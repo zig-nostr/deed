@@ -57,6 +57,13 @@ fn generate(
 ) !u8 {
     var as_hex = false;
     for (args) |a| {
+        // Accepted here as well as at the subcommand position. Every other verb
+        // takes the help forms anywhere in its arguments, and `deed key
+        // generate --help` used to come back as an unknown option.
+        if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) {
+            try out.writeAll(usage);
+            return cli.exit_ok;
+        }
         if (std.mem.eql(u8, a, "--hex")) {
             as_hex = true;
             continue;
@@ -90,6 +97,10 @@ fn public(
     var as_hex = false;
     var secret: ?[]const u8 = null;
     for (args) |a| {
+        if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) {
+            try out.writeAll(usage);
+            return cli.exit_ok;
+        }
         if (std.mem.eql(u8, a, "--hex")) {
             as_hex = true;
             continue;
@@ -250,4 +261,23 @@ test "help is printed on stdout and succeeds" {
     try std.testing.expectEqual(cli.exit_ok, r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "deed key") != null);
     try std.testing.expectEqualStrings("", r.err);
+}
+
+test "the subcommands answer --help too" {
+    // They used to reject it as an unknown option, because help was only caught
+    // at the subcommand position and never inside the argument loops.
+    for ([_][]const u8{ "--help", "-h", "help" }) |form| {
+        var ob: [4096]u8 = undefined;
+        var eb: [1024]u8 = undefined;
+        const gen = try runKey(&.{ "generate", form }, &ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, gen.code);
+        try std.testing.expect(std.mem.indexOf(u8, gen.out, "deed key") != null);
+        try std.testing.expectEqualStrings("", gen.err);
+
+        var ob2: [4096]u8 = undefined;
+        var eb2: [1024]u8 = undefined;
+        const pub_ = try runKey(&.{ "public", form }, &ob2, &eb2);
+        try std.testing.expectEqual(cli.exit_ok, pub_.code);
+        try std.testing.expect(std.mem.indexOf(u8, pub_.out, "deed key") != null);
+    }
 }

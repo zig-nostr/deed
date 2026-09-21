@@ -40,11 +40,11 @@ pub const Record = union(enum) {
 
 /// Reads the records a verb operates on.
 ///
-/// The contract, written once here so that twelve verbs cannot each invent
-/// their own: a verb takes its inputs as positional arguments, and when given
-/// none, reads them as newline-delimited records on stdin. That is the whole
-/// reason `deed req … | deed verify` composes without either side knowing the
-/// other exists.
+/// The contract, written once here so that no verb has to invent its own: a
+/// verb takes its inputs as positional arguments, and when given none, reads
+/// them as newline-delimited records on stdin. That is the whole reason
+/// `deed event - | deed verify` composes without either side knowing the other
+/// exists.
 ///
 /// Positional arguments *win* rather than merge. A verb handed both would
 /// otherwise quietly process input the caller never mentioned.
