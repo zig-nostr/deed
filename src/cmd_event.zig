@@ -196,8 +196,8 @@ pub fn run(
         try emit(gpa, io, signer, keypair, draft, ov, out);
     }
 
-    // An empty pipe is not a request to invent an event: `deed req … | deed
-    // event -` that receives nothing should produce nothing, and say so by
+    // An empty pipe is not a request to invent an event: `cat drafts.jsonl |
+    // deed event -` that receives nothing should produce nothing, and say so by
     // succeeding rather than by complaining.
     return if (failures == 0) cli.exit_ok else cli.exit_fail;
 }

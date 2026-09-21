@@ -29,8 +29,8 @@ const usage =
     \\  decrypt   decrypt a NIP-44 payload from someone
     \\  verify    check that events are correctly signed
     \\
-    \\  help      this text, or `deed help <command>`
-    \\  version   the version
+    \\  help      this text, or `deed help <command>` (also -h, --help)
+    \\  version   the version (also -V, --version)
     \\
     \\Every verb that takes events reads them as newline-delimited JSON on
     \\stdin when given no positional arguments, so verbs compose:
@@ -192,8 +192,99 @@ fn helpFor(topic: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
         try out.writeAll(cmd_verify.usage);
         return cli.exit_ok;
     }
+    // Both are listed as commands one line above the sentence promising help
+    // for any of them, so asking about either has to answer rather than refuse.
+    if (cli.isOneOf(topic, &.{ "help", "version" })) {
+        try out.writeAll(usage);
+        return cli.exit_ok;
+    }
     try err.print("deed: no help for '{s}'\n", .{topic});
     return cli.exit_usage;
+}
+
+const TestRun = struct { code: u8, out: []const u8, err: []const u8 };
+
+/// Drives the dispatcher the way `main` does, minus the process.
+///
+/// Only verbs that read no stdin are exercised here. `Input` reads stdin
+/// exactly when a verb is given no positionals, and a test that took that
+/// branch would block on the test runner's own stdin.
+fn testRun(args: []const []const u8, out_buf: []u8, err_buf: []u8) !TestRun {
+    var out: std.Io.Writer = .fixed(out_buf);
+    var err: std.Io.Writer = .fixed(err_buf);
+    const code = try run(std.testing.allocator, std.testing.io, args, &out, &err);
+    return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
+}
+
+test "no arguments prints the usage and reports that nothing was understood" {
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try testRun(&.{}, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_usage, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "deed: the nostr command line") != null);
+}
+
+test "every spelling of version agrees" {
+    for ([_][]const u8{ "version", "-V", "--version" }) |form| {
+        var ob: [1024]u8 = undefined;
+        var eb: [1024]u8 = undefined;
+        const r = try testRun(&.{form}, &ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expectEqualStrings("deed " ++ version ++ "\n", r.out);
+    }
+}
+
+test "help is available for every command the usage lists" {
+    // `help` and `version` are listed as commands one line above the sentence
+    // promising help for any of them, and asking about either used to exit 2.
+    for ([_][]const u8{ "key", "event", "decode", "encode", "encrypt", "decrypt", "verify", "help", "version" }) |topic| {
+        var ob: [8192]u8 = undefined;
+        var eb: [1024]u8 = undefined;
+        const r = try testRun(&.{ "help", topic }, &ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expect(r.out.len > 0);
+        try std.testing.expectEqualStrings("", r.err);
+    }
+}
+
+test "the help forms are interchangeable" {
+    for ([_][]const u8{ "help", "-h", "--help" }) |form| {
+        var ob: [8192]u8 = undefined;
+        var eb: [1024]u8 = undefined;
+        const r = try testRun(&.{form}, &ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "Commands:") != null);
+    }
+}
+
+test "the dispatch table reaches a real verb" {
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try testRun(
+        &.{ "key", "public", "0000000000000000000000000000000000000000000000000000000000000001", "--hex" },
+        &ob,
+        &eb,
+    );
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expectEqualStrings(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\n",
+        r.out,
+    );
+}
+
+test "what is not understood exits 2 and says so on stderr" {
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const unknown = try testRun(&.{"levitate"}, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_usage, unknown.code);
+    try std.testing.expectEqualStrings("", unknown.out);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.err, "levitate") != null);
+
+    var ob2: [1024]u8 = undefined;
+    var eb2: [1024]u8 = undefined;
+    const no_topic = try testRun(&.{ "help", "levitate" }, &ob2, &eb2);
+    try std.testing.expectEqual(cli.exit_usage, no_topic.code);
+    try std.testing.expectEqualStrings("", no_topic.out);
 }
 
 test {

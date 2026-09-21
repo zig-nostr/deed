@@ -50,7 +50,19 @@ pub fn run(
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.startsWith(u8, a, "--")) {
+        if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) {
+            try out.writeAll(usage);
+            return cli.exit_ok;
+        }
+        // A single dash introduces an option too. Testing only for `--` let
+        // `-x` fall through to the positionals, where it came back as "takes
+        // one positional argument" and pointed at the wrong word. Every other
+        // verb tests for one dash.
+        if (std.mem.startsWith(u8, a, "-")) {
+            if (!cli.isOneOf(a, &.{ "--relay", "--author", "--pubkey", "--kind" })) {
+                try err.print("deed encode: unknown option '{s}'\n", .{a});
+                return cli.exit_usage;
+            }
             i += 1;
             if (i >= args.len) {
                 try err.print("deed encode: '{s}' needs a value\n", .{a});
@@ -68,9 +80,6 @@ pub fn run(
                     try err.print("deed encode: '{s}' is not a kind number\n", .{v});
                     return cli.exit_usage;
                 };
-            } else {
-                try err.print("deed encode: unknown option '{s}'\n", .{a});
-                return cli.exit_usage;
             }
             continue;
         }
@@ -79,7 +88,20 @@ pub fn run(
 
     const code = build(gpa, kind, positionals.items, opts) catch |e| {
         try err.print("deed encode: {s}\n", .{explain(e, kind)});
-        return if (e == error.UnknownKind) cli.exit_usage else cli.exit_fail;
+        // cli.zig fixes what the two codes mean, and scripts branch on them: 2
+        // when the command was not understood and nothing was attempted, 1 when
+        // it ran and failed. Every `BuildError` is a malformed command line. A
+        // hex string that will not parse is the other kind: the command was
+        // understood and the value in it was wrong.
+        return switch (e) {
+            error.UnknownKind,
+            error.MissingArgument,
+            error.TooManyArguments,
+            error.MissingPubkey,
+            error.MissingKind,
+            => cli.exit_usage,
+            else => cli.exit_fail,
+        };
     };
     defer gpa.free(code);
 
@@ -166,4 +188,84 @@ test "naddr insists on the parts it cannot invent" {
 test "an unknown code type is a usage error, not a crash" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(BuildError.UnknownKind, build(gpa, "nwhat", &.{"ab"}, .{}));
+}
+
+const Run = struct { code: u8, out: []const u8, err: []const u8 };
+
+fn runEncode(args: []const []const u8, out_buf: []u8, err_buf: []u8) !Run {
+    var out: std.Io.Writer = .fixed(out_buf);
+    var err: std.Io.Writer = .fixed(err_buf);
+    const code = try run(std.testing.allocator, args, &out, &err);
+    return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
+}
+
+const hex32 = "abababababababababababababababababababababababababababababababab";
+
+test "encode says 2 when the command line is wrong and 1 when the value is" {
+    // cli.zig calls these part of the interface, so scripts branch on them.
+    // Every malformed command line is 2; only a value that will not parse is 1.
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+
+    const unknown_kind = try runEncode(&.{ "nwhat", hex32 }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_usage, unknown_kind.code);
+
+    var ob2: [1024]u8 = undefined;
+    var eb2: [1024]u8 = undefined;
+    const missing = try runEncode(&.{"npub"}, &ob2, &eb2);
+    try std.testing.expectEqual(cli.exit_usage, missing.code);
+
+    var ob3: [1024]u8 = undefined;
+    var eb3: [1024]u8 = undefined;
+    const too_many = try runEncode(&.{ "npub", hex32, hex32 }, &ob3, &eb3);
+    try std.testing.expectEqual(cli.exit_usage, too_many.code);
+
+    var ob4: [1024]u8 = undefined;
+    var eb4: [1024]u8 = undefined;
+    const no_pubkey = try runEncode(&.{ "naddr", "slug", "--kind", "30023" }, &ob4, &eb4);
+    try std.testing.expectEqual(cli.exit_usage, no_pubkey.code);
+
+    // The command was understood; the hex in it was not a key.
+    var ob5: [1024]u8 = undefined;
+    var eb5: [1024]u8 = undefined;
+    const bad_hex = try runEncode(&.{ "npub", "not-hex" }, &ob5, &eb5);
+    try std.testing.expectEqual(cli.exit_fail, bad_hex.code);
+}
+
+test "a single-dash argument is an option, not a positional" {
+    // `-x` used to fall through to the positionals and come back as "takes one
+    // positional argument", which points at the wrong word entirely.
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runEncode(&.{ "npub", hex32, "-x" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_usage, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "unknown option") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "-x") != null);
+}
+
+test "encode answers --help wherever it appears" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runEncode(&.{ "npub", "--help" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "deed encode") != null);
+}
+
+test "every code type it lists, it builds" {
+    // The usage names six. Only npub was covered before.
+    const cases = [_]struct { args: []const []const u8, prefix: []const u8 }{
+        .{ .args = &.{ "npub", hex32 }, .prefix = "npub1" },
+        .{ .args = &.{ "nsec", hex32 }, .prefix = "nsec1" },
+        .{ .args = &.{ "note", hex32 }, .prefix = "note1" },
+        .{ .args = &.{ "nprofile", hex32 }, .prefix = "nprofile1" },
+        .{ .args = &.{ "nevent", hex32 }, .prefix = "nevent1" },
+        .{ .args = &.{ "naddr", "slug", "--pubkey", hex32, "--kind", "30023" }, .prefix = "naddr1" },
+    };
+    for (cases) |c| {
+        var ob: [2048]u8 = undefined;
+        var eb: [1024]u8 = undefined;
+        const r = try runEncode(c.args, &ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expect(std.mem.startsWith(u8, r.out, c.prefix));
+    }
 }
