@@ -2,12 +2,73 @@
 
 **The nostr command line.**
 
-A deed is two things at once: a signed instrument, and a thing done. So is a
-nostr event. `deed` makes them, reads them, proves them, moves them, and keeps
-them.
+A deed is two things at once: a signed instrument, and a thing done. So is a nostr event. `deed` makes them, reads them and proves them.
 
-> **Status: pre-release (`v0.1.0`).** The skeleton and the first offline verbs
-> are in. Nothing here is stable yet.
+## Install
+
+Pick the build for your machine, check it against its digest, and put it on your path.
+
+```sh
+VERSION=0.1.0
+PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
+BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
+
+curl -LO $BASE/deed-$VERSION-$PLATFORM.tar.gz
+curl -LO $BASE/deed-$VERSION-$PLATFORM.tar.gz.sha256
+shasum -a 256 -c deed-$VERSION-$PLATFORM.tar.gz.sha256   # sha256sum -c on Linux
+tar -xzf deed-$VERSION-$PLATFORM.tar.gz
+sudo mv deed /usr/local/bin/
+```
+
+The Linux builds are statically linked, so there is no glibc version to satisfy.
+
+The macOS builds are ad-hoc signed and not notarized. A copy that arrived through a browser carries a quarantine flag, so clear it once:
+
+```sh
+xattr -dr com.apple.quarantine deed
+```
+
+## What it does
+
+Everything deed does today is offline. Publishing to relays and fetching from them are deliberately absent, so what comes out can be inspected before any of it leaves the machine.
+
+| verb | |
+| --- | --- |
+| `key` | make a key, or derive the public one from it |
+| `event` | build an event and sign it |
+| `decode` | turn a NIP-19 code into the fields it carries |
+| `encode` | build a NIP-19 code out of its parts |
+| `encrypt` | encrypt a message to someone, with NIP-44 |
+| `decrypt` | decrypt a NIP-44 payload from someone |
+| `verify` | check that events are correctly signed |
+
+`deed help <command>` explains any of them.
+
+## How the verbs fit together
+
+Each verb takes its inputs as arguments and, given none, reads them as newline-delimited records on standard input, writing one result per line. That is the whole reason they compose:
+
+```sh
+export NOSTR_SECRET_KEY=$(deed key generate)
+
+deed event -c "hello" | deed verify        # builds one, signs it, checks it
+cat drafts.jsonl | deed event - | deed verify
+```
+
+A key can be passed with `--sec`, but a key on a command line lands in your shell history and in the process table, so `$NOSTR_SECRET_KEY` is the better habit.
+
+A bad record fails that record alone. The stream carries on, the reason goes to standard error, and the exit code reports that something in the run failed.
+
+## Exit codes
+
+Scripts branch on these, so they are part of the interface and not free to drift.
+
+| | |
+| --- | --- |
+| `0` | it worked |
+| `1` | the command ran and failed: a bad signature, an unreadable key, a malformed code |
+| `2` | the command was not understood: unknown verb, unknown flag, missing argument. Nothing was attempted |
+| `141` | the reader on the other end of the pipe went away, as in `deed decode … \| head -1` |
 
 ## Build
 
@@ -17,4 +78,8 @@ zig build test       # run the unit tests
 zig build run -- --help
 ```
 
-Uses the Zig version pinned in `.zigversion`.
+Uses the Zig version pinned in `.zigversion`. The protocol library is pinned by URL and digest in `build.zig.zon`, so a build here and a build in CI are the same build.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
