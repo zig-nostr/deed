@@ -1,0 +1,249 @@
+name: Release
+
+# On a version tag, build deed for four targets from that commit, publish each
+# with a checksum beside it, and make the release visible only once every claim
+# about it has been checked by a command that fails the job.
+#
+# The release is created as a draft and lifted at the very end. Nothing is
+# visible to a reader until the artifacts have been downloaded back off the
+# release, verified against their digests, extracted and run. A failure anywhere
+# leaves a draft nobody can see rather than a half-built release page.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload the artifacts
+
+jobs:
+  build:
+    name: build, package, draft
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      # deed writes its version in two files. Half a bump would otherwise ship a
+      # release whose binary reports a different number than the page it is on.
+      - name: The tag, the manifest and the source must agree
+        id: version
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            v*) ;;
+            *) echo "tag '$tag' does not start with v" >&2; exit 1 ;;
+          esac
+          want="${tag#v}"
+
+          # `|| true` because grep -c exits 1 on no match, which under -e would
+          # kill the assignment before the count could be compared.
+          lines="$(grep -c '^    \.version = ' build.zig.zon || true)"
+          [ "$lines" = "1" ] || { echo "expected one .version line in build.zig.zon, found $lines" >&2; exit 1; }
+
+          zon="$(sed -n 's/^    \.version = "\(.*\)",$/\1/p' build.zig.zon)"
+          [ -n "$zon" ] || { echo "could not read the version from build.zig.zon" >&2; exit 1; }
+
+          src="$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/main.zig)"
+          [ -n "$src" ] || { echo "could not read the version from src/main.zig" >&2; exit 1; }
+
+          [ "$want" = "$zon" ] || { echo "tag says $want, build.zig.zon says $zon" >&2; exit 1; }
+          [ "$want" = "$src" ] || { echo "tag says $want, src/main.zig says $src" >&2; exit 1; }
+
+          echo "version=$want" >> "$GITHUB_OUTPUT"
+          echo "all three say $want"
+
+      # The notes are committed, and the whole file is what the page shows. The
+      # check is that they name THIS version, which is what stops a release page
+      # from describing an older one.
+      - name: The notes must name this version
+        run: |
+          set -euo pipefail
+          notes=.github/RELEASE_NOTES.md
+          [ -f "$notes" ] || { echo "$notes is missing" >&2; exit 1; }
+          grep -qF "What's new in v${{ steps.version.outputs.version }}" "$notes" \
+            || { echo "$notes does not mention v${{ steps.version.outputs.version }}" >&2; exit 1; }
+
+      # The suite runs on every pull request, but a tag can be pushed at any
+      # commit, so it runs again here against the tagged source.
+      - name: Test
+        run: zig build test
+
+      - name: Build, sign, package and check every target
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+
+          for target in aarch64-macos-none x86_64-macos-none x86_64-linux-musl aarch64-linux-musl; do
+            case "$target" in
+              aarch64-macos-none) name=macos-aarch64 ;;
+              x86_64-macos-none)  name=macos-x86_64 ;;
+              x86_64-linux-musl)  name=linux-x86_64 ;;
+              aarch64-linux-musl) name=linux-aarch64 ;;
+            esac
+
+            rm -rf "out-$target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe --prefix "out-$target"
+
+            bin="out-$target/bin/deed"
+            [ -s "$bin" ] || { echo "$target produced no binary" >&2; exit 1; }
+
+            # The linker ad-hoc signs the arm64 Mach-O and leaves the x86_64 one
+            # unsigned. An unsigned arm64 binary does not execute on Apple
+            # silicon at all, so both are signed here and both are checked,
+            # which is one rule rather than two to remember.
+            case "$target" in
+              *-macos-*)
+                codesign --force --sign - "$bin"
+                codesign --verify --strict "$bin"
+                ;;
+            esac
+
+            asset="deed-$v-$name.tar.gz"
+            tar -czf "dist/$asset" -C "out-$target/bin" deed -C "$GITHUB_WORKSPACE" LICENSE README.md
+            [ -s "dist/$asset" ] || { echo "$asset is empty" >&2; exit 1; }
+
+            # An archive holding only LICENSE and README unpacks perfectly and
+            # installs nothing, so the binary is confirmed to be in there.
+            tar -tzf "dist/$asset" | grep -qx deed \
+              || { echo "$asset carries no member named deed" >&2; exit 1; }
+
+            ( cd dist && shasum -a 256 "$asset" > "$asset.sha256" )
+            [ -s "dist/$asset.sha256" ] || { echo "$asset.sha256 is empty" >&2; exit 1; }
+            ( cd dist && shasum -a 256 -c "$asset.sha256" )
+
+            echo "packaged $asset"
+          done
+
+      - name: Create the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file .github/RELEASE_NOTES.md
+
+          # Read back rather than trust the exit code: everything after this
+          # depends on the release being invisible while it is checked.
+          draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
+          [ "$draft" = "true" ] || { echo "the release is not a draft" >&2; exit 1; }
+
+  # Each artifact is downloaded off the draft release and run on hardware that
+  # matches it. Not a copy from the build job: the bytes a reader would download.
+  verify:
+    name: run ${{ matrix.asset }} on ${{ matrix.runner }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            asset: linux-aarch64
+          - runner: macos-latest
+            asset: macos-aarch64
+          - runner: macos-13
+            asset: macos-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download it, check it, run it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          asset="deed-$v-${{ matrix.asset }}.tar.gz"
+
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "$asset" --pattern "$asset.sha256" --dir .
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "$asset.sha256"
+          else
+            shasum -a 256 -c "$asset.sha256"
+          fi
+
+          tar -xzf "$asset"
+          [ -x ./deed ] || { echo "the extracted deed is not executable" >&2; exit 1; }
+
+          got="$(./deed version)"
+          [ "$got" = "deed $v" ] || { echo "the binary says '$got', expected 'deed $v'" >&2; exit 1; }
+
+          # A real gesture rather than just --version. This exercises
+          # libsecp256k1, the bech32 encoder and the JSON writer and reader in
+          # one line, on the artifact as published.
+          sk="$(./deed key generate --hex)"
+          ./deed event -c "release check" --sec "$sk" | ./deed verify
+          echo "$asset runs on ${{ matrix.runner }}"
+
+  publish:
+    name: check the page, then lift the draft
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Everything the page must carry, before anyone can see it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --dir dist
+
+          # Diffed in both directions. A missing asset fails, and so does an
+          # unexpected extra one, which is what a leftover from a re-run looks
+          # like. Counting would catch neither on its own.
+          expected="$(printf '%s\n' \
+            "deed-$v-linux-aarch64.tar.gz" "deed-$v-linux-aarch64.tar.gz.sha256" \
+            "deed-$v-linux-x86_64.tar.gz" "deed-$v-linux-x86_64.tar.gz.sha256" \
+            "deed-$v-macos-aarch64.tar.gz" "deed-$v-macos-aarch64.tar.gz.sha256" \
+            "deed-$v-macos-x86_64.tar.gz" "deed-$v-macos-x86_64.tar.gz.sha256" | sort)"
+          actual="$(ls dist | sort)"
+          diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") \
+            || { echo "the release assets are not the eight expected files" >&2; exit 1; }
+
+          for f in dist/*; do
+            [ -s "$f" ] || { echo "$f is empty" >&2; exit 1; }
+          done
+
+          checked=0
+          for s in dist/*.sha256; do
+            ( cd dist && sha256sum -c "$(basename "$s")" )
+            checked=$((checked + 1))
+          done
+          # A glob that matched nothing would leave the loop body unrun and the
+          # step green, having verified precisely nothing.
+          [ "$checked" = "4" ] || { echo "verified $checked checksums, expected 4" >&2; exit 1; }
+
+          echo "eight assets, all present, none empty, every digest matching"
+
+      - name: Lift the draft, then read the page back
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+
+          draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
+          [ "$draft" = "false" ] || { echo "the release is still a draft" >&2; exit 1; }
+
+          # Read the list again from the published release. What was checked in
+          # the step above was the draft, and this is the page a reader opens.
+          count="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')"
+          [ "$count" = "8" ] || { echo "the published release carries $count assets, expected 8" >&2; exit 1; }
+
+          echo "published $GITHUB_REF_NAME"
