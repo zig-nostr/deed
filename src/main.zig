@@ -205,4 +205,6 @@ test {
     _ = @import("cmd_event.zig");
     _ = @import("cmd_decode.zig");
     _ = @import("cmd_encode.zig");
+    _ = @import("cmd_key.zig");
+    _ = @import("cmd_verify.zig");
 }
