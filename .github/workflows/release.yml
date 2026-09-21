@@ -153,7 +153,11 @@ jobs:
             asset: linux-aarch64
           - runner: macos-latest
             asset: macos-aarch64
-          - runner: macos-13
+          # macos-15-intel, not macos-13. The macOS 13 image has been retired
+          # and its label is still recognised, so a job asking for it queues
+          # for ever instead of failing, which is the worst of both: the run
+          # never finishes and never tells you why.
+          - runner: macos-15-intel
             asset: macos-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
