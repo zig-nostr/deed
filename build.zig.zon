@@ -4,10 +4,15 @@
     .fingerprint = 0x89498c2094a1a4a3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Path dependency while `deed` and the library move together. Becomes a
-        // pinned URL + hash at the first tagged release, like every other
-        // consumer in the org.
-        .nostr = .{ .path = "../nostr" },
+        // The protocol library, pinned by URL and hash the way every other
+        // consumer in the org pins it. A tag rather than a branch: what deed
+        // builds against has to be something anybody can fetch and check for
+        // themselves later, and "whatever main happened to be that afternoon"
+        // is not that.
+        .nostr = .{
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.1.tar.gz",
+            .hash = "nostr-0.14.1-CMyPzSLDCABUv81rExu84jizBXMixUg9gKteve9P_t0h",
+        },
     },
     .paths = .{
         "build.zig",
