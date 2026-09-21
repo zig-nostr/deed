@@ -55,10 +55,17 @@ pub fn main(init: std.process.Init) !void {
     _ = it.skip(); // argv[0]
     while (it.next()) |a| try argv.append(gpa, a);
 
+    // `writerStreaming`, not `writer`. The plain one defaults to POSITIONAL
+    // mode, which pwrites at an offset this process tracks from zero and never
+    // consults the description's own file offset. For a standard stream that is
+    // always wrong and sometimes destructive: the offset belongs to whoever
+    // opened the descriptor, `>>` asks the kernel to append, and a positional
+    // write ignores both. `deed key generate >> keys.txt` overwrote keys.txt
+    // from byte 0 rather than appending to it.
     var out_buf: [16 * 1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
     var err_buf: [4 * 1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(io, &err_buf);
+    var stderr = std.Io.File.stderr().writerStreaming(io, &err_buf);
 
     const code = run(gpa, io, argv.items, &stdout.interface, &stderr.interface) catch |e| blk: {
         // `deed decode … | head -1` closes the pipe on purpose, and every other
@@ -84,16 +91,30 @@ pub fn main(init: std.process.Init) !void {
 
     // Flush before exiting: `std.process.exit` does not unwind, so anything
     // still buffered would simply be lost.
-    stdout.interface.flush() catch {};
+    const final = finish(&stdout, &stderr, code);
     stderr.interface.flush() catch {};
-
-    // The flush is where a reader that left during the last write is noticed,
-    // since that write may never have reached the pipe before now.
-    const final = if (code == cli.exit_ok and brokenPipe(&stdout))
-        cli.exit_broken_pipe
-    else
-        code;
     std.process.exit(final);
+}
+
+/// Flushes stdout and decides the status to exit with.
+///
+/// Most of the output only reaches the descriptor here, so a failed flush has
+/// lost the result rather than part of it. That matters most for the verbs
+/// whose whole answer is one line: exiting 0 after losing it would report a key
+/// that was never written anywhere.
+fn finish(stdout: *std.Io.File.Writer, stderr: *std.Io.File.Writer, code: u8) u8 {
+    stdout.interface.flush() catch {
+        if (brokenPipe(stdout)) return if (code == cli.exit_ok) cli.exit_broken_pipe else code;
+        if (stdout.err) |write_err| {
+            stderr.interface.print("deed: {s}\n", .{@errorName(write_err)}) catch {};
+        } else {
+            stderr.interface.writeAll("deed: the output could not be written\n") catch {};
+        }
+        return cli.exit_fail;
+    };
+    // A write earlier in the run may already have found the reader gone.
+    if (code == cli.exit_ok and brokenPipe(stdout)) return cli.exit_broken_pipe;
+    return code;
 }
 
 /// True when writing to `w` failed because the far end of the pipe is gone.
