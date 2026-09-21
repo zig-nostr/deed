@@ -15,6 +15,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags, so the installer check below can ask for a real release
+          # rather than the GitHub API, which rate-limits shared runners.
+          fetch-depth: 0
 
       - name: Read Zig version
         id: zig-version
@@ -32,3 +36,76 @@ jobs:
 
       - name: Check formatting
         run: zig fmt --check .
+
+      # The installer is served over `curl | bash`, and macOS ships bash 3.2,
+      # where a multibyte character sitting next to a $variable under `set -u`
+      # aborts the script. An installer that dies on its own punctuation is a
+      # bad first impression, so the scripts are pure ASCII and this is what
+      # keeps them that way. `tr` rather than a grep class, because BSD grep has
+      # no -P and the character classes differ between the two greps.
+      - name: The scripts are pure ASCII
+        run: |
+          set -euo pipefail
+          status=0
+          for f in scripts/*.sh; do
+            n="$(tr -d '\000-\177' < "$f" | wc -c | tr -d ' ')"
+            if [ "$n" != "0" ]; then
+              echo "$f carries $n bytes outside ASCII" >&2
+              status=1
+            fi
+          done
+          [ "$status" = "0" ] || exit 1
+          echo "the scripts are ASCII"
+
+      - name: The installer parses
+        run: bash -n scripts/install.sh
+
+      # End to end against a real published release: resolve the artifact, fetch
+      # it and the digest beside it, verify, install, and run what was installed.
+      # Asking only whether the script parses would pass on an installer that
+      # downloads the wrong file or verifies nothing.
+      - name: The installer installs a release, and it runs
+        run: |
+          set -euo pipefail
+          tag="$(git tag --sort=-v:refname --list 'v*' | head -1)"
+          if [ -z "$tag" ]; then
+            echo "no release tag exists yet, so the installer was NOT exercised" >&2
+            exit 1
+          fi
+          bash scripts/install.sh --version "$tag" --prefix "$RUNNER_TEMP/deed"
+          bin="$RUNNER_TEMP/deed/bin/deed"
+          [ -x "$bin" ] || { echo "the installer reported success and installed nothing" >&2; exit 1; }
+          got="$("$bin" version)"
+          [ "$got" = "deed ${tag#v}" ] || { echo "installed binary says '$got', expected 'deed ${tag#v}'" >&2; exit 1; }
+          sk="$("$bin" key generate --hex)"
+          "$bin" event -c "installer check" --sec "$sk" | "$bin" verify
+          echo "installed $got and it works"
+
+      # The guard above has to be able to fail. A tampered archive must be
+      # refused and must install nothing, because a checksum that is checked and
+      # then ignored is worse than none: it reads as a promise.
+      - name: A download that does not verify is refused
+        run: |
+          set -euo pipefail
+          tag="$(git tag --sort=-v:refname --list 'v*' | head -1)"
+          work="$RUNNER_TEMP/tamper"
+          mkdir -p "$work"
+          case "$(uname -s)" in
+            Darwin) plat="macos" ;;
+            *) plat="linux" ;;
+          esac
+          case "$(uname -m)" in
+            x86_64|amd64) cpu="x86_64" ;;
+            *) cpu="aarch64" ;;
+          esac
+          asset="deed-${tag#v}-$plat-$cpu.tar.gz"
+          base="https://github.com/${{ github.repository }}/releases/download/$tag"
+          curl -fsSL -o "$work/$asset" "$base/$asset"
+          curl -fsSL -o "$work/$asset.sha256" "$base/$asset.sha256"
+          printf 'x' >> "$work/$asset"
+          if bash scripts/install.sh --archive "$work/$asset" --prefix "$work/out"; then
+            echo "the installer accepted a tampered archive" >&2
+            exit 1
+          fi
+          [ ! -e "$work/out/bin/deed" ] || { echo "it refused and installed anyway" >&2; exit 1; }
+          echo "a tampered archive is refused and nothing is installed"
