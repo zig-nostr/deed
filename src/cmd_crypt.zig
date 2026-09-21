@@ -157,7 +157,10 @@ pub fn run(
 
     const stdin_buf = try gpa.alloc(u8, max_record_bytes);
     defer gpa.free(stdin_buf);
-    var stdin_reader = std.Io.File.stdin().reader(io, stdin_buf);
+    // Streaming for the reason `main` gives for the writers: a positional
+    // read starts at byte 0 of the file behind the descriptor and re-reads
+    // records an earlier reader on the same descriptor already consumed.
+    var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
     var input = cli.Input.init(positionals.items, &stdin_reader.interface);
 
     var failures: usize = 0;
