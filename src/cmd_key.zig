@@ -128,7 +128,14 @@ fn public(
 
     var signer = keys.Signer.init();
     defer signer.deinit();
-    const kp = try signer.keyPairFromSecretKey(sk);
+    // Caught rather than propagated. 64 hex characters can still be a number
+    // outside the curve's range, and letting that escape printed `deed:
+    // InvalidSecretKey`, which names the branch the code took rather than
+    // telling the reader what is wrong with what they pasted.
+    const kp = signer.keyPairFromSecretKey(sk) catch {
+        try err.writeAll("deed key public: that is not a usable secret key (the number is outside the curve's range)\n");
+        return cli.exit_fail;
+    };
 
     const text = if (as_hex)
         try hex.encode(gpa, &kp.public_key)
@@ -261,6 +268,19 @@ test "help is printed on stdout and succeeds" {
     try std.testing.expectEqual(cli.exit_ok, r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "deed key") != null);
     try std.testing.expectEqualStrings("", r.err);
+}
+
+test "a key outside the curve's range is explained, not named" {
+    // 64 hex characters can still be a number the curve cannot use. Letting it
+    // escape printed `deed: InvalidSecretKey`, which names the branch the code
+    // took rather than telling the reader what is wrong with what they pasted.
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runKey(&.{ "public", "f" ** 64 }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "InvalidSecretKey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "curve") != null);
 }
 
 test "the subcommands answer --help too" {

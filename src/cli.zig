@@ -94,10 +94,20 @@ pub const Input = struct {
                 self.stdin = null;
                 return null;
             };
-            const trimmed = std.mem.trim(u8, line, " \t\r\n");
-            // Blank lines separate records, they are not records.
-            if (trimmed.len == 0) continue;
-            return .{ .line = trimmed };
+            // Only the line ending comes off, never the reader's own bytes.
+            //
+            // This used to trim spaces and tabs from both ends of every record,
+            // which is harmless for a code or a JSON object and silent data
+            // loss for a message: `printf '  hello  '` piped into
+            // `deed encrypt` encrypted `hello`, and nothing said so. A record
+            // is whatever sat between two newlines, and what to do about the
+            // whitespace in it is the verb's business, not this one's.
+            const body = if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
+            // A truly empty line separates records and is not one. A line of
+            // spaces IS one, because for `deed encrypt` it is a message
+            // somebody chose to send.
+            if (body.len == 0) continue;
+            return .{ .line = body };
         }
     }
 };
@@ -112,6 +122,45 @@ test "positional arguments win over stdin" {
 test "no positionals and no stdin yields nothing" {
     var input = Input.init(&.{}, null);
     try std.testing.expect((try input.next()) == null);
+}
+
+test "a record is handed back as it was written" {
+    // `deed encrypt` takes a record as the MESSAGE. This used to trim spaces and
+    // tabs off both ends of every record, so `printf '  hello  '` piped in
+    // encrypted `hello` and nothing said so: the reader's own words, altered on
+    // the way to being sealed.
+    var source: std.Io.Reader = .fixed("  hello  \nplain\n\ttabbed\t\n");
+    var window: [64]u8 = undefined;
+    var limited = source.limited(.unlimited, &window);
+    var input = Input.init(&.{}, &limited.interface);
+
+    try std.testing.expectEqualStrings("  hello  ", (try input.next()).?.line);
+    try std.testing.expectEqualStrings("plain", (try input.next()).?.line);
+    try std.testing.expectEqualStrings("\ttabbed\t", (try input.next()).?.line);
+    try std.testing.expect((try input.next()) == null);
+}
+
+test "a line ending comes off, and an empty line is still a separator" {
+    // CRLF is the one thing that is not the reader's bytes: it is how the line
+    // ended, not part of what they wrote.
+    var source: std.Io.Reader = .fixed("one\r\n\ntwo\r\n");
+    var window: [64]u8 = undefined;
+    var limited = source.limited(.unlimited, &window);
+    var input = Input.init(&.{}, &limited.interface);
+
+    try std.testing.expectEqualStrings("one", (try input.next()).?.line);
+    try std.testing.expectEqualStrings("two", (try input.next()).?.line);
+    try std.testing.expect((try input.next()) == null);
+}
+
+test "a line of spaces is a record, not a separator" {
+    // For `deed encrypt` it is a message somebody chose to send. Only a truly
+    // empty line separates.
+    var source: std.Io.Reader = .fixed("   \n");
+    var window: [64]u8 = undefined;
+    var limited = source.limited(.unlimited, &window);
+    var input = Input.init(&.{}, &limited.interface);
+    try std.testing.expectEqualStrings("   ", (try input.next()).?.line);
 }
 
 test "a record too long to hold does not take the stream with it" {
