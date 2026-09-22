@@ -10,9 +10,12 @@ const cmd_encode = @import("cmd_encode.zig");
 const cmd_crypt = @import("cmd_crypt.zig");
 const cmd_event = @import("cmd_event.zig");
 const cmd_key = @import("cmd_key.zig");
+const cmd_fetch = @import("cmd_fetch.zig");
+const cmd_publish = @import("cmd_publish.zig");
+const cmd_req = @import("cmd_req.zig");
 const cmd_verify = @import("cmd_verify.zig");
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 const usage =
     \\deed: the nostr command line
@@ -27,6 +30,9 @@ const usage =
     \\  encode    build a NIP-19 code out of its parts
     \\  encrypt   encrypt a message to someone, with NIP-44
     \\  decrypt   decrypt a NIP-44 payload from someone
+    \\  req       build a subscription, and run it
+    \\  fetch     get the events a code names
+    \\  publish   offer signed events to relays
     \\  verify    check that events are correctly signed
     \\
     \\  help      this text, or `deed help <command>` (also -h, --help)
@@ -157,6 +163,9 @@ fn run(
     if (std.mem.eql(u8, verb, "encode")) return cmd_encode.run(gpa, rest, out, err);
     if (std.mem.eql(u8, verb, "encrypt")) return cmd_crypt.run(gpa, io, .encrypt, rest, out, err);
     if (std.mem.eql(u8, verb, "decrypt")) return cmd_crypt.run(gpa, io, .decrypt, rest, out, err);
+    if (std.mem.eql(u8, verb, "req")) return cmd_req.run(gpa, io, rest, out, err);
+    if (std.mem.eql(u8, verb, "fetch")) return cmd_fetch.run(gpa, io, rest, out, err);
+    if (std.mem.eql(u8, verb, "publish")) return cmd_publish.run(gpa, io, rest, out, err);
     if (std.mem.eql(u8, verb, "verify")) return cmd_verify.run(gpa, io, rest, out, err);
 
     try err.print("deed: unknown command '{s}'\nRun `deed help` for the list.\n", .{verb});
@@ -186,6 +195,18 @@ fn helpFor(topic: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
     }
     if (std.mem.eql(u8, topic, "decrypt")) {
         try out.writeAll(cmd_crypt.decrypt_usage);
+        return cli.exit_ok;
+    }
+    if (std.mem.eql(u8, topic, "fetch")) {
+        try out.writeAll(cmd_fetch.usage);
+        return cli.exit_ok;
+    }
+    if (std.mem.eql(u8, topic, "publish")) {
+        try out.writeAll(cmd_publish.usage);
+        return cli.exit_ok;
+    }
+    if (std.mem.eql(u8, topic, "req")) {
+        try out.writeAll(cmd_req.usage);
         return cli.exit_ok;
     }
     if (std.mem.eql(u8, topic, "verify")) {
@@ -297,5 +318,9 @@ test {
     _ = @import("cmd_decode.zig");
     _ = @import("cmd_encode.zig");
     _ = @import("cmd_key.zig");
+    _ = @import("cmd_fetch.zig");
+    _ = @import("cmd_publish.zig");
+    _ = @import("cmd_req.zig");
+    _ = @import("relayset.zig");
     _ = @import("cmd_verify.zig");
 }
