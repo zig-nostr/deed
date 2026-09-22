@@ -59,7 +59,7 @@ deed reaches relays and keeps what it finds. Every verb that does not need a soc
 
 ## It keeps what it fetches
 
-This is the part other nostr command lines do not have, and the reason this one exists.
+A run that reaches relays can keep what it received, and a later run can ask the store instead of the network:
 
 ```sh
 deed req -k 1 -l 50 --store ~/.deed/db wss://relay.example   # once, over the network
@@ -67,8 +67,6 @@ deed req -k 1 -l 50 --store ~/.deed/db --local               # again, dialling n
 ```
 
 The second command opens no socket. The events came out of a local store that the first command filled, and they are the same events: `deed verify` is as happy with them as it was the first time, because what is stored is what was signed.
-
-nak, the command line most people reach for, keeps almost nothing. Its local database is behind a build tag for Linux on x86_64 only, so on a Mac or an ARM machine every run starts from nothing, and even where it is compiled in, `req` and `fetch` never write to it. That is a reasonable choice for a tool built to poke at relays. It is a bad one if you want to ask the same question twice.
 
 Events are checked before they are stored or printed. A relay can send anything, so a signature that does not verify, and an event that does not answer the question that was asked, are both dropped and reported.
 
