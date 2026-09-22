@@ -23,9 +23,15 @@ pub const Options = struct {
     /// so this is the difference between "everything you have" and "everything
     /// you have, and then whatever arrives while I wait".
     until_eose: bool = true,
-    /// The whole run gives up here, whatever the relays are doing. A relay that
-    /// accepts a subscription and then says nothing would otherwise hold the
-    /// process open for as long as somebody let it.
+    /// The whole run gives up here, whatever the relays are doing.
+    ///
+    /// nak has no equivalent and this is a deliberate difference. Its per-relay
+    /// select waits on EOSE, a close or an event and nothing else, so a relay
+    /// that accepts a subscription and then says nothing holds the process open
+    /// for as long as somebody lets it (go-nostr's pool.go:677-729, no timer in
+    /// that select). That is survivable at an interactive prompt and not
+    /// survivable in a script, which is where a command line spends most of its
+    /// life.
     deadline_ms: i64,
     /// How long one read may block before the loop moves to the next relay.
     /// Short, because it is a round-robin across relays rather than a wait.
@@ -46,6 +52,18 @@ pub const Outcome = struct {
 };
 
 const max_relays = 32;
+
+/// Whether an event answers any of the questions this run asked.
+///
+/// A relay is not obliged to be honest about what it sends, and a subscription
+/// is not a promise. Without this a relay could answer `-k 1` with anything it
+/// liked and the output would carry it.
+fn matchesAny(filters: []const filter.Filter, ev: nostr.event.Event) bool {
+    for (filters) |f| {
+        if (f.matches(ev)) return true;
+    }
+    return false;
+}
 
 /// The subscription every run uses. One per process, closed by the process.
 pub const subscription_id = "deed";
@@ -103,6 +121,9 @@ pub fn query(
     var seen = std.AutoHashMap([32]u8, void).init(gpa);
     defer seen.deinit();
 
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
     // `.awake` is this standard library's monotonic clock: it cannot go
     // backwards when somebody adjusts the system time mid-run, which `.real`
     // can, and a deadline that can move backwards is not one.
@@ -138,6 +159,20 @@ pub fn query(
             switch (msg.value) {
                 .event => |e| {
                     if (seen.contains(e.event.id)) continue;
+                    // Checked before it is trusted. A relay can send anything,
+                    // including an event nobody signed or one that answers a
+                    // question this run did not ask. nak verifies by default and
+                    // drops both (go-nostr relay.go:399-410), and a tool whose
+                    // output people pipe into other tools has to do the same:
+                    // this is the last point where a forgery can be stopped.
+                    if (!(nostr.event.verify(gpa, signer, e.event) catch false)) {
+                        try err.print("deed: a relay sent an event that is not correctly signed\n", .{});
+                        continue;
+                    }
+                    if (!matchesAny(filters, e.event)) {
+                        try err.print("deed: a relay sent an event nobody asked for\n", .{});
+                        continue;
+                    }
                     try seen.put(e.event.id, {});
                     if (opts.store) |s| {
                         // Written before it is printed, so a run interrupted

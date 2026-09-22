@@ -19,7 +19,7 @@ macOS and Linux, Intel and ARM. It works out which build this machine wants, che
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.1.0
+VERSION=0.2.0
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 
@@ -40,7 +40,7 @@ xattr -dr com.apple.quarantine deed
 
 ## What it does
 
-Everything deed does today is offline. It opens no socket, so what comes out can be inspected before any of it leaves the machine. Reaching relays is not here yet: see [what is missing](#what-is-missing).
+deed reaches relays and keeps what it finds. Every verb that does not need a socket still works without one, so what comes out can be read before any of it leaves the machine.
 
 | verb | |
 | --- | --- |
@@ -51,16 +51,32 @@ Everything deed does today is offline. It opens no socket, so what comes out can
 | `encrypt` | encrypt a message to someone, with NIP-44 |
 | `decrypt` | decrypt a NIP-44 payload from someone |
 | `verify` | check that events are correctly signed |
+| `req` | build a subscription, and run it |
+| `fetch` | get the events a code names |
+| `publish` | offer signed events to relays |
 
 `deed help <command>` explains any of them.
 
+## It keeps what it fetches
+
+This is the part other nostr command lines do not have, and the reason this one exists.
+
+```sh
+deed req -k 1 -l 50 --store ~/.deed/db wss://relay.example   # once, over the network
+deed req -k 1 -l 50 --store ~/.deed/db --local               # again, dialling nothing
+```
+
+The second command opens no socket. The events came out of a local store that the first command filled, and they are the same events: `deed verify` is as happy with them as it was the first time, because what is stored is what was signed.
+
+nak, the command line most people reach for, keeps almost nothing. Its local database is behind a build tag for Linux on x86_64 only, so on a Mac or an ARM machine every run starts from nothing, and even where it is compiled in, `req` and `fetch` never write to it. That is a reasonable choice for a tool built to poke at relays. It is a bad one if you want to ask the same question twice.
+
+Events are checked before they are stored or printed. A relay can send anything, so a signature that does not verify, and an event that does not answer the question that was asked, are both dropped and reported.
+
 ## What is missing
 
-There is no local store, and no verb that reaches a relay. Those are one piece of work rather than two.
+**Relay selection.** A code with no relay hints is not looked up: `deed fetch npub1...` asks you to name a relay rather than going to find the author's relay list first. Doing that properly means a second round trip and a cache with its own staleness rules, and doing it badly is worse than saying so.
 
-A command line that fetches and keeps nothing asks the same question again the next time it runs, and piping two such verbs together pays for the same answer twice. The store is what makes the network verbs worth having, and it is the reason this tool exists rather than being one more way to do what is already done well: a nostr command line that keeps what it fetches. So `req`, `fetch` and `publish` arrive together with `--store`, or they do not arrive. That is [the next release](https://github.com/zig-nostr/deed/milestone/1).
-
-Windows is not built either. `deed` itself does not compile there yet, and the protocol library cannot resolve a hostname on Windows ([nostr#59](https://github.com/zig-nostr/nostr/issues/59)), so claiming it now would mean losing it again the moment a verb needs a relay.
+**Windows.** deed does not compile there yet, and the protocol library cannot resolve a hostname on Windows ([nostr#59](https://github.com/zig-nostr/nostr/issues/59)).
 
 ## How the verbs fit together
 

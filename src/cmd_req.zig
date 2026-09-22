@@ -8,6 +8,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
+const relayset = @import("relayset.zig");
 
 const filter = nostr.filter;
 const message = nostr.message;
@@ -30,6 +31,10 @@ pub const usage =
     \\  -s, --since <n>      unix seconds, events at or after
     \\  -u, --until <n>      unix seconds, events at or before
     \\      --bare           print the filter alone, without the REQ envelope
+    \\      --store <path>   keep every event this receives in a local store
+    \\      --local          answer from the store alone, dialling nothing
+    \\      --stream         keep reading after the relays have sent what they hold
+    \\      --timeout <ms>   give up on relays still answering (default 30000)
     \\
     \\Given no relay, it prints what it would send and stops, so a filter can be
     \\read before it is asked of anybody:
@@ -44,7 +49,17 @@ pub const Request = struct {
     filter: filter.Filter,
     relays: []const []const u8,
     bare: bool,
+    store_path: ?[]const u8 = null,
+    stream: bool = false,
+    local: bool = false,
+    timeout_ms: i64 = default_timeout_ms,
 };
+
+/// How long a run waits on relays still answering.
+///
+/// Thirty seconds rather than nak's forever: long enough for a slow relay on a
+/// slow link, short enough that a script does not hang on one gone quiet.
+pub const default_timeout_ms: i64 = 30_000;
 
 const max_values = 64;
 
@@ -94,6 +109,10 @@ pub fn parse(
 ) !?Request {
     var f = filter.Filter{};
     var bare = false;
+    var stream = false;
+    var local = false;
+    var store_path: ?[]const u8 = null;
+    var timeout_ms: i64 = default_timeout_ms;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -101,6 +120,14 @@ pub fn parse(
         if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) return null;
         if (std.mem.eql(u8, a, "--bare")) {
             bare = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--stream")) {
+            stream = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--local")) {
+            local = true;
             continue;
         }
         if (!std.mem.startsWith(u8, a, "-")) {
@@ -112,9 +139,9 @@ pub fn parse(
         }
 
         const takes_value = cli.isOneOf(a, &.{
-            "-k",      "--kind", "-a",      "--author", "-i",      "--id",
-            "-e",      "-p",     "-t",      "-l",       "--limit", "-s",
-            "--since", "-u",     "--until",
+            "-k",      "--kind", "-a",      "--author", "-i",        "--id",
+            "-e",      "-p",     "-t",      "-l",       "--limit",   "-s",
+            "--since", "-u",     "--until", "--store",  "--timeout",
         });
         if (!takes_value) {
             try err.print("deed req: unknown option '{s}'\n", .{a});
@@ -161,6 +188,13 @@ pub fn parse(
                 try err.print("deed req: '{s}' is not a unix timestamp\n", .{v});
                 return ParseError.BadValue;
             };
+        } else if (std.mem.eql(u8, a, "--store")) {
+            store_path = v;
+        } else if (std.mem.eql(u8, a, "--timeout")) {
+            timeout_ms = std.fmt.parseInt(i64, v, 10) catch {
+                try err.print("deed req: '{s}' is not a number of milliseconds\n", .{v});
+                return ParseError.BadValue;
+            };
         } else if (cli.isOneOf(a, &.{ "-u", "--until" })) {
             f.until = std.fmt.parseInt(i64, v, 10) catch {
                 try err.print("deed req: '{s}' is not a unix timestamp\n", .{v});
@@ -189,7 +223,15 @@ pub fn parse(
     }
     if (tag_len > 0) f.tags = tags[0..tag_len];
 
-    return .{ .filter = f, .relays = relays.slice() orelse &.{}, .bare = bare };
+    return .{
+        .filter = f,
+        .relays = relays.slice() orelse &.{},
+        .bare = bare,
+        .store_path = store_path,
+        .stream = stream,
+        .local = local,
+        .timeout_ms = timeout_ms,
+    };
 }
 
 /// The subscription id every run uses.
@@ -207,7 +249,6 @@ pub fn run(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
-    _ = io;
     var ids: Collected([32]u8) = .{};
     var authors: Collected([32]u8) = .{};
     var kinds: Collected(u16) = .{};
@@ -228,6 +269,34 @@ pub fn run(
         return cli.exit_ok;
     };
 
+    // Answered from what is already kept, without dialling. This is the half
+    // that makes keeping worth doing: a store nothing reads back is a log.
+    if (req.local) {
+        const path = req.store_path orelse {
+            try err.writeAll("deed req: --local needs --store to read from\n");
+            return cli.exit_usage;
+        };
+        const z = try gpa.dupeZ(u8, path);
+        defer gpa.free(z);
+        var st = nostr.store.Store.open(z, .{}) catch |e| {
+            try err.print("deed req: cannot open the store at {s}: {s}\n", .{ path, @errorName(e) });
+            return cli.exit_fail;
+        };
+        defer st.deinit();
+
+        var result = st.query(gpa, req.filter) catch |e| {
+            try err.print("deed req: the store could not answer: {s}\n", .{@errorName(e)});
+            return cli.exit_fail;
+        };
+        defer result.deinit();
+        for (result.events) |ev| {
+            const json = try nostr.event.toJson(gpa, ev);
+            defer gpa.free(json);
+            try out.print("{s}\n", .{json});
+        }
+        return cli.exit_ok;
+    }
+
     // No relay named: say what would be sent, and stop. The filter is the thing
     // worth seeing before it is asked of anybody.
     if (req.relays.len == 0) {
@@ -242,8 +311,35 @@ pub fn run(
         return cli.exit_ok;
     }
 
-    try err.writeAll("deed req: asking relays is not in this release yet\n");
-    return cli.exit_fail;
+    var store: ?nostr.store.Store = null;
+    defer if (store) |*st| st.deinit();
+    if (req.store_path) |path| {
+        const z = gpa.dupeZ(u8, path) catch {
+            try err.writeAll("deed req: out of memory opening the store\n");
+            return cli.exit_fail;
+        };
+        defer gpa.free(z);
+        store = nostr.store.Store.open(z, .{}) catch |e| {
+            try err.print("deed req: cannot open the store at {s}: {s}\n", .{ path, @errorName(e) });
+            return cli.exit_fail;
+        };
+    }
+
+    const outcome = try relayset.query(gpa, io, req.relays, &.{req.filter}, out, err, .{
+        .until_eose = !req.stream,
+        .deadline_ms = req.timeout_ms,
+        .poll_ms = 100,
+        .store = if (store) |*st| st else null,
+    });
+
+    // Reaching no relay at all is a failed run. Reaching some is not: the
+    // events that arrived are real, and every relay that did not answer was
+    // named on stderr as it failed.
+    if (outcome.dialled == 0) {
+        try err.writeAll("deed req: no relay answered\n");
+        return cli.exit_fail;
+    }
+    return cli.exit_ok;
 }
 
 const Run = struct { code: u8, out: []const u8, err: []const u8 };
