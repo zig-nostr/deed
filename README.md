@@ -40,7 +40,7 @@ xattr -dr com.apple.quarantine deed
 
 ## What it does
 
-Everything deed does today is offline. Publishing to relays and fetching from them are deliberately absent, so what comes out can be inspected before any of it leaves the machine.
+Everything deed does today is offline. It opens no socket, so what comes out can be inspected before any of it leaves the machine. Reaching relays is not here yet: see [what is missing](#what-is-missing).
 
 | verb | |
 | --- | --- |
@@ -53,6 +53,14 @@ Everything deed does today is offline. Publishing to relays and fetching from th
 | `verify` | check that events are correctly signed |
 
 `deed help <command>` explains any of them.
+
+## What is missing
+
+There is no local store, and no verb that reaches a relay. Those are one piece of work rather than two.
+
+A command line that fetches and keeps nothing asks the same question again the next time it runs, and piping two such verbs together pays for the same answer twice. The store is what makes the network verbs worth having, and it is the reason this tool exists rather than being one more way to do what is already done well: a nostr command line that keeps what it fetches. So `req`, `fetch` and `publish` arrive together with `--store`, or they do not arrive. That is [the next release](https://github.com/zig-nostr/deed/milestone/1).
+
+Windows is not built either. `deed` itself does not compile there yet, and the protocol library cannot resolve a hostname on Windows ([nostr#59](https://github.com/zig-nostr/nostr/issues/59)), so claiming it now would mean losing it again the moment a verb needs a relay.
 
 ## How the verbs fit together
 
