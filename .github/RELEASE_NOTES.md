@@ -19,7 +19,7 @@ The second dials nothing. The events are the same events, and they still verify,
 
 **Events are checked before they are kept or printed.** A relay can send anything. A signature that does not verify is dropped, and so is an event that does not answer the question that was asked. Both are reported rather than silently skipped.
 
-**A query gives up rather than hanging.** Thirty seconds by default, `--timeout` to change it. This is a deliberate difference from nak, whose per-relay wait has no timer at all: a relay that accepts a subscription and then goes quiet will hold it open indefinitely. That is survivable at a prompt and not in a script.
+**A query gives up rather than hanging.** Thirty seconds by default, `--timeout` to change it.
 
 **Publishing succeeds when any relay accepts.** An event one relay holds is published, so a partial failure exits 0 with every refusal named on stderr, and only a total failure exits 1. Scripts should not retry something that already happened.
 
