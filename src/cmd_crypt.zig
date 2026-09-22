@@ -98,6 +98,15 @@ pub fn run(
             });
             return cli.exit_ok;
         }
+        // Everything after `--` is a message, whatever it starts with. Without
+        // this there was no way to encrypt a line beginning with a hyphen: it
+        // came back as an unknown option, which is a refusal to carry somebody's
+        // words on account of their first character.
+        if (std.mem.eql(u8, a, "--")) {
+            i += 1;
+            while (i < args.len) : (i += 1) try positionals.append(gpa, args[i]);
+            break;
+        }
         if (std.mem.startsWith(u8, a, "-")) {
             const is_sec = std.mem.eql(u8, a, "--sec");
             const is_peer = std.mem.eql(u8, a, dir.peerFlag());

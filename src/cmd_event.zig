@@ -171,7 +171,9 @@ pub fn run(
     var failures: usize = 0;
     while (try input.next()) |record| {
         const json = switch (record) {
-            .line => |l| l,
+            // Trimmed here rather than in `Input`: surrounding space around
+            // a draft is noise, and `deed encrypt` needs the same bytes it was given.
+            .line => |l| std.mem.trim(u8, l, " \t"),
             .too_long => {
                 try err.print(
                     "deed event: skipped a draft longer than {d} bytes\n",

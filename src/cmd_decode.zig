@@ -63,7 +63,9 @@ pub fn run(
     var failures: usize = 0;
     while (try input.next()) |record| {
         const code = switch (record) {
-            .line => |l| l,
+            // Trimmed here rather than in `Input`: surrounding space around
+            // a code is noise, and `deed encrypt` needs the same bytes it was given.
+            .line => |l| std.mem.trim(u8, l, " \t"),
             .too_long => {
                 try err.print(
                     "deed decode: skipped a code longer than {d} bytes\n",
