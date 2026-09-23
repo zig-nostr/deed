@@ -19,7 +19,7 @@ macOS and Linux, Intel and ARM. It works out which build this machine wants, che
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.3.0
+VERSION=0.3.1
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 
@@ -104,6 +104,10 @@ Scripts branch on these, so they are part of the interface and not free to drift
 | `1` | the command ran and failed: a bad signature, an unreadable key, a malformed code, an event no relay accepted |
 | `2` | the command was not understood: unknown verb, unknown flag, missing argument. Nothing was attempted |
 | `141` | the reader on the other end of the pipe went away, as in `deed decode … \| head -1` |
+
+## How fast it is
+
+A one-shot command runs in about 2.3 ms and under 2 MB of memory. deed signs about 22,000 events a second and verifies about 33,000, stores 100,000 events from a relay at about 17,000 a second, and answers a lookup from that store in about 3 ms, start to finish. The binaries are 2.3 to 2.7 MB. [BENCHMARKS.md](BENCHMARKS.md) has the full set and how to reproduce every number.
 
 ## Build
 
