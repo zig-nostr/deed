@@ -2,6 +2,18 @@
 
 Every artifact below is published with a `.sha256` beside it, so the download can be checked against a digest that was written by the same job that built it.
 
+### What's new in v0.3.1
+
+Faster, smaller, and measured.
+
+**Storing events is about seven times faster.** Events kept with `--store` are written in batches, one transaction each, instead of one transaction per event. Storing 100,000 events from a relay went from about 2,300 a second to about 16,800, each signature still checked, and a batch is still stored before any of it is printed.
+
+**Everything that allocates is faster.** deed now uses a general-purpose allocator instead of mapping pages for every allocation. Decoding a stream of npubs is about eight times faster, and verifying about a fifth faster.
+
+**The Linux downloads are less than half the size.** Release binaries are built without debug information. The Linux ones go from 12 MB to under 3 MB, and every download is now under 2 MB.
+
+**Benchmarks.** [BENCHMARKS.md](https://github.com/zig-nostr/deed/blob/main/BENCHMARKS.md) has the numbers, and `python3 bench/run.py` reproduces them on your machine.
+
 ### What's new in v0.3.0
 
 `publish` says what it published.

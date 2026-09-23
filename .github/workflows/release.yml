@@ -91,7 +91,7 @@ jobs:
             esac
 
             rm -rf "out-$target"
-            zig build -Dtarget="$target" -Doptimize=ReleaseSafe --prefix "out-$target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe -Dstrip=true --prefix "out-$target"
 
             bin="out-$target/bin/deed"
             [ -s "$bin" ] || { echo "$target produced no binary" >&2; exit 1; }

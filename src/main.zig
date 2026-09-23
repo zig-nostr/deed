@@ -15,7 +15,7 @@ const cmd_publish = @import("cmd_publish.zig");
 const cmd_req = @import("cmd_req.zig");
 const cmd_verify = @import("cmd_verify.zig");
 
-pub const version = "0.3.0";
+pub const version = "0.3.1";
 
 const usage =
     \\deed: the nostr command line
@@ -49,7 +49,10 @@ const usage =
 ;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = std.heap.page_allocator;
+    // A general-purpose allocator, not `page_allocator`: that one maps pages
+    // for every allocation, so every small string was a system call, and
+    // decoding a stream of codes spent most of its time in mmap and munmap.
+    const gpa = std.heap.smp_allocator;
 
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

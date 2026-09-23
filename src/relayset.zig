@@ -52,6 +52,43 @@ pub const Outcome = struct {
 
 const max_relays = dial.max_relays;
 
+/// Events held for one store write. LMDB syncs to disk on every commit, so
+/// writing each event as it arrives costs a sync apiece; a batch costs one.
+const batch_max = 512;
+
+/// Events that have passed every check and wait to be stored, then printed.
+/// Each one's message is kept alive until then, because the event borrows it.
+const Pending = struct {
+    msgs: std.ArrayList(message.ParsedRelayMessage) = .empty,
+
+    fn deinit(self: *Pending, gpa: std.mem.Allocator) void {
+        for (self.msgs.items) |*m| m.deinit();
+        self.msgs.deinit(gpa);
+    }
+
+    /// Stores what is held in one transaction, then prints it. Stored before
+    /// printed, so a run interrupted partway through still kept what it had
+    /// already shown.
+    fn flush(self: *Pending, gpa: std.mem.Allocator, store: *nostr.store.Store, out: *std.Io.Writer, result: *Outcome) !void {
+        if (self.msgs.items.len == 0) return;
+        defer {
+            for (self.msgs.items) |*m| m.deinit();
+            self.msgs.clearRetainingCapacity();
+        }
+        var events: [batch_max]nostr.event.Event = undefined;
+        var outcomes: [batch_max]nostr.store.IngestResult = undefined;
+        for (self.msgs.items, 0..) |m, i| events[i] = m.value.event.event;
+        const n = self.msgs.items.len;
+        store.ingestBatch(gpa, events[0..n], .{}, outcomes[0..n]) catch {};
+        for (events[0..n]) |ev| {
+            const json = try nostr.event.toJson(gpa, ev);
+            defer gpa.free(json);
+            try out.print("{s}\n", .{json});
+        }
+        result.events += n;
+    }
+};
+
 /// Whether an event answers any of the questions this run asked.
 ///
 /// A relay is not obliged to be honest about what it sends, and a subscription
@@ -141,6 +178,9 @@ pub fn query(
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
 
+    var pending: Pending = .{};
+    defer pending.deinit(gpa);
+
     // `.awake` is this standard library's monotonic clock: it cannot go
     // backwards when somebody adjusts the system time mid-run, which `.real`
     // can, and a deadline that can move backwards is not one.
@@ -153,13 +193,19 @@ pub fn query(
         }
 
         var any_live = false;
+        // Set when a relay had nothing ready, so what is held gets written
+        // and shown now rather than waiting for a batch that is not coming.
+        var idle = false;
         for (relays[0..n], 0..) |maybe, i| {
             const r = maybe orelse continue;
             if (done[i]) continue;
             any_live = true;
 
             var msg = (r.receiveTimeout(std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(opts.poll_ms), .clock = .awake } }) catch |e| switch (e) {
-                error.Timeout => continue,
+                error.Timeout => {
+                    idle = true;
+                    continue;
+                },
                 else => {
                     // A relay that drops mid-answer is a relay this run does
                     // without. The events it already sent are still good.
@@ -171,7 +217,9 @@ pub fn query(
                 done[i] = true;
                 continue;
             };
-            defer msg.deinit();
+            // Unless it is held for the store, in which case the batch owns it.
+            var held = false;
+            defer if (!held) msg.deinit();
 
             switch (msg.value) {
                 .event => |e| {
@@ -192,16 +240,17 @@ pub fn query(
                     }
                     try seen.put(e.event.id, {});
                     if (opts.store) |s| {
-                        // Written before it is printed, so a run interrupted
-                        // partway through still kept what it had already read.
-                        // `ingest` checks the signature, so a relay cannot put
-                        // something into the store by claiming it.
-                        _ = s.ingest(gpa, e.event, .{}) catch {};
+                        // Already checked above, so the store is not asked to
+                        // check it again.
+                        try pending.msgs.append(gpa, msg);
+                        held = true;
+                        if (pending.msgs.items.len == batch_max) try pending.flush(gpa, s, out, &result);
+                    } else {
+                        const json = try nostr.event.toJson(gpa, e.event);
+                        defer gpa.free(json);
+                        try out.print("{s}\n", .{json});
+                        result.events += 1;
                     }
-                    const json = try nostr.event.toJson(gpa, e.event);
-                    defer gpa.free(json);
-                    try out.print("{s}\n", .{json});
-                    result.events += 1;
                 },
                 .eose => {
                     result.complete += 1;
@@ -219,9 +268,13 @@ pub fn query(
                 .ok => {},
             }
         }
+        if (opts.store) |st| {
+            if (idle) try pending.flush(gpa, st, out, &result);
+        }
         if (!any_live) break;
     }
 
+    if (opts.store) |st| try pending.flush(gpa, st, out, &result);
     return result;
 }
 
@@ -261,6 +314,53 @@ test "a relay that never answers the dial costs the run its deadline, not foreve
     try std.testing.expectEqual(@as(usize, 1), outcome.complete);
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "no answer within 500 ms") != null);
     try std.testing.expect(took < 3_000);
+}
+
+test "events kept in a store are written in batches, and every one is stored and printed" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two full batches and part of a third.
+    const n = batch_max * 2 + 176;
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const serving = try arena.alloc([]const u8, n);
+    for (serving, 0..) |*ev, i| {
+        const e = try nostr.event.create(arena, signer, kp, 1_700_000_000 + @as(i64, @intCast(i)), 1, &.{}, try std.fmt.allocPrint(arena, "note {d}", .{i}), null);
+        ev.* = try nostr.event.toJson(arena, e);
+    }
+
+    var relay_: testrelay.Relay = undefined;
+    try relay_.start(io, .serve);
+    relay_.serving = serving;
+    defer relay_.stop(io);
+    var buf: [40]u8 = undefined;
+    const urls = [_][]const u8{try testrelay.url(&buf, relay_.port())};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/store.mdb", .{dir_buf[0..dir_len]});
+    var st = try nostr.store.Store.open(path.ptr, .{});
+    defer st.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 10_000, .poll_ms = 50, .store = &st });
+
+    try std.testing.expectEqual(@as(usize, n), outcome.events);
+    try std.testing.expectEqual(@as(usize, n), std.mem.count(u8, out.written(), "\n"));
+    try std.testing.expectEqual(@as(usize, n), try st.eventCount());
 }
 
 test "relays past the most one run dials are named as left out, not dropped quietly" {
