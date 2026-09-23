@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const nostr = @import("nostr");
+const dial = @import("dial.zig");
 
 const filter = nostr.filter;
 const message = nostr.message;
@@ -23,15 +24,13 @@ pub const Options = struct {
     /// so this is the difference between "everything you have" and "everything
     /// you have, and then whatever arrives while I wait".
     until_eose: bool = true,
-    /// The whole run gives up here, whatever the relays are doing.
+    /// The run gives up on relays still answering here, whatever they are
+    /// doing. Reaching them has its own, shorter bound: see `dial`.
     ///
-    /// nak has no equivalent and this is a deliberate difference. Its per-relay
-    /// select waits on EOSE, a close or an event and nothing else, so a relay
-    /// that accepts a subscription and then says nothing holds the process open
-    /// for as long as somebody lets it (go-nostr's pool.go:677-729, no timer in
-    /// that select). That is survivable at an interactive prompt and not
-    /// survivable in a script, which is where a command line spends most of its
-    /// life.
+    /// A relay can stall at any point: while connecting, during TLS, at the
+    /// websocket upgrade, or after accepting the subscription. Waiting on it
+    /// is survivable at an interactive prompt and not in a script, which is
+    /// where a command line spends most of its life.
     deadline_ms: i64,
     /// How long one read may block before the loop moves to the next relay.
     /// Short, because it is a round-robin across relays rather than a wait.
@@ -51,7 +50,7 @@ pub const Outcome = struct {
     complete: usize = 0,
 };
 
-const max_relays = 32;
+const max_relays = dial.max_relays;
 
 /// Whether an event answers any of the questions this run asked.
 ///
@@ -96,14 +95,29 @@ pub fn query(
         }
     };
 
+    // All at once, so the slowest relay costs its own wait and not everybody
+    // else's too, and never longer than the run itself may take.
+    var dialled: [max_relays]dial.Outcome = undefined;
+    const dial_ms = @min(dial.default_timeout_ms, opts.deadline_ms);
+    dial.all(gpa, io, urls[0..n], dial_ms, &dialled);
+
     for (urls[0..n], 0..) |url, i| {
-        const r = relay.dial(gpa, io, url) catch |e| {
-            // Named, not swallowed. A run that quietly asked three relays
-            // instead of four looks like the fourth had nothing.
-            try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
-            result.unreachable_count += 1;
-            done[i] = true;
-            continue;
+        // Named, not swallowed. A run that quietly asked three relays instead
+        // of four looks like the fourth had nothing.
+        const r = switch (dialled[i]) {
+            .connected => |r| r,
+            .failed => |e| {
+                try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
+                result.unreachable_count += 1;
+                done[i] = true;
+                continue;
+            },
+            .timed_out => {
+                try err.print("deed: {s}: no answer within {d} ms\n", .{ url, dial_ms });
+                result.unreachable_count += 1;
+                done[i] = true;
+                continue;
+            },
         };
         r.subscribe(subscription_id, filters) catch |e| {
             try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
@@ -206,6 +220,44 @@ pub fn query(
     }
 
     return result;
+}
+
+test "a relay that never answers the dial costs the run its deadline, not forever" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+
+    // Listed first, where a dial that waited on it one relay at a time would
+    // never have reached the one behind it.
+    var silent = try testrelay.listen(io);
+    defer silent.deinit(io);
+    var live: testrelay.Relay = undefined;
+    try live.start(io, .accept);
+    defer live.stop(io);
+
+    var bufs: [2][40]u8 = undefined;
+    const urls = [_][]const u8{
+        try testrelay.url(&bufs[0], silent.socket.address.ip4.port),
+        try testrelay.url(&bufs[1], live.port()),
+    };
+    const filters = [_]filter.Filter{.{ .kinds = &.{1}, .limit = 1 }};
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const outcome = try query(gpa, io, &urls, &filters, &out, &err, .{ .deadline_ms = 500, .poll_ms = 50 });
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+
+    try std.testing.expectEqual(@as(usize, 1), outcome.dialled);
+    try std.testing.expectEqual(@as(usize, 1), outcome.unreachable_count);
+    try std.testing.expectEqual(@as(usize, 1), outcome.complete);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "no answer within 500 ms") != null);
+    try std.testing.expect(took < 3_000);
 }
 
 test {

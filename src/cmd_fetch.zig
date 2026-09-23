@@ -26,6 +26,9 @@ pub const usage =
     \\      --store <path>   keep every event this receives in a local store
     \\      --timeout <ms>   give up on relays still answering (default 30000)
     \\
+    \\A relay that has not accepted the connection within five seconds, or
+    \\within --timeout if that is shorter, is named on stderr and left out.
+    \\
     \\A bare npub fetches that person's profile rather than everything they have
     \\ever written, which is what `npub` on its own can sensibly mean.
     \\

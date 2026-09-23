@@ -10,8 +10,8 @@
         // themselves later, and "whatever main happened to be that afternoon"
         // is not that.
         .nostr = .{
-            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.2.tar.gz",
-            .hash = "nostr-0.14.2-CMyPzfnQCABuzpqY9v1y0PPErY5BBDOc5OWIUUerqYbU",
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.4.tar.gz",
+            .hash = "nostr-0.14.4-CMyPze4BCQAUoi8JLNWfaR4ZDF1e4C5dhM2vMwGJ_qIT",
         },
     },
     .paths = .{

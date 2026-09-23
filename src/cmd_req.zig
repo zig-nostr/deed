@@ -36,6 +36,9 @@ pub const usage =
     \\      --stream         keep reading after the relays have sent what they hold
     \\      --timeout <ms>   give up on relays still answering (default 30000)
     \\
+    \\A relay that has not accepted the connection within five seconds, or
+    \\within --timeout if that is shorter, is named on stderr and left out.
+    \\
     \\Given no relay, it prints what it would send and stops, so a filter can be
     \\read before it is asked of anybody:
     \\
@@ -55,10 +58,11 @@ pub const Request = struct {
     timeout_ms: i64 = default_timeout_ms,
 };
 
-/// How long a run waits on relays still answering.
+/// How long a run waits on relays still answering, once they are reached.
+/// Reaching them has its own, shorter bound (`dial.default_timeout_ms`).
 ///
-/// Thirty seconds rather than nak's forever: long enough for a slow relay on a
-/// slow link, short enough that a script does not hang on one gone quiet.
+/// Thirty seconds: long enough for a slow relay on a slow link, short enough
+/// that a script does not hang on one gone quiet.
 pub const default_timeout_ms: i64 = 30_000;
 
 const max_values = 64;
