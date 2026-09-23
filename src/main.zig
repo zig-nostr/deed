@@ -49,7 +49,10 @@ const usage =
 ;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = std.heap.page_allocator;
+    // A general-purpose allocator, not `page_allocator`: that one maps pages
+    // for every allocation, so every small string was a system call, and
+    // decoding a stream of codes spent most of its time in mmap and munmap.
+    const gpa = std.heap.smp_allocator;
 
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

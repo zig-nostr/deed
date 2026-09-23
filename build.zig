@@ -11,11 +11,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Release builds pass -Dstrip. Without it a Linux binary carries about
+    // nine megabytes of debug sections, three quarters of the file.
+    const strip = b.option(bool, "strip", "Leave debug information out of the binary");
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     exe_mod.addImport("nostr", nostr_dep.module("nostr"));
 

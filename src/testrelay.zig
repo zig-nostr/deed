@@ -51,6 +51,8 @@ pub const Mode = enum {
     pings_deaf,
     /// Twenty notices, then OK true, then the connection ends.
     notices_then_close,
+    /// Answers a REQ with every event in `serving`, then EOSE.
+    serve,
     /// Sends a message the parser has no case for before each OK true.
     unreadable_first,
     /// Refuses every EVENT with a reason carrying a terminal escape and a
@@ -86,6 +88,8 @@ pub const Relay = struct {
     closing: bool = false,
     /// Connections served before the task returns.
     connections: usize = 1,
+    /// Event JSON the `serve` mode sends in answer to a REQ.
+    serving: []const []const u8 = &.{},
     task: Io.Future(void),
 
     /// Starts serving in the background. `self` must not move until `stop`.
@@ -210,6 +214,11 @@ pub const Relay = struct {
         const kind = items[0].string;
         var text: [512]u8 = undefined;
         if (std.mem.eql(u8, kind, "REQ")) {
+            if (self.mode == .serve) for (self.serving) |ev| {
+                const frame = try std.fmt.allocPrint(gpa, "[\"EVENT\",\"{s}\",{s}]", .{ items[1].string, ev });
+                defer gpa.free(frame);
+                try sendText(w, frame);
+            };
             try sendText(w, try std.fmt.bufPrint(&text, "[\"EOSE\",\"{s}\"]", .{items[1].string}));
         } else if (std.mem.eql(u8, kind, "EVENT")) {
             _ = self.events.fetchAdd(1, .monotonic);
@@ -262,7 +271,7 @@ pub const Relay = struct {
                     try sendText(w, "[\"COUNT\",\"x\",{\"count\":1}]");
                     try sendText(w, try std.fmt.bufPrint(&text, "[\"OK\",\"{s}\",true,\"\"]", .{id}));
                 },
-                .silent, .chatty, .notice_burst, .pongs, .deaf, .pings_deaf => {},
+                .silent, .chatty, .notice_burst, .pongs, .deaf, .pings_deaf, .serve => {},
             }
         }
     }
