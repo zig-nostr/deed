@@ -19,7 +19,7 @@ macOS and Linux, Intel and ARM. It works out which build this machine wants, che
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.2.0
+VERSION=0.3.0
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 
@@ -53,7 +53,7 @@ deed reaches relays and keeps what it finds. Every verb that does not need a soc
 | `verify` | check that events are correctly signed |
 | `req` | build a subscription, and run it |
 | `fetch` | get the events a code names |
-| `publish` | offer signed events to relays |
+| `publish` | offer signed events to relays, and print the ones they accepted |
 
 `deed help <command>` explains any of them.
 
@@ -85,7 +85,10 @@ export NOSTR_SECRET_KEY=$(deed key generate)
 
 deed event -c "hello" | deed verify        # builds one, signs it, checks it
 cat drafts.jsonl | deed event - | deed verify
+cat drafts.jsonl | deed event - | deed publish wss://relay.example > sent.jsonl
 ```
+
+`publish` prints each event a relay accepted, once the relays have answered or the deadline has passed, so what it writes out is what was published.
 
 A key can be passed with `--sec`, but a key on a command line lands in your shell history and in the process table, so `$NOSTR_SECRET_KEY` is the better habit.
 
@@ -98,7 +101,7 @@ Scripts branch on these, so they are part of the interface and not free to drift
 | | |
 | --- | --- |
 | `0` | it worked |
-| `1` | the command ran and failed: a bad signature, an unreadable key, a malformed code |
+| `1` | the command ran and failed: a bad signature, an unreadable key, a malformed code, an event no relay accepted |
 | `2` | the command was not understood: unknown verb, unknown flag, missing argument. Nothing was attempted |
 | `141` | the reader on the other end of the pipe went away, as in `deed decode … \| head -1` |
 

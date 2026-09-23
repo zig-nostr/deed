@@ -1,6 +1,6 @@
 .{
     .name = .deed,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x89498c2094a1a4a3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -10,8 +10,8 @@
         // themselves later, and "whatever main happened to be that afternoon"
         // is not that.
         .nostr = .{
-            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.4.tar.gz",
-            .hash = "nostr-0.14.4-CMyPze4BCQAUoi8JLNWfaR4ZDF1e4C5dhM2vMwGJ_qIT",
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.5.tar.gz",
+            .hash = "nostr-0.14.5-CMyPzUgLCQBev0r22ht88wNHfIfc6vajpRq-hylCECfB",
         },
     },
     .paths = .{
