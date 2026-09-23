@@ -15,7 +15,7 @@ const cmd_publish = @import("cmd_publish.zig");
 const cmd_req = @import("cmd_req.zig");
 const cmd_verify = @import("cmd_verify.zig");
 
-pub const version = "0.3.0";
+pub const version = "0.3.1";
 
 const usage =
     \\deed: the nostr command line
