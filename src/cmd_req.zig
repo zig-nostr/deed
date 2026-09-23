@@ -38,6 +38,7 @@ pub const usage =
     \\
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
+    \\Looking up a relay's name is the one step that cannot be cut short.
     \\
     \\Given no relay, it prints what it would send and stops, so a filter can be
     \\read before it is asked of anybody:

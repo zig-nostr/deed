@@ -87,6 +87,9 @@ pub fn query(
     var relays: [max_relays]?*relay.Relay = @splat(null);
     var done: [max_relays]bool = @splat(false);
     const n = @min(urls.len, max_relays);
+    if (urls.len > max_relays) {
+        try err.print("deed: {d} relays were named, and only the first {d} are asked\n", .{ urls.len, max_relays });
+    }
 
     defer for (relays[0..n]) |maybe| {
         if (maybe) |r| {
@@ -258,6 +261,31 @@ test "a relay that never answers the dial costs the run its deadline, not foreve
     try std.testing.expectEqual(@as(usize, 1), outcome.complete);
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "no answer within 500 ms") != null);
     try std.testing.expect(took < 3_000);
+}
+
+test "relays past the most one run dials are named as left out, not dropped quietly" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+
+    // Closed ports: each dial is refused at once.
+    var closed = try testrelay.listen(io);
+    const port = closed.socket.address.ip4.port;
+    closed.deinit(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, port);
+    var urls: [max_relays + 1][]const u8 = undefined;
+    for (&urls) |*u| u.* = url;
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    _ = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 500, .poll_ms = 50 });
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "deed: 33 relays were named, and only the first 32 are asked\n") != null);
 }
 
 test {

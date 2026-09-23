@@ -13,6 +13,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # The tests talk to relays over real sockets, so a regression that brings
+    # back an unbounded wait shows up as a hang. It should fail the job in
+    # minutes, not hold a runner for hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:

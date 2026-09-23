@@ -28,6 +28,7 @@ pub const usage =
     \\
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
+    \\Looking up a relay's name is the one step that cannot be cut short.
     \\
     \\A bare npub fetches that person's profile rather than everything they have
     \\ever written, which is what `npub` on its own can sensibly mean.
