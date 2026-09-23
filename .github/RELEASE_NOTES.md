@@ -2,6 +2,24 @@
 
 Every artifact below is published with a `.sha256` beside it, so the download can be checked against a digest that was written by the same job that built it.
 
+### What's new in v0.3.0
+
+`publish` says what it published.
+
+**What comes out of `publish` is what was published.** Each event that at least one relay accepted is printed once the relays have answered or the deadline has passed, so `deed publish wss://a wss://b < events.jsonl > sent.jsonl` leaves a record of exactly which events a relay accepted in time. Every relay's answer goes to stderr with the event's id on it, including a relay saying it already had the event.
+
+**The exit code covers every event.** `publish` exits 0 only when every event was accepted by at least one relay. An event no relay accepted, a record that is not an event, or an event whose signature does not check out is reported on stderr and makes the run exit 1, and the rest of the stream still goes out. In v0.2.0 one acceptance anywhere in the run was enough to exit 0.
+
+**Events are checked before they are sent.** An event whose id or signature does not match its content is not offered to any relay.
+
+**One deadline per event.** Every relay is sent the event at once, and the relays have ten seconds from then to take it and answer, `--timeout` to change it. Each relay is read on its own for the whole run, so an answer is counted the moment it arrives, a relay that keeps sending notices, pings or messages that cannot be read does not keep the wait going, and a relay that stalls in the middle of a message holds up nobody else. A relay that stops reading what is sent to it is dropped when the deadline passes.
+
+**A relay that never answers the dial no longer holds a run open.** `req`, `fetch` and `publish` dial the relays at once, and a relay that has not accepted the connection within five seconds is named and left out. The name lookup is the one step that cannot be cut short. Before, a relay that accepted the TCP connection and never answered the websocket upgrade held the whole run, and every relay listed after it, forever. A relay that closes the connection while `publish` waits for more input is dialled again for the next event, and an event sent down a connection that closes before answering is offered once more on a fresh one.
+
+**Text from a relay is shown, not obeyed.** Control characters in a relay's refusal or notice are printed as escapes, so a relay cannot write a line of its own into the output or send control sequences to the terminal. Notices are shown up to eight per relay.
+
+**Two fixes from the nostr library, now at 0.14.5.** An event that carries a key NIP-01 does not name is accepted as the event that was signed, and a message from a relay that cannot be read costs that message only, rather than every message after it on that connection.
+
 ### What's new in v0.2.0
 
 deed reaches relays now, and keeps what it finds.
@@ -15,7 +33,7 @@ deed req -k 1 -l 50 --store ~/.deed/db wss://relay.example
 deed req -k 1 -l 50 --store ~/.deed/db --local
 ```
 
-The second dials nothing. The events are the same events, and they still verify, because what is stored is what was signed. Other nostr command lines do not do this: the one most people use keeps its local database behind a build tag for Linux on x86_64 only, and even there its own query verbs never write to it.
+The second dials nothing. The events are the same events, and they still verify, because what is stored is what was signed.
 
 **Events are checked before they are kept or printed.** A relay can send anything. A signature that does not verify is dropped, and so is an event that does not answer the question that was asked. Both are reported rather than silently skipped.
 
