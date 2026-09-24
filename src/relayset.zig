@@ -363,6 +363,41 @@ test "events kept in a store are written in batches, and every one is stored and
     try std.testing.expectEqual(@as(usize, n), try st.eventCount());
 }
 
+test "a relay that pings and never reads does not hold the run past its deadline" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+
+    // Answering its pings fills a socket it never reads, so a pong written
+    // without a bound would hold the read, and the run, forever.
+    var pinger: testrelay.Relay = undefined;
+    try pinger.start(io, .pings_deaf);
+    defer pinger.stop(io);
+    var live: testrelay.Relay = undefined;
+    try live.start(io, .accept);
+    defer live.stop(io);
+
+    var bufs: [2][40]u8 = undefined;
+    const urls = [_][]const u8{
+        try testrelay.url(&bufs[0], pinger.port()),
+        try testrelay.url(&bufs[1], live.port()),
+    };
+    const filters = [_]filter.Filter{.{ .kinds = &.{1}, .limit = 1 }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 1000, .poll_ms = 50, .until_eose = true });
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+
+    try std.testing.expectEqual(@as(usize, 1), outcome.complete);
+    try std.testing.expect(took < 5_000);
+}
+
 test "relays past the most one run dials are named as left out, not dropped quietly" {
     const io = std.testing.io;
     const testrelay = @import("testrelay.zig");
