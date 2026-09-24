@@ -76,6 +76,10 @@ Filters for `req`: `-k` kind, `-a` author, `-i` id, `-e` / `-p` / `-t` tag value
 - deed does not yet find an author's relays on its own: name the relays to ask.
 - There is no Windows build yet.
 
+## Judging what you fetch
+
+deed's output is one JSON event per line, so it pipes straight into anything that classifies text. [`examples/jev`](https://github.com/zig-nostr/deed/tree/main/examples/jev) ranks a global feed with Jev, TypeSafe's classification model: topic, substance and spam for each note, with the thresholds in the script. Jev is a paid API and needs `TYPESAFE_API_KEY`; run it with `--dry-run` first to see the requests without spending anything, and ask the user before a paid run.
+
 ## More
 
 - Source and full reference: https://github.com/zig-nostr/deed
