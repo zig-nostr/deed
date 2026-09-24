@@ -2,6 +2,12 @@
 
 Every artifact below is published with a `.sha256` beside it, so the download can be checked against a digest that was written by the same job that built it.
 
+### What's new in v0.3.2
+
+**deed works well with AI agents.** A skill in `skills/deed` teaches an agent the commands, working recipes, and the two rules that matter: publishing is public and permanent, so it asks first, and a secret key stays in `NOSTR_SECRET_KEY`. Add it with `npx skills add zig-nostr/deed`, or in Claude Code as a plugin. `AGENTS.md` covers changing deed itself.
+
+**A relay that sends pings and has stopped reading no longer holds `req` or `fetch`.** Answering its pings filled a socket it never read, and the reply waited forever, past `--timeout`. The nostr library now bounds that reply by the read's deadline, and deed moves to that version.
+
 ### What's new in v0.3.1
 
 Faster, smaller, and measured.
