@@ -117,6 +117,10 @@ npx skills add zig-nostr/deed
 
 In Claude Code it also installs as a plugin: `/plugin marketplace add zig-nostr/deed`, then `/plugin install deed@deed`.
 
+## Examples
+
+- [`examples/jev`](examples/jev): fetch the newest thousand notes from five relays and rank them by substance with [Jev](https://docs.typesafe.ai), dropping spam and app data on the way. A real run and what it cost are in its README.
+
 ## How fast it is
 
 A one-shot command runs in about 2.3 ms and under 2 MB of memory. deed signs and verifies about 31,000 events a second each, stores 100,000 events from a relay at about 17,000 a second, and answers a lookup from that store in about 3 ms, start to finish. The binaries are 2.3 to 2.7 MB. [BENCHMARKS.md](BENCHMARKS.md) has the full set and how to reproduce every number.

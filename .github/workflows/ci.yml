@@ -51,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           status=0
-          for f in scripts/*.sh; do
+          for f in scripts/*.sh examples/*/*.sh; do
             n="$(tr -d '\000-\177' < "$f" | wc -c | tr -d ' ')"
             if [ "$n" != "0" ]; then
               echo "$f carries $n bytes outside ASCII" >&2
@@ -63,6 +63,9 @@ jobs:
 
       - name: The installer parses
         run: bash -n scripts/install.sh
+
+      - name: The examples parse
+        run: for f in examples/*/*.sh; do bash -n "$f"; done
 
       # End to end against a real published release: resolve the artifact, fetch
       # it and the digest beside it, verify, install, and run what was installed.
