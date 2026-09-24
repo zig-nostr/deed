@@ -19,7 +19,7 @@ macOS and Linux, Intel and ARM. It works out which build this machine wants, che
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.3.1
+VERSION=0.3.2
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 
@@ -104,6 +104,18 @@ Scripts branch on these, so they are part of the interface and not free to drift
 | `1` | the command ran and failed: a bad signature, an unreadable key, a malformed code, an event no relay accepted |
 | `2` | the command was not understood: unknown verb, unknown flag, missing argument. Nothing was attempted |
 | `141` | the reader on the other end of the pipe went away, as in `deed decode … \| head -1` |
+
+## Using deed from an agent
+
+deed is built to be driven by scripts, and that makes it a good tool for AI agents doing nostr work: one result per line on stdout, diagnostics on stderr, exit codes that mean one thing each, and `deed help <command>` for the exact usage of anything.
+
+The skill in [`skills/deed`](skills/deed/SKILL.md) teaches an agent the commands, the recipes, and the two things to get right: publishing is public and permanent, so it asks first, and a secret key stays in `NOSTR_SECRET_KEY` rather than on a command line. Add it to any agent that supports skills:
+
+```sh
+npx skills add zig-nostr/deed
+```
+
+In Claude Code it also installs as a plugin: `/plugin marketplace add zig-nostr/deed`, then `/plugin install deed@deed`.
 
 ## How fast it is
 

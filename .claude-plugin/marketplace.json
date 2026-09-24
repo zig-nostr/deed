@@ -1,0 +1,15 @@
+{
+  "name": "deed",
+  "description": "deed, the nostr command line: keys, events, NIP-19, NIP-44, relays and a local store, from a shell.",
+  "owner": {
+    "name": "Sepehr Safari",
+    "url": "https://github.com/sepehr-safari"
+  },
+  "plugins": [
+    {
+      "name": "deed",
+      "source": "./",
+      "description": "Teaches the agent to use deed for nostr work: generating keys, signing and verifying events, NIP-19 codes, NIP-44, querying relays, publishing, and a local store it can query offline."
+    }
+  ]
+}

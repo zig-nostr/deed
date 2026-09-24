@@ -1,0 +1,12 @@
+{
+  "name": "deed",
+  "description": "Teaches the agent to use deed for nostr work: generating keys, signing and verifying events, NIP-19 codes, NIP-44, querying relays, publishing, and a local store it can query offline.",
+  "author": {
+    "name": "Sepehr Safari",
+    "url": "https://github.com/sepehr-safari"
+  },
+  "homepage": "https://zignostr.com/deed",
+  "repository": "https://github.com/zig-nostr/deed",
+  "license": "MIT",
+  "keywords": ["nostr", "cli", "zig", "nip-19", "nip-44", "relay", "signing"]
+}
