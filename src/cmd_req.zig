@@ -8,6 +8,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
+const keyinput = @import("keyinput.zig");
 const relayset = @import("relayset.zig");
 const storepath = @import("storepath.zig");
 
@@ -95,8 +96,8 @@ fn Collected(comptime T: type) type {
 fn idOrKey(gpa: std.mem.Allocator, s: []const u8) ?[32]u8 {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (t.len == 64) return hex.decodeFixed(32, t) catch null;
-    if (std.mem.startsWith(u8, t, "npub1")) return nostr.nip19.decodeNpub(gpa, t) catch null;
-    if (std.mem.startsWith(u8, t, "note1")) return nostr.nip19.decodeNote(gpa, t) catch null;
+    if (keyinput.hasPrefix(t, "npub1")) return nostr.nip19.decodeNpub(gpa, t) catch null;
+    if (keyinput.hasPrefix(t, "note1")) return nostr.nip19.decodeNote(gpa, t) catch null;
     return null;
 }
 
@@ -386,6 +387,30 @@ test "an author is taken as an npub or as hex, and means the same thing" {
     try std.testing.expectEqualStrings(from_hex.out, from_npub.out);
     // And what goes on the wire is hex, which is what a relay reads.
     try std.testing.expect(std.mem.indexOf(u8, from_hex.out, hex_key) != null);
+}
+
+test "an uppercase npub or note is taken the same as a lowercase one" {
+    const gpa = std.testing.allocator;
+    const key = [_]u8{0x55} ** 32;
+    const npub = try nostr.nip19.encodeNpub(gpa, key);
+    defer gpa.free(npub);
+    const note = try nostr.nip19.encodeNote(gpa, key);
+    defer gpa.free(note);
+    const npub_up = try std.ascii.allocUpperString(gpa, npub);
+    defer gpa.free(npub_up);
+    const note_up = try std.ascii.allocUpperString(gpa, note);
+    defer gpa.free(note_up);
+
+    try std.testing.expectEqual(key, idOrKey(gpa, npub_up).?);
+    try std.testing.expectEqual(key, idOrKey(gpa, note_up).?);
+
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const lower = try runReq(&.{ "-a", npub, "--bare" }, &ob, &eb);
+    var ob2: [4096]u8 = undefined;
+    var eb2: [1024]u8 = undefined;
+    const upper = try runReq(&.{ "-a", npub_up, "--bare" }, &ob2, &eb2);
+    try std.testing.expectEqualStrings(lower.out, upper.out);
 }
 
 test "tag filters land under their own letter" {
