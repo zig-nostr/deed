@@ -10,7 +10,7 @@ A deed is two things at once: a signed instrument, and a thing done. So is a nos
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash
 ```
 
-For macOS and Linux, Intel and ARM. It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
+For macOS and Linux, Intel and ARM; Windows is [below](#windows). It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
 
 `--prefix <dir>` puts it somewhere else, `--version <tag>` installs a particular release, and `--archive <file>` installs from a tarball you already have, which still wants its `.sha256` beside it. Pass `--help` for the list.
 
@@ -56,7 +56,7 @@ if (($user -split ';') -notcontains $dir) {
 }
 ```
 
-That checks the download, unpacks `deed.exe` into `%LOCALAPPDATA%\deed`, and puts that folder on your `PATH` unless it is there already, so the same lines install a newer version over an older one. Keep only the zip you mean to install in the folder. Open a new terminal and `deed version` confirms it. PowerShell compares the two digests without regard to case, so the capitals `Get-FileHash` prints are fine. The binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept.
+That checks the download, unpacks `deed.exe`, with the `LICENSE` and `README.md`, into `%LOCALAPPDATA%\deed`, and puts that folder on your `PATH` unless it is there already, so the same lines install a newer version over an older one. Keep only the zip you mean to install in the folder. Open a new terminal and `deed version` confirms it. PowerShell compares the two digests without regard to case, so the capitals `Get-FileHash` prints are fine. The binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept. deed reads a leading `~` in a `--store` path from `HOME`, which Windows does not usually set, so give a full path there.
 
 ## What it does
 
@@ -75,7 +75,7 @@ deed reaches relays and keeps what it finds. Every verb that does not need a soc
 | `fetch` | get the events a code names |
 | `publish` | offer signed events to relays, and print the ones they accepted |
 
-`deed help <command>` explains any of them.
+`deed help <command>` explains any of them. Wherever a verb takes an `npub`, `nsec` or `note` it also takes it in upper case, the form a QR code carries, and `decode` and `fetch` take a code with a `nostr:` prefix in either case. A code that mixes cases is refused, as bech32 requires.
 
 ## It keeps what it fetches
 
@@ -85,6 +85,8 @@ A run that reaches relays can keep what it received, and a later run can ask the
 deed req -k 1 -l 50 --store ~/.deed/db wss://relay.example   # once, over the network
 deed req -k 1 -l 50 --store ~/.deed/db --local               # again, dialling nothing
 ```
+
+`--store` creates the store and any directories above it the first time, so the path above works on a machine that has no `~/.deed` yet, and a leading `~` means the home directory even when the shell did not expand it. `--local` only reads: it opens a store that exists, and says there is none rather than leaving an empty one behind a mistyped path. When a store will not open, the message says why: the path is a directory, a part of it is a file, there is no permission, or the file is not a store.
 
 The second command opens no socket. The events came out of a local store that the first command filled, and they are the same events: `deed verify` is as happy with them as it was the first time, because what is stored is what was signed.
 

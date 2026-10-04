@@ -23,8 +23,9 @@ pub const usage =
     \\  deed decode [<code>...]
     \\
     \\Accepts npub, nsec, note, nprofile, nevent, naddr and nrelay, with or
-    \\without a leading `nostr:`. Reads codes one per line on stdin when given
-    \\no arguments. Prints one JSON object per code.
+    \\without a leading `nostr:`, in lower case or all upper case (the form a
+    \\QR code carries). Reads codes one per line on stdin when given no
+    \\arguments. Prints one JSON object per code.
     \\
     \\  deed decode npub1…            {"pubkey":"…"}
     \\  deed decode nevent1…          {"id":"…","relays":[…],"kind":1}

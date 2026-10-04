@@ -42,8 +42,9 @@ pub const usage =
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
     \\
-    \\A store is one file. --store creates it, and any directories above it, the
-    \\first time; --local reads only a store that already exists.
+    \\A store is one file, with a -lock file beside it. --store creates them, and
+    \\any directories above them, the first time; --local reads only a store that
+    \\already exists.
     \\
     \\Given no relay, it prints what it would send and stops, so a filter can be
     \\read before it is asked of anybody:

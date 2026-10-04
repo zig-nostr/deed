@@ -21,8 +21,8 @@ pub const usage =
     \\  deed fetch <code> [<relay-url>...]
     \\
     \\Accepts note, nevent, naddr, nprofile and npub, with or without a leading
-    \\`nostr:`. A code carrying relay hints is looked for at those relays as
-    \\well as any named here.
+    \\`nostr:`, in lower case or all upper case. A code carrying relay hints is
+    \\looked for at those relays as well as any named here.
     \\
     \\Options:
     \\      --store <path>   keep every event this receives in a local store
@@ -32,8 +32,8 @@ pub const usage =
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
     \\
-    \\A store is one file. --store creates it, and any directories above it, the
-    \\first time.
+    \\A store is one file, with a -lock file beside it. --store creates them, and
+    \\any directories above them, the first time.
     \\
     \\A bare npub fetches that person's profile rather than everything they have
     \\ever written, which is what `npub` on its own can sensibly mean.

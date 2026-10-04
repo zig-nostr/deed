@@ -31,7 +31,8 @@ Shared pieces:
 - `cli.zig`: the exit code constants, `isOneOf`, and `Input`, the reader every verb uses for its records.
 - `relayset.zig`: the query that `req` and `fetch` share.
 - `dial.zig`: dialling many relays at once under one deadline.
-- `keyinput.zig`: reading a key as `nsec1...`, `npub1...` or hex.
+- `keyinput.zig`: reading a key as `nsec1...`, `npub1...` or hex, and the two helpers every code reader uses to match an entity prefix and strip `nostr:` ignoring ASCII case. Use them and not `startsWith`, or an uppercase code is refused as unknown.
+- `storepath.zig`: opening the store a `--store` path names, see the store section.
 - `jsonout.zig`: escaping strings for JSON output.
 - `console.zig`: Windows only, see Platforms.
 - `testrelay.zig`: a websocket relay on loopback, used by tests only.
@@ -65,9 +66,11 @@ Relay text is untrusted. `publish` escapes the notices and refusal reasons a rel
 
 ## The store
 
-`--store <path>` names an LMDB file, opened with `nostr.store.Store`. `req` and `fetch` write to it and `req --local` reads from it. `publish` does not touch it. deed picks no default path and does not create the directory around it. On Windows LMDB sizes the file to its whole map (the library's default, 1 GiB) when it is opened, so a new store takes that much disk at once.
+`--store <path>` names an LMDB file, opened with `nostr.store.Store`. `req` and `fetch` write to it and `req --local` reads from it. `publish` does not touch it. deed picks no default path. On Windows LMDB sizes the file to its whole map (the library's default, 1 GiB) when it is opened, so a new store takes that much disk at once.
 
-The store comes from the library, along with its indexes, replaceable event rules and deletion handling. deed's part is small: events are handed over in batches already verified, so the store is not asked to verify again, and a failed open is reported with the path and the error name and exits 1.
+The store comes from the library, along with its indexes, replaceable event rules and deletion handling. deed's part is small: events are handed over in batches already verified, so the store is not asked to verify again, and the open goes through `storepath.zig`.
+
+`storepath.open` takes a mode. A run that writes (`req` and `fetch` with `--store`) uses `create`: it makes the directories above the path first, as `mkdir -p` does, and then lets LMDB make the file and its `-lock` file beside it. `req --local` only reads, so it uses `existing`: with no file there it says "there is no store at" and creates nothing. A leading `~` is read from `HOME`, because a quoted one is not expanded by the shell and would otherwise make a directory named `~`; `~user` is refused, and so is an empty path. LMDB reports every reason an open failed as one status, so when it fails `storepath` looks at the path itself and names the cause: a directory, a part of the path that is a file, no permission to read and write the file or its directory, a read-only file system, or a file that is not a store, which is left as it was. A failed open exits 1.
 
 ## Exit codes
 
