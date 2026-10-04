@@ -9,7 +9,8 @@
 # outside your home directory, and nothing is installed that did not verify.
 #
 # One script for both systems rather than two, because deed publishes the same
-# thing four times: a tar.gz holding one static binary, named for the platform.
+# thing four times for them: a tar.gz holding one static binary, named for the
+# platform. Windows builds are zips and are installed by hand, see the README.
 # Two scripts would share every line that matters and drift in the ones that do
 # not.
 #
@@ -86,7 +87,8 @@ detect() {
   case "$os" in
     darwin) os=macos ;;
     linux)  os=linux ;;
-    *) die "deed publishes macOS and Linux builds. This machine reports '$os'." ;;
+    mingw*|msys*|cygwin*) die "this script installs the macOS and Linux builds. On Windows, download the .zip from https://github.com/$repo/releases and follow the README." ;;
+    *) die "deed publishes macOS, Linux and Windows builds. This machine reports '$os'." ;;
   esac
 
   case "$arch" in

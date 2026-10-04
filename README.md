@@ -10,7 +10,7 @@ A deed is two things at once: a signed instrument, and a thing done. So is a nos
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash
 ```
 
-macOS and Linux, Intel and ARM. It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
+For macOS and Linux, Intel and ARM; Windows is [below](#windows). It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
 
 `--prefix <dir>` puts it somewhere else, `--version <tag>` installs a particular release, and `--archive <file>` installs from a tarball you already have, which still wants its `.sha256` beside it. Pass `--help` for the list.
 
@@ -19,7 +19,7 @@ macOS and Linux, Intel and ARM. It works out which build this machine wants, che
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.3.2
+VERSION=0.4.0
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 
@@ -38,6 +38,26 @@ The macOS builds are ad-hoc signed and not notarized. A copy that arrived throug
 xattr -dr com.apple.quarantine deed
 ```
 
+### Windows
+
+Windows takes a zip rather than the script. Download `deed-<version>-windows-x86_64.zip` (or `windows-aarch64` on an ARM machine) and the `.sha256` beside it from the [releases page](https://github.com/zig-nostr/deed/releases), then in PowerShell, from the folder they are in:
+
+```powershell
+$zip = (Get-Item deed-*-windows-*.zip).Name
+$want = (Get-Content "$zip.sha256").Split(' ')[0]
+$got = (Get-FileHash $zip -Algorithm SHA256).Hash
+if ($got -ne $want) { throw "the SHA-256 does not match, do not run this" }
+
+$dir = "$env:LOCALAPPDATA\deed"
+Expand-Archive $zip -DestinationPath $dir -Force
+$user = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($user -split ';') -notcontains $dir) {
+  [Environment]::SetEnvironmentVariable('Path', "$user;$dir".TrimStart(';'), 'User')
+}
+```
+
+That checks the download, unpacks `deed.exe`, with the `LICENSE` and `README.md`, into `%LOCALAPPDATA%\deed`, and puts that folder on your `PATH` unless it is there already, so the same lines install a newer version over an older one. Keep only the zip you mean to install in the folder. Open a new terminal and `deed version` confirms it. PowerShell compares the two digests without regard to case, so the capitals `Get-FileHash` prints are fine. The binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept. deed reads a leading `~` in a `--store` path from `HOME`, which Windows does not usually set, so give a full path there.
+
 ## What it does
 
 deed reaches relays and keeps what it finds. Every verb that does not need a socket still works without one, so what comes out can be read before any of it leaves the machine.
@@ -55,7 +75,7 @@ deed reaches relays and keeps what it finds. Every verb that does not need a soc
 | `fetch` | get the events a code names |
 | `publish` | offer signed events to relays, and print the ones they accepted |
 
-`deed help <command>` explains any of them.
+`deed help <command>` explains any of them. Wherever a verb takes an `npub`, `nsec` or `note` it also takes it in upper case, the form a QR code carries, and `decode` and `fetch` take a code with a `nostr:` prefix in either case. A code that mixes cases is refused, as bech32 requires.
 
 ## It keeps what it fetches
 
@@ -66,6 +86,8 @@ deed req -k 1 -l 50 --store ~/.deed/db wss://relay.example   # once, over the ne
 deed req -k 1 -l 50 --store ~/.deed/db --local               # again, dialling nothing
 ```
 
+`--store` creates the store and any directories above it the first time, so the path above works on a machine that has no `~/.deed` yet, and a leading `~` means the home directory even when the shell did not expand it. `--local` only reads: it opens a store that exists, and says there is none rather than leaving an empty one behind a mistyped path. When a store will not open, the message says why: the path is a directory, a part of it is a file, there is no permission, or the file is not a store.
+
 The second command opens no socket. The events came out of a local store that the first command filled, and they are the same events: `deed verify` is as happy with them as it was the first time, because what is stored is what was signed.
 
 Events are checked before they are stored or printed. A relay can send anything, so a signature that does not verify, and an event that does not answer the question that was asked, are both dropped and reported.
@@ -73,8 +95,6 @@ Events are checked before they are stored or printed. A relay can send anything,
 ## What is missing
 
 **Relay selection.** A code with no relay hints is not looked up: `deed fetch npub1...` asks you to name a relay rather than going to find the author's relay list first. Doing that properly means a second round trip and a cache with its own staleness rules, and doing it badly is worse than saying so.
-
-**Windows.** deed does not compile there yet, and the protocol library cannot resolve a hostname on Windows ([nostr#59](https://github.com/zig-nostr/nostr/issues/59)).
 
 ## How the verbs fit together
 
@@ -134,6 +154,8 @@ zig build run -- --help
 ```
 
 Uses the Zig version pinned in `.zigversion`. The protocol library is pinned by URL and digest in `build.zig.zon`, so a build here and a build in CI are the same build.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how deed is put together: where each command lives, how a run flows, the store, the exit codes and how it is tested.
 
 ## License
 

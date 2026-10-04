@@ -11,22 +11,27 @@ A guide to this repository for anyone changing it, people and coding agents alik
 ```sh
 zig build                                        # binary at zig-out/bin/deed
 zig build test                                   # unit tests, including real relays on loopback
-zig fmt --check src build.zig                    # CI fails on unformatted code
+zig fmt --check .                                # CI fails on unformatted code
 zig build -Doptimize=ReleaseSafe -Dstrip=true    # the release build
 python3 bench/run.py zig-out/bin/deed            # benchmarks, see BENCHMARKS.md
+zig build test -Dtarget=x86_64-windows-gnu       # compile the tests for Windows; the run step then fails, the host cannot run them
 ```
 
-Use the Zig version in `.zigversion`. The `nostr` dependency is pinned by URL and hash in `build.zig.zon`; move it with `zig fetch --save=nostr <tarball url>` and check the diff is only the url and hash lines.
+Use the Zig version in `.zigversion`. Building only the executable for Windows is not enough to catch a break there: code the executable never reaches, the test relay for one, only gets analysed when the test binary is built, which is what the Windows line above does. The `nostr` dependency is pinned by URL and hash in `build.zig.zon`; move it with `zig fetch --save=nostr <tarball url>` and check the diff is only the url and hash lines.
 
 ## Layout
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) explains how the pieces fit: where each command lives, how a run flows, the store, the exit codes and how it is tested. The tree below is the short version.
 
 ```
 src/
   main.zig        # dispatch, the stdout/stderr writers, exit codes
   cli.zig         # exit code constants, the stdin record reader
+  console.zig     # Windows only: UTF-8 console code pages for the length of a run
   cmd_*.zig       # one file per verb
   relayset.zig    # the shared relay query behind req and fetch
   dial.zig        # dialling every relay at once under one deadline
+  storepath.zig   # opening the store a --store path names, and saying why one will not open
   testrelay.zig   # a websocket relay on loopback, for tests only
 bench/            # the benchmark script and its relay
 scripts/          # the one-line installer (pure ASCII, CI checks it)
@@ -37,6 +42,8 @@ skills/deed/      # the skill for agents that operate deed
 
 - Every verb takes its inputs as arguments or, given none, as newline-delimited records on stdin, and writes one result per line on stdout. Diagnostics go to stderr. Keep it that way: it is what makes the verbs compose.
 - Exit codes are an interface: 0 success, 1 ran and failed, 2 not understood, 141 the reader went away. Do not add new ones casually.
+- Match a NIP-19 prefix with `keyinput.hasPrefix` and strip `nostr:` with `keyinput.stripUri`, never `std.mem.startsWith`: bech32 allows all upper case, and a code in upper case has to reach the decoder.
+- Open a `--store` path with `storepath.open`, so a new store's directories are made and a store that will not open says why.
 - Anything a relay sends is untrusted: events are verified and matched against the filter before they are printed or stored, and relay text is escaped before it reaches a terminal.
 - Tests that dial use `testrelay.DialAllocator`, not `std.testing.allocator`: on macOS a stack-capturing allocator can swallow a cancel and hang the test.
 - `zig build test` caches passing runs. To check for flakiness, run the test binary directly (`ls -t .zig-cache/o/*/test | head -1`) several times.

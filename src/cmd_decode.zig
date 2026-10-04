@@ -6,6 +6,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
+const keyinput = @import("keyinput.zig");
 
 const nip19 = nostr.nip19;
 const hex = nostr.hex;
@@ -22,8 +23,9 @@ pub const usage =
     \\  deed decode [<code>...]
     \\
     \\Accepts npub, nsec, note, nprofile, nevent, naddr and nrelay, with or
-    \\without a leading `nostr:`. Reads codes one per line on stdin when given
-    \\no arguments. Prints one JSON object per code.
+    \\without a leading `nostr:`, in lower case or all upper case (the form a
+    \\QR code carries). Reads codes one per line on stdin when given no
+    \\arguments. Prints one JSON object per code.
     \\
     \\  deed decode npub1…            {"pubkey":"…"}
     \\  deed decode nevent1…          {"id":"…","relays":[…],"kind":1}
@@ -107,38 +109,38 @@ fn reason(e: anyerror) []const u8 {
 /// Decodes one code into a JSON object. Caller owns the returned bytes.
 fn decodeOne(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     // `nostr:npub1…` and `npub1…` are the same code wearing different clothes.
-    const code = nip19.fromNostrUri(std.mem.trim(u8, raw, " \t\r\n"));
+    const code = keyinput.stripUri(std.mem.trim(u8, raw, " \t\r\n"));
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     try buf.append(gpa, '{');
 
-    if (std.mem.startsWith(u8, code, "npub1")) {
+    if (keyinput.hasPrefix(code, "npub1")) {
         try appendHexField(&buf, gpa, "pubkey", &try nip19.decodeNpub(gpa, code), true);
-    } else if (std.mem.startsWith(u8, code, "nsec1")) {
+    } else if (keyinput.hasPrefix(code, "nsec1")) {
         try appendHexField(&buf, gpa, "seckey", &try nip19.decodeNsec(gpa, code), true);
-    } else if (std.mem.startsWith(u8, code, "note1")) {
+    } else if (keyinput.hasPrefix(code, "note1")) {
         try appendHexField(&buf, gpa, "id", &try nip19.decodeNote(gpa, code), true);
-    } else if (std.mem.startsWith(u8, code, "nprofile1")) {
+    } else if (keyinput.hasPrefix(code, "nprofile1")) {
         var p = try nip19.decodeNprofile(gpa, code);
         defer p.deinit(gpa);
         try appendHexField(&buf, gpa, "pubkey", &p.pubkey, true);
         try appendRelays(&buf, gpa, p.relays, false);
-    } else if (std.mem.startsWith(u8, code, "nevent1")) {
+    } else if (keyinput.hasPrefix(code, "nevent1")) {
         var p = try nip19.decodeNevent(gpa, code);
         defer p.deinit(gpa);
         try appendHexField(&buf, gpa, "id", &p.id, true);
         try appendRelays(&buf, gpa, p.relays, false);
         if (p.author) |a| try appendHexField(&buf, gpa, "author", &a, false);
         if (p.kind) |k| try appendIntField(&buf, gpa, "kind", k, false);
-    } else if (std.mem.startsWith(u8, code, "naddr1")) {
+    } else if (keyinput.hasPrefix(code, "naddr1")) {
         var p = try nip19.decodeNaddr(gpa, code);
         defer p.deinit(gpa);
         try appendStringField(&buf, gpa, "identifier", p.identifier, true);
         try appendHexField(&buf, gpa, "pubkey", &p.pubkey, false);
         try appendIntField(&buf, gpa, "kind", p.kind, false);
         try appendRelays(&buf, gpa, p.relays, false);
-    } else if (std.mem.startsWith(u8, code, "nrelay1")) {
+    } else if (keyinput.hasPrefix(code, "nrelay1")) {
         const url = try nip19.decodeNrelay(gpa, code);
         defer gpa.free(url);
         try appendStringField(&buf, gpa, "url", url, true);
@@ -264,4 +266,48 @@ test "nevent carries its optional fields only when present" {
 test "an unknown prefix is refused" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidPrefix, decodeOne(gpa, "nwhat1abc"));
+}
+
+test "an uppercase code, with either scheme case, decodes like the lowercase one" {
+    const gpa = std.testing.allocator;
+    const id = [_]u8{0x05} ** 32;
+    const hints = [_][]const u8{"wss://relay.example"};
+    const codes = [_][]u8{
+        try nip19.encodeNpub(gpa, id),
+        try nip19.encodeNsec(gpa, id),
+        try nip19.encodeNote(gpa, id),
+        try nip19.encodeNprofile(gpa, id, &hints),
+        try nip19.encodeNevent(gpa, id, &hints, id, 1),
+        try nip19.encodeNaddr(gpa, "slug", id, 30023, &hints),
+        try nip19.encodeNrelay(gpa, "wss://relay.example"),
+    };
+    defer for (codes) |c| gpa.free(c);
+
+    for (codes) |lower| {
+        const want = try decodeOne(gpa, lower);
+        defer gpa.free(want);
+        const upper = try std.ascii.allocUpperString(gpa, lower);
+        defer gpa.free(upper);
+        const forms = [_][]const u8{ "", "NOSTR:", "nostr:" };
+        for (forms) |scheme| {
+            const input = try std.fmt.allocPrint(gpa, "{s}{s}", .{ scheme, upper });
+            defer gpa.free(input);
+            const got = try decodeOne(gpa, input);
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(want, got);
+        }
+        const loud = try std.fmt.allocPrint(gpa, "NOSTR:{s}", .{lower});
+        defer gpa.free(loud);
+        const got = try decodeOne(gpa, loud);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
+}
+
+test "a code that mixes cases is still refused" {
+    const gpa = std.testing.allocator;
+    const npub = try nip19.encodeNpub(gpa, [_]u8{0x06} ** 32);
+    defer gpa.free(npub);
+    npub[0] = 'N';
+    try std.testing.expectError(error.MixedCase, decodeOne(gpa, npub));
 }

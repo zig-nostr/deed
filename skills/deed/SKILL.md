@@ -5,7 +5,7 @@ description: Use deed, the nostr command line, to work with nostr from a shell. 
 
 # deed
 
-A fast command line for nostr. One binary, macOS and Linux. Every command takes its input as arguments or as newline-delimited records on stdin, and writes one result per line on stdout, so commands pipe into each other and into `jq`.
+A fast command line for nostr. One binary, on macOS, Linux and Windows. Every command takes its input as arguments or as newline-delimited records on stdin, and writes one result per line on stdout, so commands pipe into each other and into `jq`.
 
 ## Install
 
@@ -13,7 +13,7 @@ A fast command line for nostr. One binary, macOS and Linux. Every command takes 
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash
 ```
 
-Installs into `~/.local/bin` after checking the download's SHA-256. `deed version` confirms it. `deed help <command>` prints the exact usage of any command; check it before guessing a flag.
+Installs into `~/.local/bin` after checking the download's SHA-256. That is for macOS and Linux; on Windows, download the `.zip` from the releases page and put `deed.exe` on `PATH`. `deed version` confirms it. `deed help <command>` prints the exact usage of any command; check it before guessing a flag.
 
 ## Before you act
 
@@ -58,6 +58,7 @@ deed fetch npub1... wss://relay.example       # a code with no relay hints needs
 
 # NIP-19
 deed decode nprofile1...                      # {"pubkey":"...","relays":[...]}
+deed decode NOSTR:NPUB1...                    # upper case and a nostr: prefix are both fine
 deed encode nevent <id-hex> --relay wss://relay.example --kind 1
 
 # NIP-44
@@ -70,11 +71,11 @@ Filters for `req`: `-k` kind, `-a` author, `-i` id, `-e` / `-p` / `-t` tag value
 ## Things that trip people up
 
 - `deed event -` needs the `-` to read drafts from stdin; without it, it signs one empty-content event.
+- `--store` creates the file and any directories above it, so `~/.deed/db` works on a fresh machine. `--local` only reads: with no store at the path it says so and exits 1.
 - `deed verify` is silent on success. Check the exit code, not the output.
 - Events from relays are verified and matched against the filter before they are printed, so a relay cannot slip in forged or unrelated events. Anything dropped is reported on stderr.
 - A relay that does not accept the connection within five seconds (or `--timeout`, if shorter) is named on stderr and left out; the run carries on with the others.
 - deed does not yet find an author's relays on its own: name the relays to ask.
-- There is no Windows build yet.
 
 ## Judging what you fetch
 

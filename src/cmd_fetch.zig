@@ -6,7 +6,9 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
+const keyinput = @import("keyinput.zig");
 const relayset = @import("relayset.zig");
+const storepath = @import("storepath.zig");
 
 const nip19 = nostr.nip19;
 const filter = nostr.filter;
@@ -19,8 +21,8 @@ pub const usage =
     \\  deed fetch <code> [<relay-url>...]
     \\
     \\Accepts note, nevent, naddr, nprofile and npub, with or without a leading
-    \\`nostr:`. A code carrying relay hints is looked for at those relays as
-    \\well as any named here.
+    \\`nostr:`, in lower case or all upper case. A code carrying relay hints is
+    \\looked for at those relays as well as any named here.
     \\
     \\Options:
     \\      --store <path>   keep every event this receives in a local store
@@ -29,6 +31,9 @@ pub const usage =
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
+    \\
+    \\A store is one file, with a -lock file beside it. --store creates them, and
+    \\any directories above them, the first time.
     \\
     \\A bare npub fetches that person's profile rather than everything they have
     \\ever written, which is what `npub` on its own can sensibly mean.
@@ -119,12 +124,7 @@ pub fn run(
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();
     if (store_path) |path| {
-        const z = try gpa.dupeZ(u8, path);
-        defer gpa.free(z);
-        store = nostr.store.Store.open(z, .{}) catch |e| {
-            try err.print("deed fetch: cannot open the store at {s}: {s}\n", .{ path, @errorName(e) });
-            return cli.exit_fail;
-        };
+        store = (try storepath.open(gpa, io, "fetch", path, .create, err)) orelse return cli.exit_fail;
     }
 
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{
@@ -171,18 +171,18 @@ fn resolve(
     d_values: *[1][]const u8,
     tags: *[1]filter.TagFilter,
 ) !Resolved {
-    const s = if (std.mem.startsWith(u8, raw, "nostr:")) raw["nostr:".len..] else raw;
+    const s = keyinput.stripUri(raw);
 
-    if (std.mem.startsWith(u8, s, "nevent1")) {
+    if (keyinput.hasPrefix(s, "nevent1")) {
         const p = try nip19.decodeNevent(gpa, s);
         ids[0] = p.id;
         return .{ .filter = .{ .ids = ids[0..1] }, .hints = p.relays, .owned = p.relays };
     }
-    if (std.mem.startsWith(u8, s, "note1")) {
+    if (keyinput.hasPrefix(s, "note1")) {
         ids[0] = try nip19.decodeNote(gpa, s);
         return .{ .filter = .{ .ids = ids[0..1] }, .hints = &.{} };
     }
-    if (std.mem.startsWith(u8, s, "naddr1")) {
+    if (keyinput.hasPrefix(s, "naddr1")) {
         const p = try nip19.decodeNaddr(gpa, s);
         authors[0] = p.pubkey;
         kinds[0] = @intCast(p.kind);
@@ -195,7 +195,7 @@ fn resolve(
             .owned_identifier = p.identifier,
         };
     }
-    if (std.mem.startsWith(u8, s, "nprofile1")) {
+    if (keyinput.hasPrefix(s, "nprofile1")) {
         const p = try nip19.decodeNprofile(gpa, s);
         authors[0] = p.pubkey;
         kinds[0] = 0;
@@ -205,7 +205,7 @@ fn resolve(
             .owned = p.relays,
         };
     }
-    if (std.mem.startsWith(u8, s, "npub1")) {
+    if (keyinput.hasPrefix(s, "npub1")) {
         authors[0] = try nip19.decodeNpub(gpa, s);
         // Kind 0, not everything. A bare npub names a person, and the thing a
         // person's code most usefully resolves to is who they say they are.
@@ -324,6 +324,47 @@ test "a nostr: prefix is stripped, and nonsense is refused" {
     try testing.expectEqualSlices(u8, &id, &r.filter.ids.?[0]);
 
     try testing.expectError(error.InvalidPrefix, resolveFor("not-a-code", bufs));
+}
+
+test "an uppercase code resolves like the lowercase one, with or without NOSTR:" {
+    var ids: [1][32]u8 = undefined;
+    var authors: [1][32]u8 = undefined;
+    var kinds: [1]u16 = undefined;
+    var d: [1][]const u8 = undefined;
+    var tags: [1]filter.TagFilter = undefined;
+    const bufs = .{ .ids = &ids, .authors = &authors, .kinds = &kinds, .d = &d, .tags = &tags };
+
+    const key = [_]u8{0x44} ** 32;
+    const hints = [_][]const u8{"wss://one.example"};
+    const codes = [_][]u8{
+        try nip19.encodeNote(testing.allocator, key),
+        try nip19.encodeNevent(testing.allocator, key, &hints, null, null),
+        try nip19.encodeNaddr(testing.allocator, "my-article", key, 30023, &.{}),
+        try nip19.encodeNprofile(testing.allocator, key, &hints),
+        try nip19.encodeNpub(testing.allocator, key),
+    };
+    defer for (codes) |c| testing.allocator.free(c);
+
+    for (codes) |lower| {
+        var want = try resolveFor(lower, bufs);
+        defer want.deinit(testing.allocator);
+        const want_hints = want.hints.len;
+        const want_id: ?[32]u8 = if (want.filter.ids) |v| v[0] else null;
+        const want_author: ?[32]u8 = if (want.filter.authors) |v| v[0] else null;
+
+        const upper = try std.ascii.allocUpperString(testing.allocator, lower);
+        defer testing.allocator.free(upper);
+        const forms = [_][]const u8{ "", "NOSTR:" };
+        for (forms) |scheme| {
+            const input = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ scheme, upper });
+            defer testing.allocator.free(input);
+            var got = try resolveFor(input, bufs);
+            defer got.deinit(testing.allocator);
+            try testing.expectEqual(want_hints, got.hints.len);
+            try testing.expectEqual(want_id, if (got.filter.ids) |v| v[0] else null);
+            try testing.expectEqual(want_author, if (got.filter.authors) |v| v[0] else null);
+        }
+    }
 }
 
 test "64 hex characters are taken as an event id" {
