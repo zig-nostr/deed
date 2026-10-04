@@ -105,7 +105,7 @@ Two details matter when adding a test that dials. Use `testrelay.DialAllocator` 
 
 `bench/` is not a test suite. `bench/run.py` measures size, startup, memory, signing and verifying throughput, store speed, and relays over loopback against a build, using `bench/relay.py` as the relay. [`BENCHMARKS.md`](BENCHMARKS.md) has the numbers and how to reproduce them.
 
-CI (`.github/workflows/ci.yml`) builds, tests and checks formatting on Linux and macOS, builds and tests on Windows, checks that the installer script is pure ASCII and parses, and installs the latest release and runs it. The release workflow (`release.yml`) builds every target from the tag, publishes each as a draft with a SHA-256 beside it, downloads the artifacts back and runs them on matching runners, and lifts the draft only after every check passes.
+CI (`.github/workflows/ci.yml`) builds, tests and checks formatting on Linux and macOS, builds and tests on Windows, checks that the installer scripts are pure ASCII and parse, and installs the latest release and runs it, with install.sh on Linux and macOS and with install.ps1 on Windows under both pwsh and Windows PowerShell 5.1. The release workflow (`release.yml`) builds every target from the tag, publishes each as a draft with a SHA-256 beside it, downloads the artifacts back and runs them on matching runners, and lifts the draft only after every check passes.
 
 ## Where to start reading
 

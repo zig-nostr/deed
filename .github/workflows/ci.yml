@@ -43,7 +43,9 @@ jobs:
 
       # The installer is served over `curl | bash`, and macOS ships bash 3.2,
       # where a multibyte character sitting next to a $variable under `set -u`
-      # aborts the script. An installer that dies on its own punctuation is a
+      # aborts the script. The Windows one is read by Windows PowerShell 5.1,
+      # which takes a file without a byte order mark to be in the machine's
+      # legacy code page. An installer that dies on its own punctuation is a
       # bad first impression, so the scripts are pure ASCII and this is what
       # keeps them that way. `tr` rather than a grep class, because BSD grep has
       # no -P and the character classes differ between the two greps.
@@ -51,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           status=0
-          for f in scripts/*.sh examples/*/*.sh; do
+          for f in scripts/*.sh scripts/*.ps1 examples/*/*.sh; do
             n="$(tr -d '\000-\177' < "$f" | wc -c | tr -d ' ')"
             if [ "$n" != "0" ]; then
               echo "$f carries $n bytes outside ASCII" >&2
@@ -167,3 +169,125 @@ jobs:
           sk="$("$bin" key generate --hex)"
           NOSTR_SECRET_KEY="$sk" "$bin" event -c "windows check" | "$bin" verify
           echo "deed runs on Windows"
+
+  # The Windows installer, end to end against the newest published release,
+  # under both PowerShells: pwsh, and Windows PowerShell 5.1, which is the one
+  # every Windows machine has and the one whose syntax the script keeps to.
+  install-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The newest PUBLISHED release, not the newest tag, as the check for
+      # install.sh asks: a tag whose release is still a draft has nothing a
+      # reader could download.
+      - name: Find the newest published release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          if [ -z "$tag" ]; then
+            echo "no release tag exists yet, so the installer was NOT exercised" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: The installer parses
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Host $_ }; exit 1 }
+          Write-Host "install.ps1 parses under PowerShell $($PSVersionTable.PSVersion)"
+
+      # The way the README runs it: the script's text handed to
+      # Invoke-Expression, which is all `irm | iex` does, with the options in
+      # the environment because a piped run has no command line. The text comes
+      # from this checkout rather than from main, so it is the change under
+      # test that runs.
+      - name: The piped installer installs a release, and it runs
+        env:
+          DEED_VERSION: ${{ steps.release.outputs.tag }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'deed-piped'
+          $env:DEED_PREFIX = $prefix
+          Get-Content -Raw scripts/install.ps1 | Invoke-Expression
+          $bin = Join-Path $prefix 'deed.exe'
+          if (-not (Test-Path -LiteralPath $bin)) { Write-Host "the installer reported success and installed nothing"; exit 1 }
+          $got = & $bin version
+          $want = "deed $($env:TAG.Substring(1))"
+          if ($got -ne $want) { Write-Host "installed binary says '$got', expected '$want'"; exit 1 }
+          Write-Host "installed $got"
+
+      # The same, run as a file with options on its command line. It runs twice,
+      # because installing over an existing copy is how an upgrade happens, and
+      # the second run must not add the folder to PATH a second time.
+      - name: The installer run as a file installs a release, and PATH gets one entry
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'deed'
+          foreach ($run in 1, 2) {
+            & .\scripts\install.ps1 -Version $env:TAG -Prefix $prefix
+            if ($LASTEXITCODE -ne 0) { Write-Host "run $run of the installer failed"; exit 1 }
+          }
+          $got = & (Join-Path $prefix 'deed.exe') version
+          $want = "deed $($env:TAG.Substring(1))"
+          if ($got -ne $want) { Write-Host "installed binary says '$got', expected '$want'"; exit 1 }
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $entries = @($user -split ';' | Where-Object { $_.TrimEnd('\') -eq $prefix.TrimEnd('\') })
+          if ($entries.Count -ne 1) { Write-Host "the user PATH carries $prefix $($entries.Count) times, expected once"; exit 1 }
+          "bin=$(Join-Path $prefix 'deed.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          Write-Host "installed $got, on PATH once"
+
+      # A real gesture rather than just `version`: libsecp256k1, the bech32
+      # encoder and the JSON writer and reader in one line, as the check for
+      # install.sh does. In bash, so the pipe between the two deeds carries
+      # bytes and not the re-encoded text PowerShell would make of it.
+      - name: The installed deed signs and verifies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$(cygpath -u "$bin")"
+          sk="$("$bin" key generate --hex)"
+          "$bin" event -c "installer check" --sec "$sk" | "$bin" verify
+          echo "the installed deed works"
+
+      # The guard above has to be able to fail. A tampered archive must be
+      # refused and must install nothing, because a checksum that is checked and
+      # then ignored is worse than none: it reads as a promise. The untampered
+      # archive goes through first, so a refusal means the digest and not the
+      # -Archive path.
+      - name: A download that does not verify is refused
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'tamper'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $asset = "deed-$($env:TAG.Substring(1))-windows-x86_64.zip"
+          $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG"
+          $zip = Join-Path $work $asset
+          Invoke-WebRequest -Uri "$base/$asset" -OutFile $zip -UseBasicParsing
+          Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile "$zip.sha256" -UseBasicParsing
+
+          & .\scripts\install.ps1 -Archive $zip -Prefix (Join-Path $work 'ok')
+          if ($LASTEXITCODE -ne 0) { Write-Host "the installer refused the archive as published"; exit 1 }
+
+          [IO.File]::AppendAllText($zip, 'x')
+          $out = Join-Path $work 'out'
+          & .\scripts\install.ps1 -Archive $zip -Prefix $out
+          if ($LASTEXITCODE -eq 0) { Write-Host "the installer accepted a tampered archive"; exit 1 }
+          if (Test-Path -LiteralPath (Join-Path $out 'deed.exe')) { Write-Host "it refused and installed anyway"; exit 1 }
+          Write-Host "a tampered archive is refused and nothing is installed"
+          exit 0
