@@ -19,7 +19,7 @@ For macOS and Linux, Intel and ARM; Windows is [below](#windows). It works out w
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.3.2
+VERSION=0.4.0
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 

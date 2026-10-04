@@ -2,6 +2,14 @@
 
 Every artifact below is published with a `.sha256` beside it, so the download can be checked against a digest that was written by the same job that built it.
 
+### What's new in v0.4.0
+
+**deed runs on Windows.** Each release now carries a zip for x86_64 and one for ARM, holding `deed.exe`, with a `.sha256` beside each. The nostr library underneath builds and passes its tests on Windows too, including the read deadline that `req` and `fetch --timeout` rely on.
+
+**A new store's directories are made for you, and a store that will not open says why.** `--store ~/.deed/db` used to need `~/.deed` to exist already, and a store that failed to open printed only an error name. deed now creates the missing directories and names the reason: no permission, not a store, or a directory where the file should be. `--local` only reads, so it never creates an empty store at a mistyped path.
+
+**Codes in capitals decode.** An all-uppercase `NPUB1...` or `NEVENT1...` decodes, as BIP-173 allows, and so does a `NOSTR:` scheme in any case, which is what a QR code carries. A code in mixed case is still refused.
+
 ### What's new in v0.3.2
 
 **deed works well with AI agents.** A skill in `skills/deed` teaches an agent the commands, working recipes, and the two rules that matter: publishing is public and permanent, so it asks first, and a secret key stays in `NOSTR_SECRET_KEY`. Add it with `npx skills add zig-nostr/deed`, or in Claude Code as a plugin. `AGENTS.md` covers changing deed itself.
