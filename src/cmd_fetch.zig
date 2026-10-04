@@ -7,6 +7,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const relayset = @import("relayset.zig");
+const storepath = @import("storepath.zig");
 
 const nip19 = nostr.nip19;
 const filter = nostr.filter;
@@ -29,6 +30,9 @@ pub const usage =
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
+    \\
+    \\A store is one file. --store creates it, and any directories above it, the
+    \\first time.
     \\
     \\A bare npub fetches that person's profile rather than everything they have
     \\ever written, which is what `npub` on its own can sensibly mean.
@@ -119,12 +123,7 @@ pub fn run(
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();
     if (store_path) |path| {
-        const z = try gpa.dupeZ(u8, path);
-        defer gpa.free(z);
-        store = nostr.store.Store.open(z, .{}) catch |e| {
-            try err.print("deed fetch: cannot open the store at {s}: {s}\n", .{ path, @errorName(e) });
-            return cli.exit_fail;
-        };
+        store = (try storepath.open(gpa, io, "fetch", path, .create, err)) orelse return cli.exit_fail;
     }
 
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{

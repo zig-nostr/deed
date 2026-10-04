@@ -9,6 +9,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const relayset = @import("relayset.zig");
+const storepath = @import("storepath.zig");
 
 const filter = nostr.filter;
 const message = nostr.message;
@@ -39,6 +40,9 @@ pub const usage =
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
+    \\
+    \\A store is one file. --store creates it, and any directories above it, the
+    \\first time; --local reads only a store that already exists.
     \\
     \\Given no relay, it prints what it would send and stops, so a filter can be
     \\read before it is asked of anybody:
@@ -281,12 +285,7 @@ pub fn run(
             try err.writeAll("deed req: --local needs --store to read from\n");
             return cli.exit_usage;
         };
-        const z = try gpa.dupeZ(u8, path);
-        defer gpa.free(z);
-        var st = nostr.store.Store.open(z, .{}) catch |e| {
-            try err.print("deed req: cannot open the store at {s}: {s}\n", .{ path, @errorName(e) });
-            return cli.exit_fail;
-        };
+        var st = (try storepath.open(gpa, io, "req", path, .existing, err)) orelse return cli.exit_fail;
         defer st.deinit();
 
         var result = st.query(gpa, req.filter) catch |e| {
@@ -319,15 +318,7 @@ pub fn run(
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();
     if (req.store_path) |path| {
-        const z = gpa.dupeZ(u8, path) catch {
-            try err.writeAll("deed req: out of memory opening the store\n");
-            return cli.exit_fail;
-        };
-        defer gpa.free(z);
-        store = nostr.store.Store.open(z, .{}) catch |e| {
-            try err.print("deed req: cannot open the store at {s}: {s}\n", .{ path, @errorName(e) });
-            return cli.exit_fail;
-        };
+        store = (try storepath.open(gpa, io, "req", path, .create, err)) orelse return cli.exit_fail;
     }
 
     const outcome = try relayset.query(gpa, io, req.relays, &.{req.filter}, out, err, .{
@@ -447,4 +438,46 @@ test "help is printed on stdout and succeeds" {
     const r = try runReq(&.{"--help"}, &ob, &eb);
     try std.testing.expectEqual(cli.exit_ok, r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "deed req") != null);
+}
+
+test "--local reads only a store that exists, and creates nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/typo/store.mdb", .{root[0..root_len]});
+
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runReq(&.{ "-k", "1", "--store", path, "--local" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "there is no store at ") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "typo", .{}));
+}
+
+test "--store creates the directories a new store needs" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/a/b/store.mdb", .{root[0..root_len]});
+
+    // A closed port: the store is opened before any relay is dialled, and the
+    // refused dial ends the run at once.
+    var closed = try testrelay.listen(io);
+    const port = closed.socket.address.ip4.port;
+    closed.deinit(io);
+    var url_buf: [40]u8 = undefined;
+    const url = try testrelay.url(&url_buf, port);
+
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runReq(&.{ "-k", "1", "--store", path, url }, &ob, &eb);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "the store") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "no relay answered") != null);
+    _ = try tmp.dir.statFile(io, "a/b/store.mdb", .{});
 }

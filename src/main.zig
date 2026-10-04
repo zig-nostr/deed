@@ -340,6 +340,7 @@ test {
     _ = @import("cmd_publish.zig");
     _ = @import("cmd_req.zig");
     _ = @import("relayset.zig");
+    _ = @import("storepath.zig");
     _ = @import("dial.zig");
     _ = @import("testrelay.zig");
     _ = @import("cmd_verify.zig");
