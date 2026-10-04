@@ -6,6 +6,7 @@
 //! wrong with it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 
 pub const Mode = enum {
@@ -310,6 +311,8 @@ test "a file that is not a store is not opened, and not overwritten" {
 }
 
 test "a directory that cannot be written is named as the reason" {
+    // Windows has no mode bits to take away.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     if (runningAsRoot()) return error.SkipZigTest;
     var f: Fixture = undefined;
     try f.init();
@@ -331,6 +334,8 @@ test "a directory that cannot be written is named as the reason" {
 }
 
 test "a store that cannot be read and written is named as the reason" {
+    // Windows has no mode bits to take away.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     if (runningAsRoot()) return error.SkipZigTest;
     var f: Fixture = undefined;
     try f.init();
