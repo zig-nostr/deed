@@ -21,6 +21,8 @@ Use the Zig version in `.zigversion`. Building only the executable for Windows i
 
 ## Layout
 
+[`ARCHITECTURE.md`](ARCHITECTURE.md) explains how the pieces fit: where each command lives, how a run flows, the store, the exit codes and how it is tested. The tree below is the short version.
+
 ```
 src/
   main.zig        # dispatch, the stdout/stderr writers, exit codes

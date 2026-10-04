@@ -153,6 +153,8 @@ zig build run -- --help
 
 Uses the Zig version pinned in `.zigversion`. The protocol library is pinned by URL and digest in `build.zig.zon`, so a build here and a build in CI are the same build.
 
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how deed is put together: where each command lives, how a run flows, the store, the exit codes and how it is tested.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
