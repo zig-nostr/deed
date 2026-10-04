@@ -14,9 +14,10 @@ zig build test                                   # unit tests, including real re
 zig fmt --check src build.zig                    # CI fails on unformatted code
 zig build -Doptimize=ReleaseSafe -Dstrip=true    # the release build
 python3 bench/run.py zig-out/bin/deed            # benchmarks, see BENCHMARKS.md
+zig build test -Dtarget=x86_64-windows-gnu       # compile the tests for Windows; the run step then fails, the host cannot run them
 ```
 
-Use the Zig version in `.zigversion`. The `nostr` dependency is pinned by URL and hash in `build.zig.zon`; move it with `zig fetch --save=nostr <tarball url>` and check the diff is only the url and hash lines.
+Use the Zig version in `.zigversion`. Building only the executable for Windows is not enough to catch a break there: code the executable never reaches, the test relay for one, only gets analysed when the test binary is built, which is what the Windows line above does. The `nostr` dependency is pinned by URL and hash in `build.zig.zon`; move it with `zig fetch --save=nostr <tarball url>` and check the diff is only the url and hash lines.
 
 ## Layout
 
@@ -24,6 +25,7 @@ Use the Zig version in `.zigversion`. The `nostr` dependency is pinned by URL an
 src/
   main.zig        # dispatch, the stdout/stderr writers, exit codes
   cli.zig         # exit code constants, the stdin record reader
+  console.zig     # Windows only: UTF-8 console code pages for the length of a run
   cmd_*.zig       # one file per verb
   relayset.zig    # the shared relay query behind req and fetch
   dial.zig        # dialling every relay at once under one deadline

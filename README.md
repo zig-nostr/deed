@@ -10,7 +10,7 @@ A deed is two things at once: a signed instrument, and a thing done. So is a nos
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash
 ```
 
-macOS and Linux, Intel and ARM. It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
+For macOS and Linux, Intel and ARM. It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
 
 `--prefix <dir>` puts it somewhere else, `--version <tag>` installs a particular release, and `--archive <file>` installs from a tarball you already have, which still wants its `.sha256` beside it. Pass `--help` for the list.
 
@@ -37,6 +37,26 @@ The macOS builds are ad-hoc signed and not notarized. A copy that arrived throug
 ```sh
 xattr -dr com.apple.quarantine deed
 ```
+
+### Windows
+
+Windows takes a zip rather than the script. Download `deed-<version>-windows-x86_64.zip` (or `windows-aarch64` on an ARM machine) and the `.sha256` beside it from the [releases page](https://github.com/zig-nostr/deed/releases), then in PowerShell, from the folder they are in:
+
+```powershell
+$zip = (Get-Item deed-*-windows-*.zip).Name
+$want = (Get-Content "$zip.sha256").Split(' ')[0]
+$got = (Get-FileHash $zip -Algorithm SHA256).Hash
+if ($got -ne $want) { throw "the SHA-256 does not match, do not run this" }
+
+$dir = "$env:LOCALAPPDATA\deed"
+Expand-Archive $zip -DestinationPath $dir -Force
+$user = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($user -split ';') -notcontains $dir) {
+  [Environment]::SetEnvironmentVariable('Path', "$user;$dir".TrimStart(';'), 'User')
+}
+```
+
+That checks the download, unpacks `deed.exe` into `%LOCALAPPDATA%\deed`, and puts that folder on your `PATH` unless it is there already, so the same lines install a newer version over an older one. Keep only the zip you mean to install in the folder. Open a new terminal and `deed version` confirms it. PowerShell compares the two digests without regard to case, so the capitals `Get-FileHash` prints are fine. The binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept.
 
 ## What it does
 
@@ -73,8 +93,6 @@ Events are checked before they are stored or printed. A relay can send anything,
 ## What is missing
 
 **Relay selection.** A code with no relay hints is not looked up: `deed fetch npub1...` asks you to name a relay rather than going to find the author's relay list first. Doing that properly means a second round trip and a cache with its own staleness rules, and doing it badly is worse than saying so.
-
-**Windows.** deed does not compile there yet, and the protocol library cannot resolve a hostname on Windows ([nostr#59](https://github.com/zig-nostr/nostr/issues/59)).
 
 ## How the verbs fit together
 

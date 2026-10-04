@@ -116,3 +116,47 @@ jobs:
           fi
           [ ! -e "$work/out/bin/deed" ] || { echo "it refused and installed anyway" >&2; exit 1; }
           echo "a tampered archive is refused and nothing is installed"
+
+  # Windows gets its own job because most of the steps above are bash scripts
+  # for the macOS and Linux installer. What matters here is that deed builds,
+  # that its tests (which talk to relays over real loopback sockets) pass, and
+  # that the binary that was built runs. Formatting does not depend on the
+  # platform and is checked above.
+  build-test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      # A binary that links is not a binary that runs. This makes a key, signs
+      # an event with it and checks the signature, through a pipe, which covers
+      # the argument parsing, the environment, and standard input and output
+      # that differ most on Windows.
+      - name: The binary runs
+        run: |
+          set -euo pipefail
+          bin=zig-out/bin/deed.exe
+          [ -f "$bin" ] || { echo "the build produced no deed.exe" >&2; exit 1; }
+          got="$("$bin" version)"
+          want="deed $(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/main.zig)"
+          [ "$got" = "$want" ] || { echo "the binary says '$got', expected '$want'" >&2; exit 1; }
+          sk="$("$bin" key generate --hex)"
+          NOSTR_SECRET_KEY="$sk" "$bin" event -c "windows check" | "$bin" verify
+          echo "deed runs on Windows"

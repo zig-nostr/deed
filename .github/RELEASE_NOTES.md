@@ -1,4 +1,4 @@
-**deed** is a command line for nostr, built in Zig. It runs on macOS and Linux, on both Intel and ARM. The Linux binaries are statically linked, so there is no glibc version to satisfy. The macOS binaries are **ad-hoc signed, not notarized**, which means a download that came through a browser needs `xattr -dr com.apple.quarantine` before it will run.
+**deed** is a command line for nostr, built in Zig. It runs on macOS, Linux and Windows, on both Intel and ARM. The Linux binaries are statically linked, so there is no glibc version to satisfy. The macOS binaries are **ad-hoc signed, not notarized**, which means a download that came through a browser needs `xattr -dr com.apple.quarantine` before it will run. The Windows builds are zips holding `deed.exe`, which is not code-signed.
 
 Every artifact below is published with a `.sha256` beside it, so the download can be checked against a digest that was written by the same job that built it.
 

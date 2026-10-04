@@ -5,6 +5,7 @@
 //! the same `nostr.relay.dial` a user's run goes through, over a real socket.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 
 const Io = std.Io;
@@ -68,6 +69,33 @@ pub const Mode = enum {
 /// test hangs instead of failing. `std.testing.allocator` captures them.
 pub const DialAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
+/// Sets a receive buffer of 4096 bytes on `handle`.
+///
+/// std's sockets on Windows are AFD handles that it opens without Winsock, so
+/// Winsock's `setsockopt` does not know them. The option goes through the same
+/// AFD request std uses for its own socket options instead. It is best effort
+/// there: if the driver turns it down, the two modes that use it still work,
+/// because what they send fills a large window too, only later.
+fn shrinkReceiveWindow(io: Io, handle: Io.net.Socket.Handle) !void {
+    const size: c_int = 4096;
+    if (comptime builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        _ = try io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.SOCKOPT,
+            .in = @ptrCast(&windows.AFD.SOCKOPT_INFO{
+                .mode = .set,
+                .level = windows.ws2_32.SOL.SOCKET,
+                .optname = windows.ws2_32.SO.RCVBUF,
+                .optval = &size,
+                .optlen = @sizeOf(c_int),
+            }),
+        } });
+        return;
+    }
+    try std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size));
+}
+
 /// A loopback listener on a port the kernel picks.
 pub fn listen(io: Io) !Io.net.Server {
     var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -107,8 +135,7 @@ pub const Relay = struct {
             // A small window, inherited by the connection it accepts, so what
             // is sent to it fills the sender's socket after a few hundred
             // kilobytes however large the system's defaults are.
-            const size: c_int = 4096;
-            try std.posix.setsockopt(self.server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size));
+            try shrinkReceiveWindow(io, self.server.socket.handle);
         }
         self.task = try io.concurrent(serve, .{ self, io });
     }

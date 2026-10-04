@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
+const console = @import("console.zig");
 const cmd_decode = @import("cmd_decode.zig");
 const cmd_encode = @import("cmd_encode.zig");
 const cmd_crypt = @import("cmd_crypt.zig");
@@ -54,13 +55,25 @@ pub fn main(init: std.process.Init) !void {
     // decoding a stream of codes spent most of its time in mmap and munmap.
     const gpa = std.heap.smp_allocator;
 
+    // Windows only: the console decodes output with its own code page, and
+    // everything deed writes is UTF-8. A no-op elsewhere. Every way out of
+    // `main` puts the code page back: the errdefer for a failed setup, the
+    // call before `exit` below, and a control handler for Ctrl-C.
+    console.useUtf8();
+    errdefer console.restore();
+
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    var it = std.process.Args.Iterator.init(init.minimal.args);
+    // `initAllocator` rather than `init`: on Windows the command line is one
+    // string that has to be split into arguments, and the iterator owns the
+    // buffer they point into. It is a no-op everywhere else. The arguments
+    // live as long as `it`, which is the whole run.
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer it.deinit();
     _ = it.skip(); // argv[0]
     while (it.next()) |a| try argv.append(gpa, a);
 
@@ -102,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
     // still buffered would simply be lost.
     const final = finish(&stdout, &stderr, code);
     stderr.interface.flush() catch {};
+    console.restore();
     std.process.exit(final);
 }
 
@@ -314,6 +328,7 @@ test "what is not understood exits 2 and says so on stderr" {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("cli.zig");
+    _ = @import("console.zig");
     _ = @import("keyinput.zig");
     _ = @import("jsonout.zig");
     _ = @import("cmd_crypt.zig");
