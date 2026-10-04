@@ -72,9 +72,13 @@ jobs:
       # Asking only whether the script parses would pass on an installer that
       # downloads the wrong file or verifies nothing.
       - name: The installer installs a release, and it runs
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$(git tag --sort=-v:refname --list 'v*' | head -1)"
+          # The newest PUBLISHED release, not the newest tag: a tag whose
+          # release is still a draft has nothing a reader could download.
+          tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')"
           if [ -z "$tag" ]; then
             echo "no release tag exists yet, so the installer was NOT exercised" >&2
             exit 1
