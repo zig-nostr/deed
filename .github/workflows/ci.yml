@@ -96,9 +96,12 @@ jobs:
       # refused and must install nothing, because a checksum that is checked and
       # then ignored is worse than none: it reads as a promise.
       - name: A download that does not verify is refused
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$(git tag --sort=-v:refname --list 'v*' | head -1)"
+          tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          [ -n "$tag" ] || { echo "no published release to tamper with" >&2; exit 1; }
           work="$RUNNER_TEMP/tamper"
           mkdir -p "$work"
           case "$(uname -s)" in
