@@ -19,7 +19,7 @@ For macOS and Linux, Intel and ARM; Windows is [below](#windows). It works out w
 The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
 
 ```sh
-VERSION=0.4.0
+VERSION=0.4.1
 PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
 BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
 
@@ -40,7 +40,7 @@ xattr -dr com.apple.quarantine deed
 
 ### Windows
 
-Windows takes a zip rather than the script. Download `deed-<version>-windows-x86_64.zip` (or `windows-aarch64` on an ARM machine) and the `.sha256` beside it from the [releases page](https://github.com/zig-nostr/deed/releases), then in PowerShell, from the folder they are in:
+Windows takes a zip rather than the script. Download `deed-<version>-windows-x86_64.zip` and the `.sha256` beside it from the [releases page](https://github.com/zig-nostr/deed/releases), then in PowerShell, from the folder they are in:
 
 ```powershell
 $zip = (Get-Item deed-*-windows-*.zip).Name

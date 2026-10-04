@@ -82,14 +82,13 @@ jobs:
           v="${{ steps.version.outputs.version }}"
           mkdir -p dist
 
-          for target in aarch64-macos-none x86_64-macos-none x86_64-linux-musl aarch64-linux-musl x86_64-windows-gnu aarch64-windows-gnu; do
+          for target in aarch64-macos-none x86_64-macos-none x86_64-linux-musl aarch64-linux-musl x86_64-windows-gnu; do
             case "$target" in
               aarch64-macos-none)   name=macos-aarch64 ;;
               x86_64-macos-none)    name=macos-x86_64 ;;
               x86_64-linux-musl)    name=linux-x86_64 ;;
               aarch64-linux-musl)   name=linux-aarch64 ;;
               x86_64-windows-gnu)   name=windows-x86_64 ;;
-              aarch64-windows-gnu)  name=windows-aarch64 ;;
             esac
 
             rm -rf "out-$target"
@@ -226,8 +225,6 @@ jobs:
         include:
           - runner: windows-latest
             asset: windows-x86_64
-          - runner: windows-11-arm
-            asset: windows-aarch64
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -292,11 +289,10 @@ jobs:
             "deed-$v-linux-x86_64.tar.gz" "deed-$v-linux-x86_64.tar.gz.sha256" \
             "deed-$v-macos-aarch64.tar.gz" "deed-$v-macos-aarch64.tar.gz.sha256" \
             "deed-$v-macos-x86_64.tar.gz" "deed-$v-macos-x86_64.tar.gz.sha256" \
-            "deed-$v-windows-aarch64.zip" "deed-$v-windows-aarch64.zip.sha256" \
             "deed-$v-windows-x86_64.zip" "deed-$v-windows-x86_64.zip.sha256" | sort)"
           actual="$(ls dist | sort)"
           diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") \
-            || { echo "the release assets are not the twelve expected files" >&2; exit 1; }
+            || { echo "the release assets are not the ten expected files" >&2; exit 1; }
 
           for f in dist/*; do
             [ -s "$f" ] || { echo "$f is empty" >&2; exit 1; }
@@ -309,9 +305,9 @@ jobs:
           done
           # A glob that matched nothing would leave the loop body unrun and the
           # step green, having verified precisely nothing.
-          [ "$checked" = "6" ] || { echo "verified $checked checksums, expected 6" >&2; exit 1; }
+          [ "$checked" = "5" ] || { echo "verified $checked checksums, expected 5" >&2; exit 1; }
 
-          echo "twelve assets, all present, none empty, every digest matching"
+          echo "ten assets, all present, none empty, every digest matching"
 
       - name: Lift the draft, then read the page back
         env:
@@ -327,6 +323,6 @@ jobs:
           # Read the list again from the published release. What was checked in
           # the step above was the draft, and this is the page a reader opens.
           count="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')"
-          [ "$count" = "12" ] || { echo "the published release carries $count assets, expected 12" >&2; exit 1; }
+          [ "$count" = "10" ] || { echo "the published release carries $count assets, expected 10" >&2; exit 1; }
 
           echo "published $GITHUB_REF_NAME"
