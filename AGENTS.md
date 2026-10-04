@@ -34,7 +34,7 @@ src/
   storepath.zig   # opening the store a --store path names, and saying why one will not open
   testrelay.zig   # a websocket relay on loopback, for tests only
 bench/            # the benchmark script and its relay
-scripts/          # the one-line installer (pure ASCII, CI checks it)
+scripts/          # the one-line installers, install.sh and install.ps1 (pure ASCII, CI checks both)
 skills/deed/      # the skill for agents that operate deed
 ```
 
