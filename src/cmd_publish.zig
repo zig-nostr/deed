@@ -497,6 +497,9 @@ const Set = struct {
         timeout_ms: i64,
         stalled: State,
         waiting: *[dial.max_relays]bool,
+        /// Where a send that failed outright is handed back instead of being
+        /// reported, so the caller can try it once more. Null reports it.
+        send_failed: ?*[dial.max_relays]?anyerror,
         err: *std.Io.Writer,
     ) !void {
         var results: [dial.max_relays]?Sent = @splat(null);
@@ -556,6 +559,9 @@ const Set = struct {
                     // socket is half a frame, so this connection is done.
                     try err.print("deed publish: {s}: {s}: could not send within {d} ms\n", .{ id, self.urls[i], timeout_ms });
                     try self.drop(i, stalled, err);
+                } else if (send_failed) |f| {
+                    f[i] = e;
+                    try self.drop(i, .closed, err);
                 } else {
                     try err.print("deed publish: {s}: {s}: {s}\n", .{ id, self.urls[i], @errorName(e) });
                     try self.drop(i, .closed, err);
@@ -585,7 +591,26 @@ const Set = struct {
             which[n] = i;
             n += 1;
         }
-        try self.sendSome(which[0..n], ev, id, deadline, timeout_ms, .gone, &waiting, err);
+        var send_failed: [dial.max_relays]?anyerror = @splat(null);
+        try self.sendSome(which[0..n], ev, id, deadline, timeout_ms, .gone, &waiting, &send_failed, err);
+        // A relay that dropped an idle connection can also be found out by the
+        // send itself rather than by the read after it: Windows refuses the
+        // write at once where POSIX takes it and reports the close next. Either
+        // way it gets the one fresh connection and one more try that a close
+        // while waiting gets below.
+        for (0..self.urls.len) |i| {
+            const e = send_failed[i] orelse continue;
+            if (msLeft(io, deadline) >= min_resend_ms) {
+                resent[i] = true;
+                try self.dialSome(&.{i}, @min(dial.default_timeout_ms, msLeft(io, deadline)), .closed, err);
+                if (self.conns[i] != null) {
+                    // Reports its own failure this time.
+                    try self.sendSome(&.{i}, ev, id, deadline, timeout_ms, .closed, &waiting, null, err);
+                    continue;
+                }
+            }
+            try err.print("deed publish: {s}: {s}: {s}\n", .{ id, self.urls[i], @errorName(e) });
+        }
 
         self.seq += 1;
         var timer = try io.concurrent(deadlineAfter, .{ &self.heard, io, msLeft(io, deadline), self.seq });
@@ -639,7 +664,7 @@ const Set = struct {
                         resent[i] = true;
                         try self.dialSome(&.{i}, @min(dial.default_timeout_ms, msLeft(io, deadline)), .closed, err);
                         if (self.conns[i] != null) {
-                            try self.sendSome(&.{i}, ev, id, deadline, timeout_ms, .closed, &waiting, err);
+                            try self.sendSome(&.{i}, ev, id, deadline, timeout_ms, .closed, &waiting, null, err);
                             if (waiting[i]) continue;
                         }
                     }

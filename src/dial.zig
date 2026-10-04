@@ -10,6 +10,7 @@
 //! libc call: a resolver that hangs still holds its dial until it returns.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 
 const Io = std.Io;
@@ -139,7 +140,13 @@ test "a silent relay times out, a closed port fails, and a live relay connects, 
     };
 
     try std.testing.expect(out[0] == .timed_out);
-    try std.testing.expect(out[1] == .failed);
+    // Windows retries a refused connect for about two seconds before it
+    // gives up, so there the closed port runs into the deadline instead.
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(out[1] == .failed or out[1] == .timed_out);
+    } else {
+        try std.testing.expect(out[1] == .failed);
+    }
     try std.testing.expect(out[2] == .connected);
     // Bounded by the deadline, not by the slowest relay.
     try std.testing.expect(took < 3_000);
