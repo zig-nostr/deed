@@ -9,11 +9,19 @@ A fast command line for nostr. One binary, on macOS, Linux and Windows. Every co
 
 ## Install
 
+macOS and Linux:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash
 ```
 
-Installs into `~/.local/bin` after checking the download's SHA-256. That is for macOS and Linux; on Windows, download the `.zip` from the releases page and put `deed.exe` on `PATH`. `deed version` confirms it. `deed help <command>` prints the exact usage of any command; check it before guessing a flag.
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1 | iex
+```
+
+Both check the download's SHA-256 before installing. The first installs into `~/.local/bin`; the second into `%LOCALAPPDATA%\deed`, which it adds to `PATH`, so on Windows the new `deed` is found in a new terminal, not the one that ran the installer. `deed version` confirms it. `deed help <command>` prints the exact usage of any command; check it before guessing a flag.
 
 ## Before you act
 

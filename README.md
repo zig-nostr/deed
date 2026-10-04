@@ -6,57 +6,23 @@ A deed is two things at once: a signed instrument, and a thing done. So is a nos
 
 ## Install
 
+macOS and Linux:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash
 ```
 
-For macOS and Linux, Intel and ARM; Windows is [below](#windows). It works out which build this machine wants, checks the download against the SHA-256 published beside it, and installs into `~/.local/bin`, so nothing needs root and nothing lands outside your home directory. If the digest does not match, it installs nothing and says so.
-
-`--prefix <dir>` puts it somewhere else, `--version <tag>` installs a particular release, and `--archive <file>` installs from a tarball you already have, which still wants its `.sha256` beside it. Pass `--help` for the list.
-
-### By hand
-
-The script is short and worth reading before you pipe anything into bash. If you would rather do it yourself:
-
-```sh
-VERSION=0.4.1
-PLATFORM=macos-aarch64   # or macos-x86_64, linux-x86_64, linux-aarch64
-BASE=https://github.com/zig-nostr/deed/releases/download/v$VERSION
-
-curl -LO $BASE/deed-$VERSION-$PLATFORM.tar.gz
-curl -LO $BASE/deed-$VERSION-$PLATFORM.tar.gz.sha256
-shasum -a 256 -c deed-$VERSION-$PLATFORM.tar.gz.sha256   # sha256sum -c on Linux
-tar -xzf deed-$VERSION-$PLATFORM.tar.gz
-sudo mv deed /usr/local/bin/
-```
-
-The Linux builds are statically linked, so there is no glibc version to satisfy.
-
-The macOS builds are ad-hoc signed and not notarized. A copy that arrived through a browser carries a quarantine flag, so clear it once:
-
-```sh
-xattr -dr com.apple.quarantine deed
-```
-
-### Windows
-
-Windows takes a zip rather than the script. Download `deed-<version>-windows-x86_64.zip` and the `.sha256` beside it from the [releases page](https://github.com/zig-nostr/deed/releases), then in PowerShell, from the folder they are in:
+Windows, in PowerShell:
 
 ```powershell
-$zip = (Get-Item deed-*-windows-*.zip).Name
-$want = (Get-Content "$zip.sha256").Split(' ')[0]
-$got = (Get-FileHash $zip -Algorithm SHA256).Hash
-if ($got -ne $want) { throw "the SHA-256 does not match, do not run this" }
-
-$dir = "$env:LOCALAPPDATA\deed"
-Expand-Archive $zip -DestinationPath $dir -Force
-$user = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (($user -split ';') -notcontains $dir) {
-  [Environment]::SetEnvironmentVariable('Path', "$user;$dir".TrimStart(';'), 'User')
-}
+irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1 | iex
 ```
 
-That checks the download, unpacks `deed.exe`, with the `LICENSE` and `README.md`, into `%LOCALAPPDATA%\deed`, and puts that folder on your `PATH` unless it is there already, so the same lines install a newer version over an older one. Keep only the zip you mean to install in the folder. Open a new terminal and `deed version` confirms it. PowerShell compares the two digests without regard to case, so the capitals `Get-FileHash` prints are fine. The binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept. deed reads a leading `~` in a `--store` path from `HOME`, which Windows does not usually set, so give a full path there.
+Each checks the download against the SHA-256 published beside it, and if the digest does not match it installs nothing and says so. On macOS and Linux deed goes into `~/.local/bin`. On Windows it goes into `%LOCALAPPDATA%\deed`, which is added to your `PATH`, so `deed version` works in a new terminal. Neither needs root or administrator rights.
+
+`--version <tag>` installs a particular release, `--prefix <dir>` puts it somewhere else, and `--archive <file>` installs from an archive you already have, which still wants its `.sha256` beside it. `--help` lists them. On Windows they are `-Version`, `-Prefix`, `-Archive` and `-Help` when you run the script as a file, and `$env:DEED_VERSION`, `$env:DEED_PREFIX` and `$env:DEED_ARCHIVE` for the piped line.
+
+On Windows on ARM the installer puts the x86_64 build in place, which Windows 11 runs under emulation. The Windows binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept. deed reads a leading `~` in a `--store` path from `HOME`, which Windows does not usually set, so give a full path there.
 
 ## What it does
 

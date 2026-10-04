@@ -10,7 +10,7 @@
 #
 # One script for both systems rather than two, because deed publishes the same
 # thing four times for them: a tar.gz holding one static binary, named for the
-# platform. Windows builds are zips and are installed by hand, see the README.
+# platform. Windows builds are zips, installed by scripts/install.ps1.
 # Two scripts would share every line that matters and drift in the ones that do
 # not.
 #
@@ -87,7 +87,7 @@ detect() {
   case "$os" in
     darwin) os=macos ;;
     linux)  os=linux ;;
-    mingw*|msys*|cygwin*) die "this script installs the macOS and Linux builds. On Windows, download the .zip from https://github.com/$repo/releases and follow the README." ;;
+    mingw*|msys*|cygwin*) die "this script installs the macOS and Linux builds. On Windows, run this in PowerShell: irm https://raw.githubusercontent.com/$repo/main/scripts/install.ps1 | iex" ;;
     *) die "deed publishes macOS, Linux and Windows builds. This machine reports '$os'." ;;
   esac
 
