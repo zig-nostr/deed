@@ -16,11 +16,16 @@ const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
 const kinds = @import("kinds.zig");
 const cmd_publish = @import("cmd_publish.zig");
+const parallel = @import("parallel.zig");
 
 const keys = nostr.keys;
 const event = nostr.event;
+const nip13 = nostr.nip13;
 const nip19 = nostr.nip19;
 const hex = nostr.hex;
+
+/// The most leading zero bits an event id can have.
+const max_pow_bits = 256;
 
 /// A draft larger than this is not a draft anybody typed.
 const max_record_bytes = 1 << 20;
@@ -41,7 +46,8 @@ pub const usage =
     \\Usage:
     \\  deed event [-] [<relay-url>...] [--sec <key>] [-c <content>] [-k <kind>] [-t <tag>]...
     \\             [-e <id>] [-p <pubkey>] [-d <d>] [-h <h>] [-a <address>]
-    \\             [--created-at <n>] [--envelope] [--nevent] [--confirm]
+    \\             [--created-at <n>] [--pow <bits>] [--pow-threads <n>] [--pow-timeout <s>]
+    \\             [--envelope] [--nevent] [--confirm]
     \\
     \\Options:
     \\  --sec <key>          secret key, as nsec1… or 64 hex characters.
@@ -62,6 +68,16 @@ pub const usage =
     \\  -a <address>         add an a tag: kind:pubkey:d, an naddr1…, or a bare
     \\                       pubkey (taken as <kind>:<pubkey>:<-d value>)
     \\  --created-at <n>     unix seconds (default: now)
+    \\  --pow <bits>         proof of work (NIP-13): search for a nonce until the
+    \\                       event id has at least <bits> leading zero bits, and
+    \\                       add a ["nonce", n, <bits>] tag. Any nonce tag given
+    \\                       with -t is replaced. 0 (the default) does no work and
+    \\                       adds no tag. Up to 256. Each extra bit doubles the
+    \\                       expected work.
+    \\  --pow-threads <n>    threads to search with (default: the CPU count).
+    \\  --pow-timeout <s>    give up on an event after <s> seconds, sign nothing
+    \\                       for it, and exit 1. Applies to each event separately.
+    \\                       Default: no limit.
     \\  --envelope           print ["EVENT",{…}] instead of the bare event
     \\  --nevent             print an nevent1… line after each event
     \\  --confirm            ask on the terminal before publishing; refuses when
@@ -109,6 +125,12 @@ const Overrides = struct {
     nevent: bool = false,
     confirm: bool = false,
     relays: []const []const u8 = &.{},
+    /// Leading zero bits to mine into each event id. 0 mines nothing.
+    pow: u32 = 0,
+    /// Search threads. Null until `run` has read every flag, then the CPU count.
+    pow_threads: ?u32 = null,
+    /// Per-event search deadline in milliseconds. Null means no limit.
+    pow_timeout_ms: ?u64 = null,
 };
 
 /// The fields a draft may carry. Everything is optional and everything else in
@@ -168,8 +190,8 @@ pub fn run(
             continue;
         }
         const needs_value = cli.isOneOf(a, &.{
-            "--sec", "-c", "--content", "-k", "--kind", "-t", "--tag", "--created-at",
-            "-e",    "-p", "-d",        "-h", "-a",
+            "--sec", "-c", "--content", "-k", "--kind", "-t",    "--tag",         "--created-at",
+            "-e",    "-p", "-d",        "-h", "-a",     "--pow", "--pow-threads", "--pow-timeout",
         });
         if (!needs_value) {
             try err.print("deed event: unknown option '{s}'\n", .{a});
@@ -203,10 +225,35 @@ pub fn run(
                 try err.print("deed event: '{s}' is not a unix timestamp\n", .{v});
                 return cli.exit_usage;
             };
+        } else if (std.mem.eql(u8, a, "--pow")) {
+            const bits = std.fmt.parseInt(u32, v, 10) catch null;
+            if (bits == null or bits.? > max_pow_bits) {
+                try err.print("deed event: --pow needs a number of bits from 0 to {d}, not '{s}'\n", .{ max_pow_bits, v });
+                return cli.exit_usage;
+            }
+            ov.pow = bits.?;
+        } else if (std.mem.eql(u8, a, "--pow-threads")) {
+            const n = std.fmt.parseInt(u32, v, 10) catch null;
+            if (n == null or n.? == 0) {
+                try err.print("deed event: --pow-threads needs a number of threads of at least 1, not '{s}'\n", .{v});
+                return cli.exit_usage;
+            }
+            ov.pow_threads = n.?;
+        } else if (std.mem.eql(u8, a, "--pow-timeout")) {
+            const secs = std.fmt.parseInt(u32, v, 10) catch null;
+            if (secs == null or secs.? == 0) {
+                try err.print("deed event: --pow-timeout needs a number of seconds of at least 1, not '{s}'\n", .{v});
+                return cli.exit_usage;
+            }
+            ov.pow_timeout_ms = @as(u64, secs.?) * std.time.ms_per_s;
         } else {
             ov.tags_given = true;
             try order.append(arena, .{ .flag = a[1], .value = v });
         }
+    }
+
+    if (ov.pow_threads == null) {
+        ov.pow_threads = std.math.cast(u32, parallel.cpuCount()) orelse 1;
     }
 
     if (ov.confirm and relays.items.len == 0) {
@@ -263,7 +310,10 @@ pub fn run(
 
     var failures: usize = 0;
     if (!read_stdin) {
-        try emit(gpa, io, signer, keypair, Draft{}, ov, &sink);
+        emit(gpa, io, signer, keypair, Draft{}, ov, &sink) catch |e| switch (e) {
+            error.PowTimeout, error.PowFailed => return reportPow(err, e, ov),
+            else => return e,
+        };
     } else {
         const stdin_buf = try gpa.alloc(u8, max_record_bytes);
         defer gpa.free(stdin_buf);
@@ -299,7 +349,14 @@ pub fn run(
                 failures += 1;
                 continue;
             };
-            try emit(gpa, io, signer, keypair, draft, ov, &sink);
+            emit(gpa, io, signer, keypair, draft, ov, &sink) catch |e| switch (e) {
+                error.PowTimeout, error.PowFailed => {
+                    _ = try reportPow(err, e, ov);
+                    failures += 1;
+                    continue;
+                },
+                else => return e,
+            };
         }
     }
 
@@ -518,9 +575,52 @@ fn emit(
     else
         &.{};
 
-    const ev = try event.create(a, signer, keypair, created_at, kind, tags, content, null);
+    if (ov.pow == 0) {
+        const ev = try event.create(a, signer, keypair, created_at, kind, tags, content, null);
+        const json = try event.toJson(a, ev);
+        try sink.add(json);
+        return;
+    }
+
+    // Mined first, then signed: the search fixes the id, and the signature is
+    // over the id. `toJson` copies everything out of the mining arena, so the
+    // deferred deinit is safe.
+    var mined = nip13.mine(gpa, io, .{
+        .pubkey = keypair.public_key,
+        .created_at = created_at,
+        .kind = kind,
+        .tags = tags,
+        .content = content,
+    }, .{
+        .target = ov.pow,
+        .threads = ov.pow_threads orelse 1,
+        .timeout_ms = ov.pow_timeout_ms,
+    }) catch |e| return switch (e) {
+        error.Timeout => error.PowTimeout,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.PowFailed,
+    };
+    defer mined.deinit();
+
+    var ev = mined.event;
+    ev.sig = signer.signId(ev.id, keypair, null) catch return error.PowFailed;
     const json = try event.toJson(a, ev);
     try sink.add(json);
+}
+
+/// Prints why an event was not made and returns the exit code for it.
+fn reportPow(err: *std.Io.Writer, e: anyerror, ov: Overrides) !u8 {
+    switch (e) {
+        error.PowTimeout => try err.print(
+            "deed event: no nonce reached {d} leading zero bits within {d} seconds; nothing was signed\n",
+            .{ ov.pow, (ov.pow_timeout_ms orelse 0) / std.time.ms_per_s },
+        ),
+        else => try err.print(
+            "deed event: proof of work failed at {d} leading zero bits; nothing was signed\n",
+            .{ov.pow},
+        ),
+    }
+    return cli.exit_fail;
 }
 
 /// `name=v1;v2` becomes `["name","v1","v2"]`; a bare `name` becomes `["name"]`.
@@ -767,4 +867,108 @@ test "--confirm without a relay is a usage error" {
     const arena = st.allocator();
     const r = try runEvent(arena, &.{ "--sec", test_sec, "--confirm" });
     try std.testing.expectEqual(cli.exit_usage, r.code);
+}
+
+test "pow: difficulty 8 to 12 gives an id with those bits, a nonce tag, and a valid signature" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+
+    var bits: u32 = 8;
+    while (bits <= 12) : (bits += 1) {
+        const pow = try std.fmt.allocPrint(arena, "{d}", .{bits});
+        const r = try runEvent(arena, &.{ "--sec", test_sec, "-c", "mined", "--pow", pow, "--created-at", "1700000000" });
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+
+        var parsed = try event.fromJson(std.testing.allocator, std.mem.trimEnd(u8, r.out, "\n"));
+        defer parsed.deinit();
+        const ev = parsed.value;
+        try std.testing.expect(nip13.difficulty(ev.id) >= bits);
+        try std.testing.expectEqual(@as(?u32, bits), nip13.committedTarget(ev));
+        const nonce = ev.tags[ev.tags.len - 1];
+        try std.testing.expectEqual(@as(usize, 3), nonce.len);
+        try std.testing.expectEqualStrings("nonce", nonce[0]);
+        _ = try std.fmt.parseInt(u64, nonce[1], 10);
+        try std.testing.expectEqualStrings(pow, nonce[2]);
+        try std.testing.expect(try event.verify(std.testing.allocator, signer, ev));
+    }
+}
+
+test "pow: --pow 0 mines nothing and changes nothing" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+
+    const plain = try runEvent(arena, &.{ "--sec", test_sec, "-c", "same", "--created-at", "1700000000" });
+    const zero = try runEvent(arena, &.{ "--sec", test_sec, "-c", "same", "--created-at", "1700000000", "--pow", "0" });
+    try std.testing.expectEqual(cli.exit_ok, plain.code);
+    try std.testing.expectEqual(cli.exit_ok, zero.code);
+    try std.testing.expect(!has(zero.out, "nonce"));
+
+    var a = try event.fromJson(std.testing.allocator, std.mem.trimEnd(u8, plain.out, "\n"));
+    defer a.deinit();
+    var b = try event.fromJson(std.testing.allocator, std.mem.trimEnd(u8, zero.out, "\n"));
+    defer b.deinit();
+    try std.testing.expectEqualSlices(u8, &a.value.id, &b.value.id);
+    try std.testing.expectEqual(a.value.tags.len, b.value.tags.len);
+}
+
+test "pow: several threads find a valid nonce" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const r = try runEvent(arena, &.{ "--sec", test_sec, "-c", "threads", "--pow", "12", "--pow-threads", "4" });
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    var parsed = try event.fromJson(std.testing.allocator, std.mem.trimEnd(u8, r.out, "\n"));
+    defer parsed.deinit();
+    try std.testing.expect(nip13.difficulty(parsed.value.id) >= 12);
+}
+
+test "pow: bad values are usage errors" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const bad = [_][2][]const u8{
+        .{ "--pow", "257" },
+        .{ "--pow", "soon" },
+        .{ "--pow", "-1" },
+        .{ "--pow-threads", "0" },
+        .{ "--pow-timeout", "0" },
+        .{ "--pow-timeout", "later" },
+    };
+    for (bad) |b| {
+        const r = try runEvent(arena, &.{ "--sec", test_sec, b[0], b[1] });
+        try std.testing.expectEqual(cli.exit_usage, r.code);
+        try std.testing.expectEqualStrings("", r.out);
+    }
+}
+
+test "pow: a search past its timeout exits 1 and signs nothing" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const r = try runEvent(arena, &.{ "--sec", test_sec, "-c", "too hard", "--pow", "256", "--pow-timeout", "1" });
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expect(has(r.err, "nothing was signed"));
+}
+
+test "pow: a mined event is published to a relay that accepts it" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const io = std.testing.io;
+
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, acceptAll, null);
+    defer relay.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, relay.port());
+
+    const r = try runEvent(arena, &.{ url, "--sec", test_sec, "-c", "mined and sent", "--pow", "8", "--envelope" });
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expect(has(r.out, "\"nonce\",\""));
+    try std.testing.expect(has(r.err, ": accepted"));
 }
