@@ -544,6 +544,7 @@ pub fn runWith(
     // Reaching no relay at all is a failed run. Reaching some is not: the
     // events that arrived are real, and every relay that did not answer was
     // named on stderr as it failed.
+    if (outcome.store_failed) return cli.exit_fail;
     if (outcome.dialled == 0) {
         try err.writeAll("deed req: no relay answered\n");
         return cli.exit_fail;
@@ -599,6 +600,7 @@ fn pages(
             .store = store,
             .auth = auth_opts,
         });
+        if (outcome.store_failed) return cli.exit_fail;
         if (outcome.dialled == 0) {
             try err.writeAll("deed req: no relay answered\n");
             return cli.exit_fail;

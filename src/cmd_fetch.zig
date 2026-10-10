@@ -179,6 +179,7 @@ pub fn run(
         .auth = auth_opts,
     });
 
+    if (outcome.store_failed) return cli.exit_fail;
     if (outcome.dialled == 0) {
         try err.writeAll("deed fetch: no relay answered\n");
         return cli.exit_fail;

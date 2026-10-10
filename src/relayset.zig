@@ -59,6 +59,9 @@ pub const Outcome = struct {
     events: usize = 0,
     /// Relays that reached EOSE before the deadline.
     complete: usize = 0,
+    /// The store could not take a batch. Nothing from that batch or after it
+    /// was printed, because printing comes after storing; the run has failed.
+    store_failed: bool = false,
 };
 
 const max_relays = dial.max_relays;
@@ -90,7 +93,13 @@ const Pending = struct {
         var outcomes: [batch_max]nostr.store.IngestResult = undefined;
         for (self.msgs.items, 0..) |m, i| events[i] = m.value.event.event;
         const n = self.msgs.items.len;
-        store.ingestBatch(gpa, events[0..n], .{}, outcomes[0..n]) catch {};
+        // Once the store has failed, nothing more is printed: an event shown
+        // but not kept is what storing first is there to prevent.
+        if (result.store_failed) return;
+        store.ingestBatch(gpa, events[0..n], .{}, outcomes[0..n]) catch {
+            result.store_failed = true;
+            return;
+        };
         for (events[0..n]) |ev| {
             const json = try nostr.event.toJson(gpa, ev);
             defer gpa.free(json);
@@ -544,6 +553,7 @@ pub fn query(
     }
 
     if (opts.store) |st| try pending.flush(gpa, st, out, &result);
+    if (result.store_failed) try err.writeAll("deed: the store could not be written, so events from that point were not printed\n");
     return result;
 }
 
@@ -639,6 +649,53 @@ test "events kept in a store are written in batches, and every one is stored and
     try std.testing.expectEqual(@as(usize, n), outcome.events);
     try std.testing.expectEqual(@as(usize, n), std.mem.count(u8, out.written(), "\n"));
     try std.testing.expectEqual(@as(usize, n), try st.eventCount());
+}
+
+test "a store that cannot take a batch prints nothing for it and says so" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    // Together far more than the map below can hold.
+    const serving = try arena.alloc([]const u8, 60);
+    for (serving, 0..) |*ev, i| {
+        const body = try arena.alloc(u8, 8_000);
+        @memset(body, 'x');
+        _ = try std.fmt.bufPrint(body, "{d}", .{i});
+        const e = try nostr.event.create(arena, signer, kp, 1_700_000_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+        ev.* = try nostr.event.toJson(arena, e);
+    }
+    var relay_: testrelay.Relay = undefined;
+    try relay_.start(io, .serve);
+    relay_.serving = serving;
+    defer relay_.stop(io);
+    var buf: [40]u8 = undefined;
+    const urls = [_][]const u8{try testrelay.url(&buf, relay_.port())};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/store.mdb", .{dir_buf[0..dir_len]});
+    var st = try nostr.store.Store.open(path.ptr, .{ .map_size = 1 << 17 });
+    defer st.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 5_000, .store = &st });
+    try std.testing.expect(outcome.store_failed);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "the store could not be written") != null);
 }
 
 test "a relay that pings and never reads does not hold the run past its deadline" {
