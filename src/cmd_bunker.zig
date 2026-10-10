@@ -75,8 +75,9 @@ pub const usage =
     \\  served.
     \\
     \\  With --persist, a client that connected with a secret is remembered and
-    \\  does not need one again after a restart. To stop serving it, take its
-    \\  pubkey out of the file. The file is written readable by its owner only,
+    \\  does not need one again after a restart. A client that logs out is
+    \\  forgotten, and needs a secret to connect again. To stop serving one,
+    \\  take its pubkey out of the file. The file is written readable by its owner only,
     \\  and refused if anybody else can read it. It holds the key in the form it
     \\  was given, so give an ncryptsec to keep it encrypted there.
     \\
@@ -538,6 +539,16 @@ const Trust = struct {
         return false;
     }
 
+    fn forgetLocked(self: *Trust, client: [32]u8) void {
+        var i: usize = 0;
+        while (i < self.authorized.items.len) {
+            if (std.mem.eql(u8, &self.authorized.items[i], &client)) {
+                _ = self.authorized.orderedRemove(i);
+                self.dirty = true;
+            } else i += 1;
+        }
+    }
+
     fn policy(self: *Trust) nip46.Policy {
         return .{ .ctx = self, .decideFn = &decide };
     }
@@ -550,7 +561,13 @@ const Trust = struct {
         const method = nip46.Method.fromString(request.method) orelse return .reject;
         self.acquire();
         defer self.release();
-        if (self.isAuthorizedLocked(client)) return .approve;
+        if (self.isAuthorizedLocked(client)) {
+            // The library revokes the session; this forgets the client too,
+            // so it cannot come back with a bare `connect`, and the persist
+            // file stops naming it.
+            if (method == .logout) self.forgetLocked(client);
+            return .approve;
+        }
         if (method != .connect) return .reject;
 
         const got = if (request.params.len >= 2) request.params[1] else "";
@@ -1407,6 +1424,47 @@ test "a client that connected with a secret is remembered in the persist file" {
     try testing.expectEqual(@as(usize, 1), back.authorized_keys.len);
     try testing.expectEqualStrings(&want, back.authorized_keys[0]);
     try testing.expectEqualStrings(h.relays[0], back.relays[0]);
+}
+
+test "a client that logs out needs a secret again, and is forgotten by the persist file" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const gpa = h.da.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const secrets = [_][]const u8{"come-in"};
+    var config = h.config();
+    config.authorized_secrets = &secrets;
+    config.persist_dir = tmp.dir;
+    config.persist_path = "bunker.json";
+    var d = try Daemon.init(gpa, testing.io, &config, &h.out.writer, &h.err.writer);
+    defer d.deinit();
+
+    const pk_hex = std.fmt.bytesToHex(h.user.public_key, .lower);
+    const plan = [_]Script.Planned{
+        .{ .client = 0, .request = .{ .id = "c1", .method = "connect", .params = &.{ &pk_hex, "come-in" } } },
+        .{ .client = 0, .request = .{ .id = "o1", .method = "logout", .params = &.{} } },
+        .{ .client = 0, .request = .{ .id = "c2", .method = "connect", .params = &.{&pk_hex} } },
+        .{ .client = 0, .request = .{ .id = "s1", .method = "sign_event", .params = &.{template("after logout")} } },
+    };
+    h.script.plan = &plan;
+    try h.runUntil(&d, 4);
+
+    var out = try h.script.reply(testing.allocator, "o1");
+    defer out.deinit();
+    try testing.expectEqualStrings("ack", out.value.result);
+    for ([_][]const u8{ "c2", "s1" }) |id| {
+        var r = try h.script.reply(testing.allocator, id);
+        defer r.deinit();
+        try testing.expect(r.value.err.len > 0);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const back = try loadStored(arena_state.allocator(), testing.io, tmp.dir, "bunker.json");
+    try testing.expectEqual(@as(usize, 0), back.authorized_keys.len);
 }
 
 test "the command line is checked before anything starts" {
