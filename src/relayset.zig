@@ -10,7 +10,7 @@
 //! waiting for it.
 //!
 //! Each relay that answered the dial gets a reader task of its own. It sends
-//! the subscription, answers pings, parses what arrives
+//! the subscription, answers pings and NIP-42 challenges, parses what arrives
 //! and hands it to the calling thread through one queue. The calling thread
 //! does the rest: it drops duplicates, checks signatures, stores and prints,
 //! tracks EOSE, and stops at the deadline, which a timer task puts into the
@@ -20,6 +20,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const dial = @import("dial.zig");
+const auth = @import("auth.zig");
 
 const filter = nostr.filter;
 const message = nostr.message;
@@ -44,6 +45,11 @@ pub const Options = struct {
     poll_ms: i64 = 0,
     /// Every event that arrives is written here before it is printed.
     store: ?*nostr.store.Store = null,
+    /// Answer NIP-42 challenges with this key. Null answers none.
+    auth: ?auth.Options = null,
+    /// How long `auth.force_pre_auth` waits for a challenge before asking
+    /// without one. Never longer than the deadline.
+    challenge_wait_ms: i64 = 3_000,
 };
 
 pub const Outcome = struct {
@@ -115,8 +121,15 @@ pub const subscription_id = "deed";
 const Heard = struct {
     index: usize = 0,
     what: union(enum) {
-        /// Whatever the relay sent. The calling thread owns it.
+        /// An event, EOSE, CLOSED, a notice, or a challenge this run has no
+        /// key to answer. The calling thread owns it.
         msg: message.ParsedRelayMessage,
+        /// The relay asked for authentication, and the reader is giving it.
+        authenticating,
+        /// The relay refused the authentication, with its reason. Owned.
+        auth_refused: []u8,
+        /// No challenge came in time under `force_pre_auth`.
+        no_challenge,
         subscribe_failed: anyerror,
         /// The connection went away: null when the relay closed it.
         lost: ?anyerror,
@@ -124,9 +137,10 @@ const Heard = struct {
         deadline,
     },
 
-    fn deinit(self: *Heard) void {
+    fn deinit(self: *Heard, gpa: std.mem.Allocator) void {
         switch (self.what) {
             .msg => |*m| m.deinit(),
+            .auth_refused => |t| gpa.free(t),
             else => {},
         }
     }
@@ -138,6 +152,8 @@ const Shared = struct {
     io: std.Io,
     urls: []const []const u8,
     filters: []const filter.Filter,
+    auth: ?auth.Options,
+    challenge_wait_ms: i64,
     relays: [max_relays]?*relay.Relay = @splat(null),
     readers: [max_relays]?std.Io.Future(void) = @splat(null),
     /// Set before a reader is cancelled, so it hands nothing over on its way
@@ -177,17 +193,17 @@ const Shared = struct {
         while (true) {
             const n = self.heard.get(self.io, &buf, 0) catch break;
             if (n == 0) break;
-            for (buf[0..n]) |*h| h.deinit();
+            for (buf[0..n]) |*h| h.deinit(self.gpa);
         }
     }
 };
 
 /// Reads relay `i` until its connection goes away or the run lets it go.
 ///
-/// It also does every write the relay gets: the subscription and the pongs.
-/// A write to a relay that has stopped reading waits, and one waiting here is
-/// cut short when the reader is cancelled; one made from the calling thread
-/// would hold it instead.
+/// It also does every write the relay gets: the subscription, the pongs, and
+/// any NIP-42 answer. A write to a relay that has stopped reading waits, and
+/// one waiting here is cut short when the reader is cancelled; one made from
+/// the calling thread would hold it instead.
 ///
 /// `receive` rather than `receiveTimeout`: with no deadline the read goes
 /// straight to the socket, where a cancel reaches it, including in the middle
@@ -195,23 +211,143 @@ const Shared = struct {
 /// blocking call ends the task, so nothing blocks again after a cancel.
 fn readLoop(sh: *Shared, i: usize) void {
     const r = sh.relays[i].?;
-    r.subscribe(subscription_id, sh.filters) catch |e| {
-        _ = sh.tell(i, .{ .subscribe_failed = e });
-        return;
-    };
-    while (true) {
-        var msg = (r.receive() catch |e| {
-            _ = sh.tell(i, .{ .lost = e });
+    const url = sh.urls[i];
+
+    var challenge: ?[]u8 = null;
+    defer if (challenge) |c| sh.gpa.free(c);
+    // The answer the relay has not yet said OK to.
+    var auth_id: ?[32]u8 = null;
+    // A refusal asked for authentication before any challenge arrived.
+    var want_auth = false;
+    // One authentication per refusal, and one retry per run: a relay that
+    // refuses again after it is not asked a third time.
+    var retried = false;
+    var subscribed = false;
+
+    var wait_until: ?std.Io.Clock.Timestamp = null;
+    if (sh.auth) |a| {
+        if (a.force_pre_auth) wait_until = .fromNow(sh.io, .{ .raw = .fromMilliseconds(sh.challenge_wait_ms), .clock = .awake });
+    }
+    if (wait_until == null) {
+        r.subscribe(subscription_id, sh.filters) catch |e| {
+            _ = sh.tell(i, .{ .subscribe_failed = e });
             return;
+        };
+        subscribed = true;
+    }
+
+    while (true) {
+        const got = if (wait_until) |d| r.receiveTimeout(.{ .deadline = d }) else r.receive();
+        var msg = (got catch |e| switch (e) {
+            error.Timeout => {
+                // Asked without one, and the relay can still refuse.
+                wait_until = null;
+                if (!sh.tell(i, .no_challenge)) return;
+                r.subscribe(subscription_id, sh.filters) catch |se| {
+                    _ = sh.tell(i, .{ .subscribe_failed = se });
+                    return;
+                };
+                subscribed = true;
+                continue;
+            },
+            else => {
+                _ = sh.tell(i, .{ .lost = e });
+                return;
+            },
         }) orelse {
             _ = sh.tell(i, .{ .lost = null });
             return;
         };
-        if (!sh.tell(i, .{ .msg = msg })) {
-            msg.deinit();
-            return;
+
+        switch (msg.value) {
+            .auth => |c| {
+                const a = sh.auth orelse {
+                    if (!sh.tell(i, .{ .msg = msg })) {
+                        msg.deinit();
+                        return;
+                    }
+                    continue;
+                };
+                defer msg.deinit();
+                const copy = sh.gpa.dupe(u8, c.challenge) catch |e| {
+                    _ = sh.tell(i, .{ .lost = e });
+                    return;
+                };
+                if (challenge) |old| sh.gpa.free(old);
+                challenge = copy;
+                if (wait_until != null or want_auth) {
+                    wait_until = null;
+                    want_auth = false;
+                    auth_id = sendAuth(sh, r, a, url, copy) catch |e| {
+                        _ = sh.tell(i, .{ .lost = e });
+                        return;
+                    };
+                }
+            },
+            .ok => |o| {
+                defer msg.deinit();
+                const id = auth_id orelse continue;
+                if (!std.mem.eql(u8, &o.event_id, &id)) continue;
+                auth_id = null;
+                if (!o.accepted) {
+                    const text = sh.gpa.dupe(u8, o.message) catch |e| {
+                        _ = sh.tell(i, .{ .lost = e });
+                        return;
+                    };
+                    if (!sh.tell(i, .{ .auth_refused = text })) sh.gpa.free(text);
+                    return;
+                }
+                // Asked once more, now that the relay knows who is asking.
+                r.subscribe(subscription_id, sh.filters) catch |e| {
+                    _ = sh.tell(i, .{ .subscribe_failed = e });
+                    return;
+                };
+                subscribed = true;
+            },
+            .closed => |c| {
+                const a = sh.auth orelse {
+                    if (!sh.tell(i, .{ .msg = msg })) {
+                        msg.deinit();
+                        return;
+                    }
+                    continue;
+                };
+                if (retried or !subscribed or !std.mem.eql(u8, c.subscription_id, subscription_id) or !auth.isAuthRequired(c.message)) {
+                    if (!sh.tell(i, .{ .msg = msg })) {
+                        msg.deinit();
+                        return;
+                    }
+                    continue;
+                }
+                msg.deinit();
+                retried = true;
+                subscribed = false;
+                if (!sh.tell(i, .authenticating)) return;
+                if (challenge) |ch| {
+                    auth_id = sendAuth(sh, r, a, url, ch) catch |e| {
+                        _ = sh.tell(i, .{ .lost = e });
+                        return;
+                    };
+                } else {
+                    // The challenge may follow the refusal. Until it does
+                    // there is nothing to sign.
+                    want_auth = true;
+                }
+            },
+            .event, .eose, .notice => if (!sh.tell(i, .{ .msg = msg })) {
+                msg.deinit();
+                return;
+            },
         }
     }
+}
+
+/// Signs and sends the answer to `challenge`. Returns its id.
+fn sendAuth(sh: *Shared, r: *relay.Relay, a: auth.Options, url: []const u8, challenge: []const u8) ![32]u8 {
+    var ans = try auth.answer(sh.gpa, sh.io, a, url, challenge);
+    defer ans.deinit();
+    try r.authenticate(ans.event);
+    return ans.id;
 }
 
 fn deadlineAfter(q: *std.Io.Queue(Heard), io: std.Io, ms: i64) void {
@@ -246,6 +382,8 @@ pub fn query(
         .io = io,
         .urls = urls[0..n],
         .filters = filters,
+        .auth = opts.auth,
+        .challenge_wait_ms = @min(opts.challenge_wait_ms, opts.deadline_ms),
     };
     sh.heard = .init(&sh.heard_buf);
     defer sh.deinit();
@@ -326,7 +464,7 @@ pub fn query(
         var h = one[0];
         // Unless it is held for the store, in which case the batch owns it.
         var held = false;
-        defer if (!held) h.deinit();
+        defer if (!held) h.deinit(gpa);
 
         if (h.what == .deadline) {
             try err.writeAll("deed: gave up waiting for the relays still answering\n");
@@ -377,12 +515,17 @@ pub fn query(
                     finish(&sh, &live, &live_count, i);
                 },
                 .notice => |notice| try err.print("deed: notice: {s}\n", .{notice.message}),
-                // A relay asking for NIP-42 is asking for a signature this verb
-                // was not given a key for. Saying so beats looking like a relay
-                // with nothing to say.
-                .auth => try err.print("deed: a relay wants authentication, which this verb cannot give it\n", .{}),
+                // A relay asking for NIP-42 when this run has no key to answer
+                // with. Saying so beats looking like a relay with nothing to say.
+                .auth => try err.print("deed: a relay wants authentication, which needs --auth\n", .{}),
                 .ok => {},
             },
+            .authenticating => try err.print("deed: {s}: authenticating\n", .{url}),
+            .auth_refused => |t| {
+                try err.print("deed: {s}: authentication refused: {s}\n", .{ url, t });
+                finish(&sh, &live, &live_count, i);
+            },
+            .no_challenge => try err.print("deed: {s}: no authentication challenge within {d} ms, asking without one\n", .{ url, sh.challenge_wait_ms }),
             .subscribe_failed => |e| {
                 try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
                 result.dialled -= 1;
@@ -625,6 +768,200 @@ test "an event from the last of five relays is printed at once, although four ne
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "gave up waiting") != null);
 }
 
+/// A relay that keeps its events behind NIP-42. It refuses a REQ with
+/// `auth-required:` until it gets an AUTH whose `relay` tag is `want_url` and
+/// whose challenge is its own, and serves `event` after that.
+const AuthRelay = struct {
+    want_url: []const u8,
+    event: []const u8,
+    /// Send the challenge after the refusal rather than before it.
+    challenge_last: bool = false,
+    authed: bool = false,
+    reqs: usize = 0,
+    auths: usize = 0,
+
+    const challenge = "chal-7f3a";
+
+    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+        const testrelay = @import("testrelay.zig");
+        const self: *AuthRelay = @ptrCast(@alignCast(ctx.?));
+        const a = std.heap.page_allocator;
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        const kind = items[0].string;
+        if (std.mem.eql(u8, kind, "REQ")) {
+            self.reqs += 1;
+            const sub = items[1].string;
+            if (!self.authed) {
+                if (!self.challenge_last) try testrelay.sendText(w, "[\"AUTH\",\"" ++ challenge ++ "\"]");
+                const closed = try std.fmt.allocPrint(a, "[\"CLOSED\",\"{s}\",\"auth-required: who are you\"]", .{sub});
+                defer a.free(closed);
+                try testrelay.sendText(w, closed);
+                if (self.challenge_last) try testrelay.sendText(w, "[\"AUTH\",\"" ++ challenge ++ "\"]");
+                return;
+            }
+            const ev = try std.fmt.allocPrint(a, "[\"EVENT\",\"{s}\",{s}]", .{ sub, self.event });
+            defer a.free(ev);
+            try testrelay.sendText(w, ev);
+            const eose = try std.fmt.allocPrint(a, "[\"EOSE\",\"{s}\"]", .{sub});
+            defer a.free(eose);
+            try testrelay.sendText(w, eose);
+        } else if (std.mem.eql(u8, kind, "AUTH")) {
+            self.auths += 1;
+            const ev = items[1].object;
+            const id = ev.get("id").?.string;
+            const tags = ev.get("tags").?.array.items;
+            var relay_ok = false;
+            var challenge_ok = false;
+            for (tags) |t| {
+                const pair = t.array.items;
+                if (std.mem.eql(u8, pair[0].string, "relay")) relay_ok = std.mem.eql(u8, pair[1].string, self.want_url);
+                if (std.mem.eql(u8, pair[0].string, "challenge")) challenge_ok = std.mem.eql(u8, pair[1].string, challenge);
+            }
+            const good = relay_ok and challenge_ok and ev.get("kind").?.integer == 22242;
+            if (good) self.authed = true;
+            const ok = try std.fmt.allocPrint(a, "[\"OK\",\"{s}\",{s},\"{s}\"]", .{ id, if (good) "true" else "false", if (good) "" else "auth-required: wrong relay" });
+            defer a.free(ok);
+            try testrelay.sendText(w, ok);
+        }
+    }
+};
+
+fn authOptions() !auth.Options {
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    return .{ .keypair = try signer.keyPairFromSecretKey([_]u8{0x44} ** 32) };
+}
+
+test "with --auth a relay that refuses until it is told who is asking is answered, and asked again" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_]bool{ false, true }) |challenge_last| {
+        var script: AuthRelay = .{ .want_url = undefined, .event = try testEvent(arena, io, "members only"), .challenge_last = challenge_last };
+        var r: testrelay.Relay = undefined;
+        try r.startCustom(io, AuthRelay.handle, &script);
+        defer r.stop(io);
+        var buf: [40]u8 = undefined;
+        const url = try testrelay.url(&buf, r.port());
+        script.want_url = url;
+
+        const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        const outcome = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 3_000, .auth = try authOptions() });
+
+        try std.testing.expectEqual(@as(usize, 1), outcome.events);
+        try std.testing.expectEqual(@as(usize, 1), outcome.complete);
+        try std.testing.expectEqual(@as(usize, 1), script.auths);
+        try std.testing.expectEqual(@as(usize, 2), script.reqs);
+        try std.testing.expect(std.mem.indexOf(u8, err.written(), try std.fmt.allocPrint(arena, "deed: {s}: authenticating\n", .{url})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, err.written(), "closed the subscription") == null);
+    }
+}
+
+test "without --auth the refusal is reported, and nothing is signed" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var script: AuthRelay = .{ .want_url = undefined, .event = try testEvent(arena, io, "members only") };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, AuthRelay.handle, &script);
+    defer r.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, r.port());
+    script.want_url = url;
+
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const outcome = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 3_000 });
+
+    try std.testing.expectEqual(@as(usize, 0), outcome.events);
+    try std.testing.expectEqual(@as(usize, 0), script.auths);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "deed: a relay wants authentication, which needs --auth\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "deed: a relay closed the subscription: auth-required: who are you\n") != null);
+}
+
+test "an answer naming some other relay is refused, reported, and not tried again" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The relay knows itself by a name other than the one dialled, so the
+    // answer's `relay` tag, which is the dialled URL, does not match it.
+    var script: AuthRelay = .{ .want_url = "wss://relay.example", .event = try testEvent(arena, io, "members only") };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, AuthRelay.handle, &script);
+    defer r.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, r.port());
+
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const outcome = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 3_000, .auth = try authOptions() });
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+
+    try std.testing.expectEqual(@as(usize, 0), outcome.events);
+    try std.testing.expectEqual(@as(usize, 1), script.auths);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), try std.fmt.allocPrint(arena, "deed: {s}: authentication refused: auth-required: wrong relay\n", .{url})) != null);
+    // Ends on the refusal, not at the deadline.
+    try std.testing.expect(took < 2_000);
+}
+
+test "--force-pre-auth against a relay that sends no challenge asks without one, in bounded time" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var r: testrelay.Relay = undefined;
+    try r.start(io, .serve);
+    r.serving = &.{try testEvent(arena, io, "open")};
+    defer r.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, r.port());
+
+    var opts = try authOptions();
+    opts.force_pre_auth = true;
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const outcome = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 3_000, .auth = opts, .challenge_wait_ms = 150 });
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+
+    try std.testing.expectEqual(@as(usize, 1), outcome.events);
+    try std.testing.expectEqual(@as(usize, 1), outcome.complete);
+    try std.testing.expect(took >= 150);
+    try std.testing.expect(took < 2_000);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "no authentication challenge within 150 ms, asking without one\n") != null);
+}
+
 test "a relay still answering at the deadline is let go, whatever its reader is doing" {
     const io = std.testing.io;
     const testrelay = @import("testrelay.zig");
@@ -661,7 +998,7 @@ test "a relay still answering at the deadline is let go, whatever its reader is 
     defer err.deinit();
 
     const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 400 });
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 400, .auth = try authOptions() });
     const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
 
     try std.testing.expectEqual(@as(usize, 4), outcome.dialled);
@@ -674,4 +1011,5 @@ test {
     // imports it without ever compiling a function body nobody references, so
     // the build would go green over code that does not compile.
     std.testing.refAllDecls(@This());
+    _ = @import("auth.zig");
 }
