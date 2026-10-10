@@ -26,6 +26,7 @@ const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
 const dial = @import("dial.zig");
+const qr = @import("qr.zig");
 
 const Io = std.Io;
 const keys = nostr.keys;
@@ -60,6 +61,7 @@ pub const usage =
     \\                                 presents it, repeatable
     \\  --persist <path>               keep the key, the relays and the authorized
     \\                                 clients in this file across restarts
+    \\  --qrcode                       print the URI as a QR code too, on stderr
     \\
     \\Who is served:
     \\  Only authorized clients. A client is authorized when its pubkey was
@@ -83,7 +85,7 @@ pub const usage =
     \\  and any given here, and then serves that client.
     \\
     \\  deed bunker --sec nsec1… wss://relay.example
-    \\  deed bunker --persist ~/.config/deed/bunker.json wss://relay.example
+    \\  deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
     \\  deed bunker connect 'nostrconnect://…' --sec nsec1…
     \\
 ;
@@ -151,6 +153,7 @@ const Parsed = struct {
     authorized_keys: std.ArrayList([32]u8) = .empty,
     authorized_secrets: std.ArrayList([]const u8) = .empty,
     persist: ?[]const u8 = null,
+    qrcode: bool = false,
     invite: ?nip46.NostrConnectUri = null,
     /// The exit code for a failure found after parsing.
     failure: u8 = cli.exit_usage,
@@ -183,6 +186,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, out: *Io.Writer
             try out.writeAll(usage);
             p.help = true;
             return p;
+        }
+        if (std.mem.eql(u8, a, "--qrcode")) {
+            p.qrcode = true;
+            continue;
         }
         const takes_value = cli.isOneOf(a, &.{ "--sec", "-k", "--authorized-keys", "-s", "--authorized-secrets", "--persist" });
         if (!takes_value) {
@@ -255,6 +262,7 @@ pub const Config = struct {
     authorized_secrets: []const []const u8,
     /// Whether to generate a single-use secret for the printed URI.
     fresh_secret: bool,
+    qrcode: bool = false,
     /// Where `persist_path` is resolved from. Null is the working directory.
     persist_dir: ?Io.Dir = null,
     persist_path: ?[]const u8 = null,
@@ -371,6 +379,7 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
         .authorized_keys = authorized.items,
         .authorized_secrets = secrets.items,
         .fresh_secret = !keys_only and p.invite == null,
+        .qrcode = p.qrcode,
         .persist_path = persist_path,
         .invite = p.invite,
     };
@@ -687,7 +696,7 @@ pub const Daemon = struct {
         self.err.flush() catch {};
     }
 
-    /// Prints the URI on stdout.
+    /// Prints the URI on stdout, and as a QR code on stderr when asked.
     fn printUri(self: *Daemon) void {
         self.trust.acquire();
         const fresh = self.trust.fresh;
@@ -700,6 +709,16 @@ pub const Daemon = struct {
         defer self.gpa.free(uri);
         self.out.print("{s}\n", .{uri}) catch {};
         self.out.flush() catch {};
+        if (!self.config.qrcode) return;
+        var code = qr.encode(self.gpa, uri, .medium, null) catch |e| {
+            self.log("no QR code: {s}", .{@errorName(e)});
+            return;
+        };
+        defer code.deinit(self.gpa);
+        self.lockLog();
+        defer self.unlockLog();
+        qr.render(&code, self.err) catch {};
+        self.err.flush() catch {};
     }
 
     /// Writes the persist file, if there is one and something changed.
