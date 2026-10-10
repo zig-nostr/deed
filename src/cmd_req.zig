@@ -25,7 +25,7 @@ pub const usage =
     \\deed req: build a subscription, and run it
     \\
     \\Usage:
-    \\  deed req [options] [<filter-json>...] [<relay-url>...]
+    \\  deed req [options] [<filter-json>...] [-] [<relay-url>...]
     \\
     \\Options:
     \\  -k, --kind <n>       event kind, repeatable
@@ -52,8 +52,9 @@ pub const usage =
 ++ auth.usage_lines ++
     \\
     \\A filter can also be given as JSON: as an argument that starts with {, or
-    \\on stdin when it is not a terminal (one object, several, or an array of
-    \\them). Flags are laid over each JSON filter: a field a flag sets replaces
+    \\on stdin when a lone - is given (one object, several, or an array of them).
+    \\Stdin is read only for that -, never on its own, so a caller that leaves a
+    \\pipe open cannot stall a request; reading it gives up after --timeout. Flags are laid over each JSON filter: a field a flag sets replaces
     \\the one in the JSON. Several filters make one subscription.
     \\More than 500 ids or authors in a filter go out as several filters in the
     \\same REQ, so none is dropped.
@@ -95,6 +96,8 @@ pub const Request = struct {
     paginate: bool = false,
     paginate_interval_ms: i64 = 0,
     auth: auth.Flags = .{},
+    /// A lone `-` was given: read filters from stdin.
+    stdin: bool = false,
 };
 
 /// How long a run waits on relays still answering, once they are reached.
@@ -156,6 +159,7 @@ pub fn parse(
     var store_path: ?[]const u8 = null;
     var timeout_ms: i64 = default_timeout_ms;
     var auth_flags: auth.Flags = .{};
+    var from_stdin = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -170,6 +174,10 @@ pub fn parse(
                 return ParseError.Usage;
             },
             .not_mine => {},
+        }
+        if (std.mem.eql(u8, a, "-")) {
+            from_stdin = true;
+            continue;
         }
         if (std.mem.eql(u8, a, "--bare")) {
             bare = true;
@@ -257,6 +265,7 @@ pub fn parse(
         .paginate = paginate,
         .paginate_interval_ms = paginate_interval_ms,
         .auth = auth_flags,
+        .stdin = from_stdin,
     };
 }
 
@@ -331,6 +340,43 @@ pub fn parseJsonFilters(
     }
 }
 
+const StdinArrival = union(enum) {
+    read: anyerror![]u8,
+    timer: std.Io.Cancelable!void,
+};
+
+fn readAll(arena: std.mem.Allocator, r: *std.Io.Reader) anyerror![]u8 {
+    return r.allocRemaining(arena, .limited(max_stdin_bytes));
+}
+
+/// All of `r`, or `error.Timeout` when it has not ended within `timeout_ms`.
+fn readStdin(arena: std.mem.Allocator, io: std.Io, r: *std.Io.Reader, timeout_ms: i64) ![]u8 {
+    var buf: [2]StdinArrival = undefined;
+    var sel = std.Io.Select(StdinArrival).init(io, &buf);
+    var result: anyerror![]u8 = error.Timeout;
+    var started = false;
+    if (sel.concurrent(.read, readAll, .{ arena, r })) {
+        started = true;
+        sel.concurrent(.timer, std.Io.sleep, .{ io, .fromMilliseconds(timeout_ms), .awake }) catch {};
+        if (sel.await()) |first| switch (first) {
+            .read => |v| result = v,
+            .timer => {},
+        } else |_| {}
+    } else |_| {
+        // No second thread to read on: read inline, as unbounded as before.
+        result = readAll(arena, r);
+    }
+    if (started) {
+        while (sel.cancel()) |late| switch (late) {
+            .read => |v| if (v) |text| {
+                result = text;
+            } else |_| {},
+            .timer => {},
+        };
+    }
+    return result;
+}
+
 pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -339,12 +385,10 @@ pub fn run(
     err: *std.Io.Writer,
 ) !u8 {
     var buf: [4096]u8 = undefined;
-    // Streaming for the reason `main` gives for the writers. Stdin is only
-    // read when it is not a terminal, and only once the command line has been
-    // understood and carries no filter of its own.
+    // Streaming for the reason `main` gives for the writers. Stdin is read
+    // only for an explicit `-`, once the command line has been understood.
     var reader = std.Io.File.stdin().readerStreaming(io, &buf);
-    const piped = !(std.Io.File.stdin().isTty(io) catch true);
-    return runWith(gpa, io, args, if (piped) &reader.interface else null, out, err);
+    return runWith(gpa, io, args, &reader.interface, out, err);
 }
 
 /// `run`, with the stdin to read a JSON filter from given (or none).
@@ -375,8 +419,8 @@ pub fn runWith(
         return cli.exit_ok;
     };
 
-    // The filters: JSON given as arguments, else JSON on stdin, else the flags
-    // alone. Flags lay over whichever JSON there was.
+    // The filters: JSON given as arguments and, with `-`, on stdin; else the
+    // flags alone. Flags lay over whichever JSON there was.
     var filters: std.ArrayList(filter.Filter) = .empty;
     var parsed_ok = true;
     parseAll: {
@@ -389,11 +433,15 @@ pub fn runWith(
                 else => return e,
             };
         }
-        if (jsons.len == 0) if (stdin) |r| {
-            const text = r.allocRemaining(arena, .limited(max_stdin_bytes)) catch |e| switch (e) {
+        if (req.stdin) if (stdin) |r| {
+            const text = readStdin(arena, io, r, req.timeout_ms) catch |e| switch (e) {
                 error.OutOfMemory => return e,
                 error.StreamTooLong => {
                     try err.print("deed req: the filter on stdin is longer than {d} bytes\n", .{max_stdin_bytes});
+                    return cli.exit_fail;
+                },
+                error.Timeout => {
+                    try err.print("deed req: nothing ended the filter on stdin within {d} ms\n", .{req.timeout_ms});
                     return cli.exit_fail;
                 },
                 else => {
@@ -816,26 +864,60 @@ test "filters given as JSON arguments are printed as one REQ, with flags laid ov
 test "a filter on stdin is read, several are kept, and a bad one is refused" {
     var ob: [4096]u8 = undefined;
     var eb: [1024]u8 = undefined;
-    const one = try runReqStdin(&.{"--bare"}, "{\"kinds\": [1],\n \"#t\": [\"a\"]}\n", &ob, &eb);
+    const one = try runReqStdin(&.{ "-", "--bare" }, "{\"kinds\": [1],\n \"#t\": [\"a\"]}\n", &ob, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[1],\"#t\":[\"a\"]}\n", one.out);
 
     var ob2: [4096]u8 = undefined;
-    const many = try runReqStdin(&.{ "-l", "4" }, "{\"kinds\":[1]}\n{\"kinds\":[7]}\n", &ob2, &eb);
+    const many = try runReqStdin(&.{ "-", "-l", "4" }, "{\"kinds\":[1]}\n{\"kinds\":[7]}\n", &ob2, &eb);
     try std.testing.expectEqualStrings("[\"REQ\",\"deed\",{\"kinds\":[1],\"limit\":4},{\"kinds\":[7],\"limit\":4}]\n", many.out);
 
     var ob3: [4096]u8 = undefined;
-    const array = try runReqStdin(&.{"--bare"}, "[{\"kinds\":[1]},{\"kinds\":[7]}]", &ob3, &eb);
+    const array = try runReqStdin(&.{ "-", "--bare" }, "[{\"kinds\":[1]},{\"kinds\":[7]}]", &ob3, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[1]}\n{\"kinds\":[7]}\n", array.out);
 
     var ob4: [4096]u8 = undefined;
-    const bad = try runReqStdin(&.{"--bare"}, "{\"kinds\": nope}\n", &ob4, &eb);
+    const bad = try runReqStdin(&.{ "-", "--bare" }, "{\"kinds\": nope}\n", &ob4, &eb);
     try std.testing.expectEqual(cli.exit_fail, bad.code);
     try std.testing.expect(std.mem.indexOf(u8, bad.err, "deed req: the filter is not valid JSON") != null);
 
-    // Filters given as arguments mean stdin is not read at all.
+    // Without a lone -, stdin is not read at all, whatever is on it.
     var ob5: [4096]u8 = undefined;
     const args_win = try runReqStdin(&.{ "{\"kinds\":[2]}", "--bare" }, "{\"kinds\":[9]}", &ob5, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[2]}\n", args_win.out);
+    var ob6: [4096]u8 = undefined;
+    const flags_only = try runReqStdin(&.{ "-k", "7", "--bare" }, "{\"kinds\":[9]}", &ob6, &eb);
+    try std.testing.expectEqualStrings("{\"kinds\":[7]}\n", flags_only.out);
+}
+
+/// A reader whose input never ends: it waits, as a pipe nobody closes does.
+const Stuck = struct {
+    io: std.Io,
+    interface: std.Io.Reader,
+
+    fn init(io: std.Io, buf: []u8) Stuck {
+        return .{ .io = io, .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buf, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(r: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Stuck = @alignCast(@fieldParentPtr("interface", r));
+        while (true) self.io.sleep(.fromMilliseconds(50), .awake) catch return error.ReadFailed;
+    }
+};
+
+test "a stdin that never ends is given up on at --timeout, not waited for" {
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    var stuck = Stuck.init(io, &buf);
+    var out_buf: [256]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err: std.Io.Writer = .fixed(&err_buf);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const code = try runWith(std.testing.allocator, io, &.{ "-", "--timeout", "300" }, &stuck.interface, &out, &err);
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expectEqual(cli.exit_fail, code);
+    try std.testing.expect(took < 3_000);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "within 300 ms") != null);
 }
 
 test "--auth answers a relay that holds events behind NIP-42, and --sec needs --auth" {
