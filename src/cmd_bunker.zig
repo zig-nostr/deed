@@ -89,7 +89,8 @@ pub const usage =
     \\  forgotten, and needs a secret to connect again. To stop serving one,
     \\  take its pubkey out of the file. The file is written readable by its owner only,
     \\  and refused if anybody else can read it. It holds the key in the form it
-    \\  was given, so give an ncryptsec to keep it encrypted there.
+    \\  was given, so give an ncryptsec to keep it encrypted there. One bunker
+    \\  uses a file at a time: a second one given the same file will not start.
     \\
     \\connect:
     \\  Answers a nostrconnect:// URI shown by a client, on the relays it names
@@ -137,6 +138,19 @@ pub fn run(
     if (parsed.help) return cli.exit_ok;
 
     const config = (try resolve(arena, io, &parsed, getEnv("NOSTR_SECRET_KEY"), err)) orelse return parsed.failure;
+
+    var held: ?Io.File = null;
+    defer if (held) |f| f.close(io);
+    if (config.persist_path) |path| {
+        held = lockPersist(gpa, io, Io.Dir.cwd(), path) catch |e| {
+            try err.print("deed bunker: cannot lock {s}: {s}\n", .{ path, @errorName(e) });
+            return cli.exit_fail;
+        };
+        if (held == null) {
+            try err.print("deed bunker: another bunker is using {s}; stop it, or give this one a --persist file of its own\n", .{path});
+            return cli.exit_fail;
+        }
+    }
 
     var daemon = Daemon.init(gpa, io, &config, out, err) catch |e| {
         try err.print("deed bunker: could not start: {s}\n", .{@errorName(e)});
@@ -484,7 +498,8 @@ fn loadStored(arena: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) L
 
 /// Writes the persist file whole: to a fresh owner-only file beside it, then
 /// renamed over it, so a crash mid-write leaves the old one rather than half
-/// of the new one.
+/// of the new one. The file beside it has a name of its own (the process id
+/// and a random part), so it is never one another process is writing.
 ///
 /// Windows has no mode bits: the file takes the access list of its directory,
 /// which under the user's profile is already private to that user.
@@ -492,12 +507,11 @@ fn saveStored(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, sto
     const text = try std.json.Stringify.valueAlloc(gpa, stored, .{ .whitespace = .indent_2 });
     defer gpa.free(text);
     if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
-    const tmp = try std.mem.concat(gpa, u8, &.{ path, ".tmp" });
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-{s}", .{ path, processId(), &std.fmt.bytesToHex(raw, .lower) });
     defer gpa.free(tmp);
-    dir.deleteFile(io, tmp) catch |e| switch (e) {
-        error.FileNotFound => {},
-        else => return e,
-    };
+    errdefer dir.deleteFile(io, tmp) catch {};
     try dir.writeFile(io, .{
         .sub_path = tmp,
         .data = text,
@@ -507,6 +521,37 @@ fn saveStored(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, sto
         },
     });
     try dir.rename(tmp, dir, path, io);
+}
+
+fn processId() u64 {
+    if (builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(std.c.getpid());
+}
+
+/// Takes the lock that says a bunker is using the persist file at `path`, or
+/// null when another one already holds it. Two bunkers on one file would each
+/// write their own list of clients over the other's.
+///
+/// The lock is on a file beside it, `<path>.lock`, because the persist file
+/// itself is replaced on every save and a lock on it would go with the old
+/// one. The lock ends with the process, however it ends.
+fn lockPersist(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) !?Io.File {
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
+    const lock_path = try std.mem.concat(gpa, u8, &.{ path, ".lock" });
+    defer gpa.free(lock_path);
+    const f = try dir.createFile(io, lock_path, .{
+        .truncate = false,
+        .permissions = if (builtin.os.tag == .windows) .default_file else Io.File.Permissions.fromMode(0o600),
+    });
+    const locked = f.tryLock(io, .exclusive) catch |e| {
+        f.close(io);
+        return e;
+    };
+    if (!locked) {
+        f.close(io);
+        return null;
+    }
+    return f;
 }
 
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
@@ -1456,6 +1501,28 @@ test "the persist file round-trips, is owner-only, and is refused when others ca
     try testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
     try tmp.dir.setFilePermissions(io, "dir/bunker.json", .fromMode(0o644), .{});
     try testing.expectError(error.ReadableByOthers, loadStored(arena_state.allocator(), io, tmp.dir, "dir/bunker.json"));
+}
+
+test "two bunkers cannot share a persist file, nor clobber each other's half-written save" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first = (try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) orelse return error.TestUnexpectedResult;
+    try testing.expect((try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) == null);
+    // A save does not take the lock with it.
+    try saveStored(gpa, io, tmp.dir, "dir/bunker.json", .{ .sec = "nsec1example" });
+    try testing.expect((try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) == null);
+    first.close(io);
+    const again = (try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) orelse return error.TestUnexpectedResult;
+    again.close(io);
+
+    // What another process is halfway through writing is left alone.
+    try tmp.dir.writeFile(io, .{ .sub_path = "dir/bunker.json.tmp", .data = "theirs" });
+    try saveStored(gpa, io, tmp.dir, "dir/bunker.json", .{ .sec = "nsec1example" });
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("theirs", try tmp.dir.readFile(io, "dir/bunker.json.tmp", &buf));
 }
 
 test "a client that connected with a secret is remembered in the persist file" {
