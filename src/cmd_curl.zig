@@ -3,8 +3,9 @@
 //! deed does not reimplement curl. It reads just enough of curl's command line
 //! to know the method, the URL and (when the body is written inline) the
 //! body, signs a `kind:27235` event for that request, and runs the real curl
-//! with `-H "Authorization: Nostr ..."` in front of everything else, which is
-//! passed through untouched. curl's exit status is deed's.
+//! with `-H @-` in front of everything else, which is passed through
+//! untouched. The header itself is written to curl's stdin, so it never
+//! appears in argv. curl's exit status is deed's.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,8 +47,10 @@ pub const usage =
     \\                Falls back to $NOSTR_SECRET_KEY. Not passed on to curl.
     \\
     \\The header carries the time it was signed, and servers accept it for a
-    \\minute or so. It is visible to other users of the machine in the process
-    \\list while curl runs.
+    \\minute or so. It reaches curl on stdin, so it is not in the process
+    \\list. When the arguments already read stdin (-d @-, -T -), it goes in a
+    \\private file in the temp directory instead, which is removed after curl
+    \\exits.
     \\
     \\Examples:
     \\  deed curl https://example.com/api/me
@@ -357,20 +360,88 @@ pub fn run(
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
     const auth = try nip98.authHeader(gpa, signer, keypair, now, parsed.url, parsed.method, parsed.body, null);
     defer gpa.free(auth);
-    const header = try std.fmt.allocPrint(gpa, "Authorization: {s}", .{auth});
-    defer gpa.free(header);
+    // The header line curl reads with `-H @...`. It is data for curl's
+    // stdin or a private file, never an argument.
+    const line = try std.fmt.allocPrint(gpa, "Authorization: {s}\n", .{auth});
+    defer gpa.free(line);
 
+    if (!readsStdin(parsed.forward)) {
+        const argv = try curlArgv(gpa, "@-", parsed.forward);
+        defer gpa.free(argv);
+        return exec(io, argv, line, err);
+    }
+
+    // The user's own arguments read stdin, so the header waits in a file.
+    const path = try writeHeaderFile(gpa, io, line);
+    defer {
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+        gpa.free(path);
+    }
+    const ref = try std.fmt.allocPrint(gpa, "@{s}", .{path});
+    defer gpa.free(ref);
+    const argv = try curlArgv(gpa, ref, parsed.forward);
+    defer gpa.free(argv);
+    return exec(io, argv, null, err);
+}
+
+/// The argv for curl: the header read from `header_ref` (`@-` or `@path`),
+/// then the user's arguments. The signed header is never in it.
+fn curlArgv(gpa: std.mem.Allocator, header_ref: []const u8, forward: []const []const u8) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try argv.appendSlice(gpa, &.{ "curl", "-H", header });
-    try argv.appendSlice(gpa, parsed.forward);
+    errdefer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ "curl", "-H", header_ref });
+    try argv.appendSlice(gpa, forward);
+    return argv.toOwnedSlice(gpa);
+}
 
-    return exec(io, argv.items, err);
+/// True when one of curl's arguments may read stdin: a lone "-" (-T -, or a
+/// config file from stdin), a value ending in "@-" (-d @-, -F name=@-), or a
+/// short option cluster ending in "-" (-d-). Errs toward true: a false
+/// positive only means the header goes in a file.
+fn readsStdin(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "-")) return true;
+        if (std.mem.endsWith(u8, a, "@-")) return true;
+        if (a.len > 2 and a[0] == '-' and a[1] != '-' and a[a.len - 1] == '-') return true;
+    }
+    return false;
+}
+
+/// The directory for the header file: $TMPDIR, or /tmp.
+fn tempDir() ?[]const u8 {
+    if (builtin.os.tag == .windows) return getEnv("TEMP") orelse getEnv("TMP");
+    return getEnv("TMPDIR") orelse "/tmp";
+}
+
+/// Writes `line` to a new file in the temp directory that only the owner can
+/// read (0600), and returns its absolute path, owned by the caller. The name
+/// is random and the file is created exclusively.
+fn writeHeaderFile(gpa: std.mem.Allocator, io: std.Io, line: []const u8) ![]u8 {
+    const dir = tempDir() orelse return error.NoTempDir;
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const hex = std.fmt.bytesToHex(rnd, .lower);
+    const path = try std.fmt.allocPrint(gpa, "{s}/deed-curl-{s}.hdr", .{ dir, &hex });
+    errdefer gpa.free(path);
+
+    const perm: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .permissions = perm });
+    file.writeStreamingAll(io, line) catch |e| {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+        gpa.free(path);
+        return e;
+    };
+    file.close(io);
+    return path;
 }
 
 /// Runs `argv` with the terminal as its streams and returns its exit status.
-fn exec(io: std.Io, argv: []const []const u8, err: *std.Io.Writer) !u8 {
-    var child = std.process.spawn(io, .{ .argv = argv }) catch |e| {
+/// When `stdin_bytes` is given, curl's stdin is a pipe that receives those
+/// bytes and is then closed.
+fn exec(io: std.Io, argv: []const []const u8, stdin_bytes: ?[]const u8, err: *std.Io.Writer) !u8 {
+    const stdin_mode: std.process.SpawnOptions.StdIo = if (stdin_bytes != null) .pipe else .inherit;
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = stdin_mode }) catch |e| {
         if (e == error.FileNotFound) {
             try err.writeAll("deed curl: curl is not installed, or is not on the PATH\n");
         } else {
@@ -378,6 +449,21 @@ fn exec(io: std.Io, argv: []const []const u8, err: *std.Io.Writer) !u8 {
         }
         return cli.exit_fail;
     };
+    if (stdin_bytes) |bytes| {
+        if (child.stdin) |pipe| {
+            child.stdin = null;
+            pipe.writeStreamingAll(io, bytes) catch |e| {
+                // curl may exit before it reads the header; that is its status to report.
+                if (e != error.BrokenPipe) {
+                    pipe.close(io);
+                    _ = child.wait(io) catch {};
+                    try err.print("deed curl: could not send the header to curl: {s}\n", .{@errorName(e)});
+                    return cli.exit_fail;
+                }
+            };
+            pipe.close(io);
+        }
+    }
     const term = child.wait(io) catch |e| {
         try err.print("deed curl: waiting for curl failed: {s}\n", .{@errorName(e)});
         return cli.exit_fail;
@@ -669,4 +755,74 @@ test "curl's exit status is passed back" {
     // --fail makes curl exit 22 on a 404.
     const code = try run(testing.allocator, io, &.{ "--sec", test_secret, "-s", "--fail", "-o", "/dev/null", url }, &out.writer, &err.writer);
     try testing.expectEqual(@as(u8, 22), code);
+}
+
+test "the signed header is never an argument to curl" {
+    const gpa = testing.allocator;
+    const forward = [_][]const u8{ "-s", "-d", "a=1", "https://example.com/" };
+    for ([_][]const u8{ "@-", "@/tmp/deed-curl-x.hdr" }) |ref| {
+        const argv = try curlArgv(gpa, ref, &forward);
+        defer gpa.free(argv);
+        try testing.expectEqualStrings("curl", argv[0]);
+        try testing.expectEqualStrings("-H", argv[1]);
+        try testing.expectEqualStrings(ref, argv[2]);
+        for (argv) |a| {
+            try testing.expect(std.mem.indexOf(u8, a, "Authorization") == null);
+            try testing.expect(std.mem.indexOf(u8, a, "Nostr") == null);
+        }
+    }
+}
+
+test "only arguments that may read stdin send the header to a file" {
+    try testing.expect(!readsStdin(&.{ "-s", "-o", "/dev/null", "-d", "a=1", "https://example.com/" }));
+    try testing.expect(!readsStdin(&.{ "-d", "@body.json", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "-d", "@-", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "-d@-", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "-T", "-", "https://example.com/f" }));
+    try testing.expect(readsStdin(&.{ "-T-", "https://example.com/f" }));
+    try testing.expect(readsStdin(&.{ "--data-binary", "@-", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "-F", "file=@-", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "--config", "-", "https://example.com/" }));
+}
+
+test "the header file is private, holds the line, and is named under the temp dir" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const line = "Authorization: Nostr test-token\n";
+
+    const path = try writeHeaderFile(gpa, io, line);
+    defer gpa.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, st.permissions.toMode() & 0o777));
+    const body = try std.Io.Dir.readFileAlloc(.cwd(), io, path, gpa, .limited(4096));
+    defer gpa.free(body);
+    try testing.expectEqualStrings(line, body);
+}
+
+test "a request whose arguments read stdin still gets a header that verifies" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    if (!curlExists(io)) return error.SkipZigTest;
+
+    var srv: CaptureServer = undefined;
+    try srv.start(io, .ok, "fine", 1);
+    defer srv.stop(io);
+
+    // The URL ends in "@-", so deed sends the header through a file rather
+    // than stdin. curl reads nothing from stdin here.
+    var ub: [64]u8 = undefined;
+    const url = try srv.url(&ub, "/thing@-");
+
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    const code = try run(testing.allocator, io, &.{ "--sec", test_secret, "-s", "-o", "/dev/null", url }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_ok, code);
+    try expectSigned(io, srv.sentAuth(), url, "GET", null);
 }
