@@ -1046,3 +1046,43 @@ test "a key that cannot be read exits 1 with one line, and a missing key is a us
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, err.written(), "\n"));
     try testing.expect(std.mem.indexOf(u8, err.written(), "not a secret key") != null);
 }
+
+const Dribble = struct {
+    io: std.Io,
+    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+        const self: *Dribble = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.startsWith(u8, frame, "[\"EVENT\"")) return;
+        // A text frame declaring 1000 bytes, then one byte every 100 ms.
+        try w.writeAll(&.{ 0x81, 126, 0x03, 0xE8 });
+        try w.flush();
+        var k: usize = 0;
+        while (k < 40) : (k += 1) {
+            try self.io.sleep(.fromMilliseconds(100), .awake);
+            try w.writeAll(" ");
+            try w.flush();
+        }
+    }
+};
+
+test "publishEvent is bounded by its timeout against a dribbling relay" {
+    const testrelay = @import("testrelay.zig");
+    const io = testing.io;
+    const gpa = std.heap.page_allocator;
+    var d = Dribble{ .io = io };
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, Dribble.handle, &d);
+    defer relay.stop(io);
+    var url_buf: [40]u8 = undefined;
+    const url = try testrelay.url(&url_buf, relay.port());
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const j = try signedJson(arena_state.allocator(), io, [_]u8{0x21} ** 32, 1, &.{}, "x", 1_700_000_000);
+    var p = try event.fromJson(arena_state.allocator(), j);
+    defer p.deinit();
+    var eb: [4096]u8 = undefined;
+    var ew: std.Io.Writer = .fixed(&eb);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    _ = try publishEvent(gpa, io, &.{url}, p.value, 500, "post", &ew);
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try testing.expect(took < 2000);
+}
