@@ -889,8 +889,9 @@ fn onCount(c: *Conn, sub_id: []const u8, filters: []const Filter) SendError!void
     for (filters) |f| {
         var q = f;
         q.limit = null;
-        const items = c.server.store.syncItems(c.gpa, q) catch |e| {
+        const items = c.server.store.syncItems(c.gpa, q, .{ .max_items = c.server.opts.limits.max_neg_items }) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
+            if (e == error.TooManyItems) return c.closed(sub_id, "blocked: too many events match, narrow the filter");
             return c.closed(sub_id, "error: the store could not answer");
         };
         defer c.gpa.free(items);
@@ -953,7 +954,8 @@ fn onNegOpen(c: *Conn, sub_id: []const u8, f: Filter, initial_hex: []const u8) S
     const neg = try c.gpa.create(Neg);
     var owned = false;
     defer if (!owned) c.gpa.destroy(neg);
-    neg.storage = nip77.Storage.fromStore(c.gpa, c.server.store, f) catch |e| {
+    neg.storage = nip77.Storage.fromStore(c.gpa, c.server.store, f, .{ .max_items = limits.max_neg_items }) catch |e| {
+        if (e == error.TooManyItems) return c.negErr(sub_id, "blocked: too many events match, narrow the filter");
         if (e == error.OutOfMemory) return error.OutOfMemory;
         return c.negErr(sub_id, "error: the store could not answer");
     };

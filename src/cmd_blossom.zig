@@ -243,12 +243,13 @@ const Ctx = struct {
     ) !?[]const u8 {
         const kp = self.keypair orelse return null;
         const created = self.now();
+        const one = [1][]const u8{srv.host orelse ""};
         const header = try blossom.buildAuthHeader(self.gpa, self.signer, kp, created, .{
             .action = action,
             .content = content,
             .expiration = created + auth_lifetime_s,
             .hashes = hashes,
-            .server = srv.host,
+            .servers = if (srv.host != null) one[0..] else &.{},
         }, null);
         defer self.gpa.free(header);
         return try arena.dupe(u8, header);
@@ -654,13 +655,13 @@ fn uploadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, path: []con
         try ctx.err.print("deed blossom: {s}: {s}: the reply is not a blob descriptor\n", .{ srv.base, path });
         return false;
     };
-    if (!std.mem.eql(u8, &d.parsed.sha256, &named.sha)) {
-        const theirs = std.fmt.bytesToHex(d.parsed.sha256, .lower);
+    if (d.parsed.sha256 == null or !std.mem.eql(u8, &d.parsed.sha256.?, &named.sha)) {
+        const theirs = std.fmt.bytesToHex(d.parsed.sha256 orelse [_]u8{0} ** 32, .lower);
         try ctx.err.print("deed blossom: {s}: {s}: the server reports sha256 {s}, the file is {s}\n", .{ srv.base, path, &theirs, &hex });
         return false;
     }
-    if (d.parsed.size != named.size) {
-        try ctx.err.print("deed blossom: {s}: {s}: the server reports {d} bytes, the file has {d}\n", .{ srv.base, path, d.parsed.size, named.size });
+    if (d.parsed.size != null and d.parsed.size.? != named.size) {
+        try ctx.err.print("deed blossom: {s}: {s}: the server reports {d} bytes, the file has {d}\n", .{ srv.base, path, d.parsed.size.?, named.size });
         return false;
     }
     try writeDescriptor(ctx, d.value);
@@ -868,8 +869,8 @@ fn cmdMirror(ctx: *const Ctx, arena: std.mem.Allocator, opts: Options, servers: 
             code = cli.exit_fail;
             continue;
         };
-        if (!std.mem.eql(u8, &d.parsed.sha256, &sha)) {
-            const theirs = std.fmt.bytesToHex(d.parsed.sha256, .lower);
+        if (d.parsed.sha256 == null or !std.mem.eql(u8, &d.parsed.sha256.?, &sha)) {
+            const theirs = std.fmt.bytesToHex(d.parsed.sha256 orelse [_]u8{0} ** 32, .lower);
             try ctx.err.print("deed blossom: {s}: the server reports sha256 {s}, expected {s}\n", .{ srv.base, &theirs, &hex });
             code = cli.exit_fail;
             continue;
@@ -1359,7 +1360,7 @@ test "an upload sends the preflight and the file, checks the reply, and prints t
     try testing.expect(std.mem.endsWith(u8, r.out, "}\n"));
     var parsed = try blossom.parseDescriptor(testing.allocator, std.mem.trim(u8, r.out, "\n"));
     defer parsed.deinit();
-    try testing.expectEqual(@as(u64, 13), parsed.value.size);
+    try testing.expectEqual(@as(?u64, 13), parsed.value.size);
 }
 
 test "an upload whose reply names another sha256 fails and prints nothing" {
