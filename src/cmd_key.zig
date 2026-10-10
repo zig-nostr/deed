@@ -937,6 +937,12 @@ test "encrypt then decrypt returns the key, at a cost small enough to test" {
     const dec = try runKey(&.{ "decrypt", code, "--hex" }, &ob2, &eb2);
     try std.testing.expectEqualStrings(sk_two ++ "\n", dec.out);
 
+    // An ncryptsec is a key wherever a secret key is read.
+    var ob3: [1024]u8 = undefined;
+    var eb3: [1024]u8 = undefined;
+    const pub_ = try runKey(&.{ "public", code, "--hex" }, &ob3, &eb3);
+    try std.testing.expectEqualStrings(pk_two ++ "\n", pub_.out);
+
     // Two encryptions of one key differ: the salt and nonce are fresh.
     var ob4: [1024]u8 = undefined;
     var eb4: [1024]u8 = undefined;
