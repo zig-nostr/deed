@@ -41,8 +41,6 @@ pub const Options = struct {
     /// is survivable at an interactive prompt and not in a script, which is
     /// where a command line spends most of its life.
     deadline_ms: i64,
-    /// Not used. Every relay has its own reader now, so nothing polls.
-    poll_ms: i64 = 0,
     /// Every event that arrives is written here before it is printed.
     store: ?*nostr.store.Store = null,
     /// Answer NIP-42 challenges with this key. Null answers none.
@@ -586,7 +584,7 @@ test "a relay that never answers the dial costs the run its deadline, not foreve
     var err: std.Io.Writer = .fixed(&err_buf);
 
     const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    const outcome = try query(gpa, io, &urls, &filters, &out, &err, .{ .deadline_ms = 500, .poll_ms = 50 });
+    const outcome = try query(gpa, io, &urls, &filters, &out, &err, .{ .deadline_ms = 500 });
     const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
 
     try std.testing.expectEqual(@as(usize, 1), outcome.dialled);
@@ -636,7 +634,7 @@ test "events kept in a store are written in batches, and every one is stored and
     var out: std.Io.Writer.Allocating = .init(arena);
     var err: std.Io.Writer.Allocating = .init(arena);
     const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
-    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 10_000, .poll_ms = 50, .store = &st });
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 10_000, .store = &st });
 
     try std.testing.expectEqual(@as(usize, n), outcome.events);
     try std.testing.expectEqual(@as(usize, n), std.mem.count(u8, out.written(), "\n"));
@@ -671,7 +669,7 @@ test "a relay that pings and never reads does not hold the run past its deadline
     defer err.deinit();
 
     const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 1000, .poll_ms = 50, .until_eose = true });
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 1000, .until_eose = true });
     const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
 
     try std.testing.expectEqual(@as(usize, 1), outcome.complete);
@@ -699,7 +697,7 @@ test "relays past the most one run dials are named as left out, not dropped quie
     defer out.deinit();
     var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err.deinit();
-    _ = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 500, .poll_ms = 50 });
+    _ = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 500 });
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "deed: 33 relays were named, and only the first 32 are asked\n") != null);
 }
 
@@ -720,7 +718,7 @@ const FirstWrite = struct {
 };
 
 /// One signed kind 1 event as JSON, from a fixed key.
-fn testEvent(arena: std.mem.Allocator, io: std.Io, content: []const u8) ![]const u8 {
+pub fn testEvent(arena: std.mem.Allocator, io: std.Io, content: []const u8) ![]const u8 {
     var signer = try nostr.keys.Signer.initRandomized(io);
     defer signer.deinit();
     const kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
@@ -774,7 +772,7 @@ test "an event from the last of five relays is printed at once, although four ne
 /// A relay that keeps its events behind NIP-42. It refuses a REQ with
 /// `auth-required:` until it gets an AUTH whose `relay` tag is `want_url` and
 /// whose challenge is its own, and serves `event` after that.
-const AuthRelay = struct {
+pub const AuthRelay = struct {
     want_url: []const u8,
     event: []const u8,
     /// Send the challenge after the refusal rather than before it.
@@ -783,9 +781,9 @@ const AuthRelay = struct {
     reqs: usize = 0,
     auths: usize = 0,
 
-    const challenge = "chal-7f3a";
+    pub const challenge = "chal-7f3a";
 
-    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+    pub fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
         const testrelay = @import("testrelay.zig");
         const self: *AuthRelay = @ptrCast(@alignCast(ctx.?));
         const a = std.heap.page_allocator;
@@ -831,7 +829,7 @@ const AuthRelay = struct {
     }
 };
 
-fn authOptions() !auth.Options {
+pub fn authOptions() !auth.Options {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     return .{ .keypair = try signer.keyPairFromSecretKey([_]u8{0x44} ** 32) };

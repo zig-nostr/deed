@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const nostr = @import("nostr");
+const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const filterflags = @import("filterflags.zig");
 const relayset = @import("relayset.zig");
@@ -48,6 +49,7 @@ pub const usage =
     \\      --local          answer from the store alone, dialling nothing
     \\      --stream         keep reading after the relays have sent what they hold
     \\      --timeout <ms>   give up on relays still answering (default 30000)
+++ auth.usage_lines ++
     \\
     \\A filter can also be given as JSON: as an argument that starts with {, or
     \\on stdin when it is not a terminal (one object, several, or an array of
@@ -90,6 +92,7 @@ pub const Request = struct {
     ids_only: bool = false,
     paginate: bool = false,
     paginate_interval_ms: i64 = 0,
+    auth: auth.Flags = .{},
 };
 
 /// How long a run waits on relays still answering, once they are reached.
@@ -150,6 +153,7 @@ pub fn parse(
     var paginate_interval_ms: i64 = 0;
     var store_path: ?[]const u8 = null;
     var timeout_ms: i64 = default_timeout_ms;
+    var auth_flags: auth.Flags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -157,6 +161,14 @@ pub fn parse(
         if (cli.isOneOf(a, &.{ "help", "--help" })) return null;
         // `-h` names the `h` tag when a value follows, and asks for help alone.
         if (std.mem.eql(u8, a, "-h") and i + 1 >= args.len) return null;
+        switch (auth_flags.take(args, &i)) {
+            .taken => continue,
+            .missing_value => {
+                try err.print("deed req: '{s}' needs a value\n", .{a});
+                return ParseError.Usage;
+            },
+            .not_mine => {},
+        }
         if (std.mem.eql(u8, a, "--bare")) {
             bare = true;
             continue;
@@ -242,6 +254,7 @@ pub fn parse(
         .ids_only = ids_only,
         .paginate = paginate,
         .paginate_interval_ms = paginate_interval_ms,
+        .auth = auth_flags,
     };
 }
 
@@ -452,6 +465,12 @@ pub fn runWith(
         return cli.exit_ok;
     }
 
+    const auth_opts = auth.resolve(gpa, req.auth, "req", err) catch |e| switch (e) {
+        error.Usage => return cli.exit_usage,
+        error.BadKey => return cli.exit_fail,
+        else => |other| return other,
+    };
+
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();
     if (req.store_path) |path| {
@@ -460,14 +479,14 @@ pub fn runWith(
     const store_ptr: ?*nostr.store.Store = if (store) |*st| st else null;
 
     if (req.paginate or req.ids_only) {
-        return pages(gpa, io, req, filters.items, store_ptr, out, err);
+        return pages(gpa, io, req, auth_opts, filters.items, store_ptr, out, err);
     }
 
     const outcome = try relayset.query(gpa, io, req.relays, filters.items, out, err, .{
         .until_eose = !req.stream,
         .deadline_ms = req.timeout_ms,
-        .poll_ms = 100,
         .store = store_ptr,
+        .auth = auth_opts,
     });
 
     // Reaching no relay at all is a failed run. Reaching some is not: the
@@ -496,6 +515,7 @@ fn pages(
     gpa: std.mem.Allocator,
     io: std.Io,
     req: Request,
+    auth_opts: ?auth.Options,
     filters: []const filter.Filter,
     store: ?*nostr.store.Store,
     out: *std.Io.Writer,
@@ -524,8 +544,8 @@ fn pages(
         const outcome = try relayset.query(gpa, io, req.relays, page_filters, &capture.writer, err, .{
             .until_eose = true,
             .deadline_ms = req.timeout_ms,
-            .poll_ms = 100,
             .store = store,
+            .auth = auth_opts,
         });
         if (outcome.dialled == 0) {
             try err.writeAll("deed req: no relay answered\n");
@@ -812,6 +832,37 @@ test "a filter on stdin is read, several are kept, and a bad one is refused" {
     var ob5: [4096]u8 = undefined;
     const args_win = try runReqStdin(&.{ "{\"kinds\":[2]}", "--bare" }, "{\"kinds\":[9]}", &ob5, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[2]}\n", args_win.out);
+}
+
+test "--auth answers a relay that holds events behind NIP-42, and --sec needs --auth" {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the run leaked");
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var script: relayset.AuthRelay = .{ .want_url = undefined, .event = try relayset.testEvent(arena, io, "members only") };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, relayset.AuthRelay.handle, &script);
+    defer r.stop(io);
+    var url_buf: [40]u8 = undefined;
+    const url = try testrelay.url(&url_buf, r.port());
+    script.want_url = url;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const sec = "44" ** 32;
+    const code = try runWith(da.allocator(), io, &.{ "-k", "1", "--auth", "--sec", sec, url }, null, &out.writer, &err.writer);
+    try std.testing.expectEqual(cli.exit_ok, code);
+    try std.testing.expectEqual(@as(usize, 1), script.auths);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "members only") != null);
+
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{ "--sec", sec, url }, &ob, &eb)).code);
+    try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{"--sec"}, &ob, &eb)).code);
+    try std.testing.expectEqual(cli.exit_fail, (try runReq(&.{ "--auth", "--sec", "nope", url }, &ob, &eb)).code);
 }
 
 test "combining flags that cannot go together is a usage error" {

@@ -47,7 +47,6 @@ pub const Options = struct {
     /// list replaces the cached one.
     refresh: bool = false,
     timeout_ms: i64 = 10_000,
-    poll_ms: i64 = 100,
 };
 
 pub const Entry = struct {
@@ -206,7 +205,6 @@ fn fill(
     _ = try relayset.query(gpa, io, opts.bootstrap, &.{.{ .authors = missing.items, .kinds = &kinds }}, &out.writer, err, .{
         .until_eose = true,
         .deadline_ms = opts.timeout_ms,
-        .poll_ms = opts.poll_ms,
         .store = opts.store,
     });
 

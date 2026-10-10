@@ -281,7 +281,6 @@ pub fn fetchNewest(
     const o = try relayset.query(gpa, io, urls, &.{f}, &buf.writer, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
-        .poll_ms = 100,
         .store = store,
     });
     var best: ?event.Parsed = null;
