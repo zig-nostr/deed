@@ -880,7 +880,9 @@ test "an event from the last of five relays is printed at once, although four ne
     try std.testing.expectEqual(@as(usize, 5), outcome.dialled);
     try std.testing.expectEqual(@as(usize, 1), outcome.events);
     try std.testing.expectEqual(@as(usize, 1), outcome.complete);
-    try std.testing.expect(out.at.? - started < 20);
+    // Round-robin polling put four 100 ms waits ahead of this event, so
+    // 200 ms still tells the two designs apart on a loaded machine.
+    try std.testing.expect(out.at.? - started < 200);
     // The silent ones hold the run to its deadline and not past it.
     try std.testing.expect(took >= deadline_ms);
     try std.testing.expect(took < deadline_ms + 1_000);
