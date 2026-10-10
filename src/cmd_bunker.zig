@@ -51,14 +51,24 @@ pub const usage =
     \\every request to stderr (the method and the client's pubkey, never its
     \\content), and runs until interrupted.
     \\
+    \\The key to sign with comes from $NOSTR_SECRET_KEY, or from the --persist
+    \\file once it holds one. --sec works too, but the command line of a
+    \\process that runs for days can be read by every user of the machine
+    \\(ps), so a key given there is not kept secret.
+    \\
     \\Options:
     \\  --sec <key>                    the key to sign with, in any form
-    \\                                 `deed event` takes. Falls back to
-    \\                                 $NOSTR_SECRET_KEY, then to the --persist file.
+    \\                                 `deed event` takes; see above for why
+    \\                                 $NOSTR_SECRET_KEY is the better way
     \\  -k, --authorized-keys <pubkey> a client served without a secret,
     \\                                 repeatable
-    \\  -s, --authorized-secrets <s>   a secret that authorizes the client that
-    \\                                 presents it, repeatable
+    \\  --authorized-secrets-file <path>
+    \\                                 secrets that authorize the client that
+    \\                                 presents one, one a line; the file must be
+    \\                                 readable by its owner only
+    \\  -s, --authorized-secrets <s>   one such secret on the command line,
+    \\                                 repeatable; visible to other users like
+    \\                                 --sec, so prefer the file
     \\  --persist <path>               keep the key, the relays and the authorized
     \\                                 clients in this file across restarts
     \\  --qrcode                       print the URI as a QR code too, on stderr
@@ -75,18 +85,20 @@ pub const usage =
     \\  served.
     \\
     \\  With --persist, a client that connected with a secret is remembered and
-    \\  does not need one again after a restart. To stop serving it, take its
-    \\  pubkey out of the file. The file is written readable by its owner only,
+    \\  does not need one again after a restart. A client that logs out is
+    \\  forgotten, and needs a secret to connect again. To stop serving one,
+    \\  take its pubkey out of the file. The file is written readable by its owner only,
     \\  and refused if anybody else can read it. It holds the key in the form it
-    \\  was given, so give an ncryptsec to keep it encrypted there.
+    \\  was given, so give an ncryptsec to keep it encrypted there. One bunker
+    \\  uses a file at a time: a second one given the same file will not start.
     \\
     \\connect:
     \\  Answers a nostrconnect:// URI shown by a client, on the relays it names
     \\  and any given here, and then serves that client.
     \\
-    \\  deed bunker --sec nsec1… wss://relay.example
+    \\  NOSTR_SECRET_KEY=ncryptsec1… deed bunker wss://relay.example
     \\  deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
-    \\  deed bunker connect 'nostrconnect://…' --sec nsec1…
+    \\  NOSTR_SECRET_KEY=ncryptsec1… deed bunker connect 'nostrconnect://…'
     \\
 ;
 
@@ -127,6 +139,19 @@ pub fn run(
 
     const config = (try resolve(arena, io, &parsed, getEnv("NOSTR_SECRET_KEY"), err)) orelse return parsed.failure;
 
+    var held: ?Io.File = null;
+    defer if (held) |f| f.close(io);
+    if (config.persist_path) |path| {
+        held = lockPersist(gpa, io, Io.Dir.cwd(), path) catch |e| {
+            try err.print("deed bunker: cannot lock {s}: {s}\n", .{ path, @errorName(e) });
+            return cli.exit_fail;
+        };
+        if (held == null) {
+            try err.print("deed bunker: another bunker is using {s}; stop it, or give this one a --persist file of its own\n", .{path});
+            return cli.exit_fail;
+        }
+    }
+
     var daemon = Daemon.init(gpa, io, &config, out, err) catch |e| {
         try err.print("deed bunker: could not start: {s}\n", .{@errorName(e)});
         return cli.exit_fail;
@@ -152,6 +177,7 @@ const Parsed = struct {
     relays: std.ArrayList([]const u8) = .empty,
     authorized_keys: std.ArrayList([32]u8) = .empty,
     authorized_secrets: std.ArrayList([]const u8) = .empty,
+    authorized_secrets_files: std.ArrayList([]const u8) = .empty,
     persist: ?[]const u8 = null,
     qrcode: bool = false,
     invite: ?nip46.NostrConnectUri = null,
@@ -191,7 +217,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, out: *Io.Writer
             p.qrcode = true;
             continue;
         }
-        const takes_value = cli.isOneOf(a, &.{ "--sec", "-k", "--authorized-keys", "-s", "--authorized-secrets", "--persist" });
+        const takes_value = cli.isOneOf(a, &.{ "--sec", "-k", "--authorized-keys", "-s", "--authorized-secrets", "--authorized-secrets-file", "--persist" });
         if (!takes_value) {
             if (std.mem.startsWith(u8, a, "-")) {
                 try err.print("deed bunker: unknown option '{s}'\n", .{a});
@@ -224,6 +250,12 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, out: *Io.Writer
                 return null;
             }
             try appendUnique([]const u8, arena, &p.authorized_secrets, v);
+        } else if (std.mem.eql(u8, a, "--authorized-secrets-file")) {
+            if (v.len == 0) {
+                try err.writeAll("deed bunker: --authorized-secrets-file needs a path, and it was empty\n");
+                return null;
+            }
+            try appendUnique([]const u8, arena, &p.authorized_secrets_files, v);
         } else if (std.mem.eql(u8, a, "--persist")) {
             if (v.len == 0) {
                 try err.writeAll("deed bunker: --persist needs a path, and it was empty\n");
@@ -297,7 +329,7 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
     // The key: the flag, then the environment, then the file.
     const given = p.sec orelse env_sec;
     const sec_text = given orelse stored.sec orelse {
-        try err.writeAll("deed bunker: needs a secret key: pass --sec, set $NOSTR_SECRET_KEY, or use a --persist file that holds one\n");
+        try err.writeAll("deed bunker: needs a secret key: set $NOSTR_SECRET_KEY, use a --persist file that holds one, or pass --sec\n");
         return null;
     };
     var signer = keys.Signer.init();
@@ -365,6 +397,23 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
 
     var secrets: std.ArrayList([]const u8) = .empty;
     for (p.authorized_secrets.items) |s| try appendUnique([]const u8, arena, &secrets, s);
+    for (p.authorized_secrets_files.items) |raw| {
+        const full = expandHome(arena, raw, getEnv("HOME")) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => raw,
+        };
+        const n = secrets.items.len;
+        loadSecrets(arena, io, Io.Dir.cwd(), full, &secrets) catch |e| {
+            p.failure = cli.exit_fail;
+            try err.print("deed bunker: cannot use {s}: {s}\n", .{ full, describeSecrets(e) });
+            return null;
+        };
+        if (secrets.items.len == n) {
+            p.failure = cli.exit_fail;
+            try err.print("deed bunker: {s} holds no secret\n", .{full});
+            return null;
+        }
+    }
     for (stored.authorized_secrets) |s| {
         if (s.len > 0) try appendUnique([]const u8, arena, &secrets, s);
     }
@@ -396,6 +445,36 @@ fn describeLoad(e: LoadError) []const u8 {
     };
 }
 
+const SecretsError = error{ OutOfMemory, ReadableByOthers, NotFound, Unreadable };
+
+fn describeSecrets(e: SecretsError) []const u8 {
+    return switch (e) {
+        error.OutOfMemory => "out of memory",
+        error.ReadableByOthers => "other users can read it, and it holds secrets; make it readable by its owner only (chmod 600)",
+        error.NotFound => "there is no such file",
+        error.Unreadable => "it cannot be read",
+    };
+}
+
+/// Adds the secrets in the file at `path`, one a line. Blank lines and the
+/// spaces around a secret are left out.
+fn loadSecrets(arena: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, into: *std.ArrayList([]const u8)) SecretsError!void {
+    const text = dir.readFileAlloc(io, path, arena, .limited(max_persist_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return error.NotFound,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Unreadable,
+    };
+    if (builtin.os.tag != .windows) {
+        const st = dir.statFile(io, path, .{}) catch return error.Unreadable;
+        if (st.permissions.toMode() & 0o077 != 0) return error.ReadableByOthers;
+    }
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const secret = std.mem.trim(u8, line, " \t\r");
+        if (secret.len > 0) try appendUnique([]const u8, arena, into, secret);
+    }
+}
+
 /// Reads the persist file, or an empty one if there is none yet.
 fn loadStored(arena: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) LoadError!Stored {
     const text = dir.readFileAlloc(io, path, arena, .limited(max_persist_bytes)) catch |e| switch (e) {
@@ -419,7 +498,8 @@ fn loadStored(arena: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) L
 
 /// Writes the persist file whole: to a fresh owner-only file beside it, then
 /// renamed over it, so a crash mid-write leaves the old one rather than half
-/// of the new one.
+/// of the new one. The file beside it has a name of its own (the process id
+/// and a random part), so it is never one another process is writing.
 ///
 /// Windows has no mode bits: the file takes the access list of its directory,
 /// which under the user's profile is already private to that user.
@@ -427,12 +507,11 @@ fn saveStored(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, sto
     const text = try std.json.Stringify.valueAlloc(gpa, stored, .{ .whitespace = .indent_2 });
     defer gpa.free(text);
     if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
-    const tmp = try std.mem.concat(gpa, u8, &.{ path, ".tmp" });
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp-{d}-{s}", .{ path, processId(), &std.fmt.bytesToHex(raw, .lower) });
     defer gpa.free(tmp);
-    dir.deleteFile(io, tmp) catch |e| switch (e) {
-        error.FileNotFound => {},
-        else => return e,
-    };
+    errdefer dir.deleteFile(io, tmp) catch {};
     try dir.writeFile(io, .{
         .sub_path = tmp,
         .data = text,
@@ -442,6 +521,37 @@ fn saveStored(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, sto
         },
     });
     try dir.rename(tmp, dir, path, io);
+}
+
+fn processId() u64 {
+    if (builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(std.c.getpid());
+}
+
+/// Takes the lock that says a bunker is using the persist file at `path`, or
+/// null when another one already holds it. Two bunkers on one file would each
+/// write their own list of clients over the other's.
+///
+/// The lock is on a file beside it, `<path>.lock`, because the persist file
+/// itself is replaced on every save and a lock on it would go with the old
+/// one. The lock ends with the process, however it ends.
+fn lockPersist(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) !?Io.File {
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
+    const lock_path = try std.mem.concat(gpa, u8, &.{ path, ".lock" });
+    defer gpa.free(lock_path);
+    const f = try dir.createFile(io, lock_path, .{
+        .truncate = false,
+        .permissions = if (builtin.os.tag == .windows) .default_file else Io.File.Permissions.fromMode(0o600),
+    });
+    const locked = f.tryLock(io, .exclusive) catch |e| {
+        f.close(io);
+        return e;
+    };
+    if (!locked) {
+        f.close(io);
+        return null;
+    }
+    return f;
 }
 
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
@@ -538,6 +648,16 @@ const Trust = struct {
         return false;
     }
 
+    fn forgetLocked(self: *Trust, client: [32]u8) void {
+        var i: usize = 0;
+        while (i < self.authorized.items.len) {
+            if (std.mem.eql(u8, &self.authorized.items[i], &client)) {
+                _ = self.authorized.orderedRemove(i);
+                self.dirty = true;
+            } else i += 1;
+        }
+    }
+
     fn policy(self: *Trust) nip46.Policy {
         return .{ .ctx = self, .decideFn = &decide };
     }
@@ -550,7 +670,13 @@ const Trust = struct {
         const method = nip46.Method.fromString(request.method) orelse return .reject;
         self.acquire();
         defer self.release();
-        if (self.isAuthorizedLocked(client)) return .approve;
+        if (self.isAuthorizedLocked(client)) {
+            // The library revokes the session; this forgets the client too,
+            // so it cannot come back with a bare `connect`, and the persist
+            // file stops naming it.
+            if (method == .logout) self.forgetLocked(client);
+            return .approve;
+        }
         if (method != .connect) return .reject;
 
         const got = if (request.params.len >= 2) request.params[1] else "";
@@ -1377,6 +1503,28 @@ test "the persist file round-trips, is owner-only, and is refused when others ca
     try testing.expectError(error.ReadableByOthers, loadStored(arena_state.allocator(), io, tmp.dir, "dir/bunker.json"));
 }
 
+test "two bunkers cannot share a persist file, nor clobber each other's half-written save" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first = (try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) orelse return error.TestUnexpectedResult;
+    try testing.expect((try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) == null);
+    // A save does not take the lock with it.
+    try saveStored(gpa, io, tmp.dir, "dir/bunker.json", .{ .sec = "nsec1example" });
+    try testing.expect((try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) == null);
+    first.close(io);
+    const again = (try lockPersist(gpa, io, tmp.dir, "dir/bunker.json")) orelse return error.TestUnexpectedResult;
+    again.close(io);
+
+    // What another process is halfway through writing is left alone.
+    try tmp.dir.writeFile(io, .{ .sub_path = "dir/bunker.json.tmp", .data = "theirs" });
+    try saveStored(gpa, io, tmp.dir, "dir/bunker.json", .{ .sec = "nsec1example" });
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("theirs", try tmp.dir.readFile(io, "dir/bunker.json.tmp", &buf));
+}
+
 test "a client that connected with a secret is remembered in the persist file" {
     var h: Harness = undefined;
     try h.init();
@@ -1407,6 +1555,47 @@ test "a client that connected with a secret is remembered in the persist file" {
     try testing.expectEqual(@as(usize, 1), back.authorized_keys.len);
     try testing.expectEqualStrings(&want, back.authorized_keys[0]);
     try testing.expectEqualStrings(h.relays[0], back.relays[0]);
+}
+
+test "a client that logs out needs a secret again, and is forgotten by the persist file" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const gpa = h.da.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const secrets = [_][]const u8{"come-in"};
+    var config = h.config();
+    config.authorized_secrets = &secrets;
+    config.persist_dir = tmp.dir;
+    config.persist_path = "bunker.json";
+    var d = try Daemon.init(gpa, testing.io, &config, &h.out.writer, &h.err.writer);
+    defer d.deinit();
+
+    const pk_hex = std.fmt.bytesToHex(h.user.public_key, .lower);
+    const plan = [_]Script.Planned{
+        .{ .client = 0, .request = .{ .id = "c1", .method = "connect", .params = &.{ &pk_hex, "come-in" } } },
+        .{ .client = 0, .request = .{ .id = "o1", .method = "logout", .params = &.{} } },
+        .{ .client = 0, .request = .{ .id = "c2", .method = "connect", .params = &.{&pk_hex} } },
+        .{ .client = 0, .request = .{ .id = "s1", .method = "sign_event", .params = &.{template("after logout")} } },
+    };
+    h.script.plan = &plan;
+    try h.runUntil(&d, 4);
+
+    var out = try h.script.reply(testing.allocator, "o1");
+    defer out.deinit();
+    try testing.expectEqualStrings("ack", out.value.result);
+    for ([_][]const u8{ "c2", "s1" }) |id| {
+        var r = try h.script.reply(testing.allocator, id);
+        defer r.deinit();
+        try testing.expect(r.value.err.len > 0);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const back = try loadStored(arena_state.allocator(), testing.io, tmp.dir, "bunker.json");
+    try testing.expectEqual(@as(usize, 0), back.authorized_keys.len);
 }
 
 test "the command line is checked before anything starts" {
@@ -1440,6 +1629,52 @@ test "the command line is checked before anything starts" {
         }
         try testing.expectEqual(c.code, code);
         try testing.expect(std.mem.indexOf(u8, err.written(), c.says) != null);
+    }
+}
+
+test "secrets can come from an owner-only file, and the usage does not put the key on the command line" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "secrets",
+        .data = "first\n\n  second \r\nfirst\n",
+        .flags = .{ .permissions = if (builtin.os.tag == .windows) .default_file else Io.File.Permissions.fromMode(0o600) },
+    });
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root);
+    const path = try std.fmt.allocPrint(gpa, "{s}/secrets", .{root[0..root_len]});
+    defer gpa.free(path);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    const sec = "0000000000000000000000000000000000000000000000000000000000000001";
+    var p = (try parseArgs(arena, &.{ "--authorized-secrets-file", path, "wss://relay.example" }, &out.writer, &err.writer)) orelse return error.TestUnexpectedResult;
+    const config = (try resolve(arena, io, &p, sec, &err.writer)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), config.authorized_secrets.len);
+    try testing.expectEqualStrings("first", config.authorized_secrets[0]);
+    try testing.expectEqualStrings("second", config.authorized_secrets[1]);
+
+    if (builtin.os.tag != .windows) {
+        try tmp.dir.setFilePermissions(io, "secrets", .fromMode(0o644), .{});
+        var q = (try parseArgs(arena, &.{ "--authorized-secrets-file", path, "wss://relay.example" }, &out.writer, &err.writer)) orelse return error.TestUnexpectedResult;
+        try testing.expect((try resolve(arena, io, &q, sec, &err.writer)) == null);
+        try testing.expectEqual(cli.exit_fail, q.failure);
+        try testing.expect(std.mem.indexOf(u8, err.written(), "other users can read it") != null);
+    }
+
+    // The examples take the key from the environment, never from --sec.
+    var ex = std.mem.splitSequence(u8, usage, "\n");
+    while (ex.next()) |line| {
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "deed bunker ")) {
+            try testing.expect(std.mem.indexOf(u8, line, "--sec") == null);
+        }
     }
 }
 
