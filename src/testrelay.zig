@@ -321,7 +321,7 @@ pub const Relay = struct {
                     }
                 },
                 .unreadable_first => {
-                    try sendText(w, "[\"COUNT\",\"x\",{\"count\":1}]");
+                    try sendText(w, "[\"BOGUS\",\"x\",{\"count\":1}]");
                     try sendText(w, try std.fmt.bufPrint(&text, "[\"OK\",\"{s}\",true,\"\"]", .{id}));
                 },
                 .silent, .chatty, .notice_burst, .pongs, .deaf, .pings_deaf, .serve, .custom => {},

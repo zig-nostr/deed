@@ -384,7 +384,7 @@ const Set = struct {
                 },
                 // A challenge is not a refusal yet. If the relay needs it
                 // answered, the OK that follows says so.
-                .auth, .event, .eose, .closed => {},
+                .auth, .event, .eose, .closed, .count, .neg_msg, .neg_err => {},
             }
         }
     }

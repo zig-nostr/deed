@@ -265,6 +265,7 @@ pub fn query(
                 // was not given a key for. Saying so beats looking like a relay
                 // with nothing to say.
                 .auth => try err.print("deed: a relay wants authentication, which this verb cannot give it\n", .{}),
+                .count, .neg_msg, .neg_err => {},
                 .ok => {},
             }
         }
