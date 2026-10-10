@@ -15,11 +15,24 @@ const hex = nostr.hex;
 
 pub const max_values = 64;
 
+/// Ids and authors may be many: a list of ids read from another command is
+/// the ordinary way to ask for them. A verb that sends them splits them across
+/// filters, see `chunk_size`.
+pub const max_keys = 2048;
+
+/// Relays commonly refuse a filter naming more ids or authors than this, so a
+/// request with more is sent as several filters of at most this many.
+pub const chunk_size = 500;
+
 /// What a repeated flag collects. Fixed, because a command line naming more
-/// than this many authors is a file being piped in by the wrong route.
+/// than this many tag values is a file being piped in by the wrong route.
 pub fn Collected(comptime T: type) type {
+    return CollectedN(T, max_values);
+}
+
+pub fn CollectedN(comptime T: type, comptime n: usize) type {
     return struct {
-        items: [max_values]T = undefined,
+        items: [n]T = undefined,
         len: usize = 0,
 
         pub fn push(self: *@This(), v: T) bool {
@@ -129,8 +142,8 @@ pub fn parseTime(v: []const u8, now: i64) ?i64 {
 /// `finish` returns a filter whose slices point into this struct, so it must
 /// stay where it is for as long as that filter is used.
 pub const Flags = struct {
-    ids: Collected([32]u8) = .{},
-    authors: Collected([32]u8) = .{},
+    ids: CollectedN([32]u8, max_keys) = .{},
+    authors: CollectedN([32]u8, max_keys) = .{},
     kinds: Collected(u16) = .{},
     tag_pairs: Collected(TagPair) = .{},
     tag_filters: [max_values]filter.TagFilter = undefined,
@@ -144,6 +157,11 @@ pub const Flags = struct {
     pub fn any(self: *const Flags) bool {
         return self.ids.len + self.authors.len + self.kinds.len + self.tag_pairs.len > 0 or
             self.search != null or self.limit != null or self.since != null or self.until != null;
+    }
+
+    fn tooMany(verb: []const u8, what: []const u8, max: usize, err: *std.Io.Writer) !void {
+        try err.print("deed {s}: too many {s} (at most {d}); pass the rest in a JSON filter\n", .{ verb, what, max });
+        return ParseError.BadValue;
     }
 
     fn pushTag(self: *Flags, verb: []const u8, letter: u8, v: []const u8, err: *std.Io.Writer) !void {
@@ -170,19 +188,19 @@ pub const Flags = struct {
                 try err.print("deed {s}: '{s}' is not a kind number\n", .{ verb, v });
                 return ParseError.BadValue;
             };
-            _ = self.kinds.push(n);
+            if (!self.kinds.push(n)) return tooMany(verb, "kinds", self.kinds.items.len, err);
         } else if (cli.isOneOf(a, &.{ "-a", "--author" })) {
             const k = idOrKey(gpa, v) orelse {
                 try err.print("deed {s}: '{s}' is not a key\n", .{ verb, v });
                 return ParseError.BadValue;
             };
-            _ = self.authors.push(k);
+            if (!self.authors.push(k)) return tooMany(verb, "authors", self.authors.items.len, err);
         } else if (cli.isOneOf(a, &.{ "-i", "--id" })) {
             const k = idOrKey(gpa, v) orelse {
                 try err.print("deed {s}: '{s}' is not an id\n", .{ verb, v });
                 return ParseError.BadValue;
             };
-            _ = self.ids.push(k);
+            if (!self.ids.push(k)) return tooMany(verb, "ids", self.ids.items.len, err);
         } else if (a.len == 2 and std.mem.indexOfScalar(u8, "eptdh", a[1]) != null and a[0] == '-') {
             try self.pushTag(verb, a[1], v, err);
         } else if (cli.isOneOf(a, &.{ "-T", "--tag" })) {
@@ -254,6 +272,33 @@ pub const Flags = struct {
         return f;
     }
 };
+
+/// `filters` with any filter that names more than `chunk_size` ids or authors
+/// replaced by several that together name the same ones, so that no relay
+/// refuses the request for its size and no id is dropped. The result lives in
+/// `arena`; filters that need no splitting are copied as they are.
+pub fn splitLarge(arena: std.mem.Allocator, filters: []const filter.Filter) ![]filter.Filter {
+    var out: std.ArrayList(filter.Filter) = .empty;
+    for (filters) |f| {
+        const n_ids = if (f.ids) |v| v.len else 0;
+        const n_authors = if (f.authors) |v| v.len else 0;
+        if (n_ids <= chunk_size and n_authors <= chunk_size) {
+            try out.append(arena, f);
+            continue;
+        }
+        const id_chunks = @max(1, (n_ids + chunk_size - 1) / chunk_size);
+        const author_chunks = @max(1, (n_authors + chunk_size - 1) / chunk_size);
+        for (0..id_chunks) |ci| {
+            for (0..author_chunks) |ca| {
+                var piece = f;
+                if (f.ids) |v| piece.ids = v[ci * chunk_size .. @min(v.len, (ci + 1) * chunk_size)];
+                if (f.authors) |v| piece.authors = v[ca * chunk_size .. @min(v.len, (ca + 1) * chunk_size)];
+                try out.append(arena, piece);
+            }
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
 
 /// Reads one filter object, as JSON text, into a `Filter` whose slices live in
 /// `arena`. Unknown keys are ignored. Errors are written to `err`, naming `verb`.
@@ -355,6 +400,24 @@ pub fn overlay(arena: std.mem.Allocator, base: filter.Filter, over: filter.Filte
         f.tags = list.items;
     }
     return f;
+}
+
+test "more than a relay takes of ids or authors is split across filters, losing none" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ids = try arena.alloc([32]u8, 1200);
+    for (ids, 0..) |*id, i| id.* = [_]u8{0} ** 31 ++ [_]u8{@truncate(i)};
+    const small = filter.Filter{ .kinds = &.{1} };
+    const big = filter.Filter{ .ids = ids, .limit = 7 };
+    const out = try splitLarge(arena, &.{ small, big });
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expectEqual(@as(usize, 500), out[1].ids.?.len);
+    try std.testing.expectEqual(@as(usize, 500), out[2].ids.?.len);
+    try std.testing.expectEqual(@as(usize, 200), out[3].ids.?.len);
+    try std.testing.expectEqual(@as(?u32, 7), out[3].limit);
+    const exact = try splitLarge(arena, &.{.{ .ids = ids[0..500] }});
+    try std.testing.expectEqual(@as(usize, 1), exact.len);
 }
 
 test "filterflags: repeated flags collect and the filter points at them" {

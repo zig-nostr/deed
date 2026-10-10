@@ -55,6 +55,8 @@ pub const usage =
     \\on stdin when it is not a terminal (one object, several, or an array of
     \\them). Flags are laid over each JSON filter: a field a flag sets replaces
     \\the one in the JSON. Several filters make one subscription.
+    \\More than 500 ids or authors in a filter go out as several filters in the
+    \\same REQ, so none is dropped.
     \\
     \\With --paginate, --limit is the total across all pages, not a page size.
     \\Each page asks for events older than the oldest one seen so far, and an
@@ -414,6 +416,8 @@ pub fn runWith(
     } else if (flags.any()) {
         for (filters.items) |*f| f.* = try filterflags.overlay(arena, f.*, req.filter);
     }
+    // A long list of ids goes out as several filters in the one REQ, never cut.
+    filters.items = try filterflags.splitLarge(arena, filters.items);
 
     // Answered from what is already kept, without dialling. This is the half
     // that makes keeping worth doing: a store nothing reads back is a log.
@@ -863,6 +867,51 @@ test "--auth answers a relay that holds events behind NIP-42, and --sec needs --
     try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{ "--sec", sec, url }, &ob, &eb)).code);
     try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{"--sec"}, &ob, &eb)).code);
     try std.testing.expectEqual(cli.exit_fail, (try runReq(&.{ "--auth", "--sec", "nope", url }, &ob, &eb)).code);
+}
+
+test "repeated -i is never truncated: 100 ids go in one filter, 1200 in three" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 100, 1200 }) |n| {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(gpa);
+        var store: std.ArrayList([]u8) = .empty;
+        defer {
+            for (store.items) |b| gpa.free(b);
+            store.deinit(gpa);
+        }
+        try args.append(gpa, "--bare");
+        for (0..n) |k| {
+            const id = try std.fmt.allocPrint(gpa, "{x:0>64}", .{k + 1});
+            try store.append(gpa, id);
+            try args.append(gpa, "-i");
+            try args.append(gpa, id);
+        }
+        const ob = try gpa.alloc(u8, 1 << 20);
+        defer gpa.free(ob);
+        var eb: [1024]u8 = undefined;
+        const r = try runReq(args.items, ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expectEqual(@as(usize, if (n == 100) 1 else 3), std.mem.count(u8, r.out, "\n"));
+        // Every id is somewhere in what would be sent.
+        for (store.items) |id| try std.testing.expect(std.mem.indexOf(u8, r.out, id) != null);
+    }
+}
+
+test "more ids than a command line can hold is refused, not cut" {
+    const gpa = std.testing.allocator;
+    const n = filterflags.max_keys + 1;
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(gpa);
+    const id = "ab" ** 32;
+    for (0..n) |_| {
+        try args.append(gpa, "-i");
+        try args.append(gpa, id);
+    }
+    var ob: [64]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    const r = try runReq(args.items, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "too many ids") != null);
 }
 
 test "combining flags that cannot go together is a usage error" {
