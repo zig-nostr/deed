@@ -8,6 +8,7 @@ const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
 const relayset = @import("relayset.zig");
+const auth = @import("auth.zig");
 const storepath = @import("storepath.zig");
 
 const nip19 = nostr.nip19;
@@ -27,6 +28,7 @@ pub const usage =
     \\Options:
     \\      --store <path>   keep every event this receives in a local store
     \\      --timeout <ms>   give up on relays still answering (default 30000)
+++ auth.usage_lines ++
     \\
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
@@ -58,6 +60,7 @@ pub fn run(
     defer urls.deinit(gpa);
     var store_path: ?[]const u8 = null;
     var timeout_ms: i64 = 30_000;
+    var auth_flags: auth.Flags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -65,6 +68,14 @@ pub fn run(
         if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) {
             try out.writeAll(usage);
             return cli.exit_ok;
+        }
+        switch (auth_flags.take(args, &i)) {
+            .taken => continue,
+            .missing_value => {
+                try err.print("deed fetch: '{s}' needs a value\n", .{a});
+                return cli.exit_usage;
+            },
+            .not_mine => {},
         }
         if (std.mem.startsWith(u8, a, "-")) {
             if (!cli.isOneOf(a, &.{ "--store", "--timeout" })) {
@@ -98,6 +109,11 @@ pub fn run(
         try err.writeAll("deed fetch: needs a code to fetch\n");
         return cli.exit_usage;
     };
+    const auth_opts = auth.resolve(gpa, auth_flags, "fetch", err) catch |e| switch (e) {
+        error.Usage => return cli.exit_usage,
+        error.BadKey => return cli.exit_fail,
+        else => |other| return other,
+    };
 
     var ids: [1][32]u8 = undefined;
     var authors: [1][32]u8 = undefined;
@@ -130,8 +146,8 @@ pub fn run(
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
-        .poll_ms = 100,
         .store = if (store) |*st| st else null,
+        .auth = auth_opts,
     });
 
     if (outcome.dialled == 0) {
