@@ -14,6 +14,7 @@ const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const dial = @import("dial.zig");
 const auth = @import("auth.zig");
+const relayset = @import("relayset.zig");
 
 const hex = nostr.hex;
 const relay = nostr.relay;
@@ -945,27 +946,7 @@ fn msLeft(io: std.Io, deadline: std.Io.Clock.Timestamp) i64 {
     return @intCast(@min(@divFloor(left, std.time.ns_per_ms), std.math.maxInt(i64)));
 }
 
-/// Writes text a relay sent, with every control character shown as an escape:
-/// C0 and DEL as `\xNN`, and C1 (U+0080 to U+009F) as `\u00NN`.
-///
-/// A relay chooses these bytes. Printed raw, a newline would let it write a
-/// line of its own that looks like one of these, such as a relay claiming to
-/// have accepted an event, and a control sequence would reach the terminal.
-/// C1 matters because some terminals read U+009B as the start of one.
-fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        const c = text[i];
-        if (c < 0x20 or c == 0x7f) {
-            try w.print("\\x{x:0>2}", .{c});
-        } else if (c == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f) {
-            try w.print("\\u00{x:0>2}", .{text[i + 1]});
-            i += 1;
-        } else {
-            try w.writeByte(c);
-        }
-    }
-}
+const writeEscaped = relayset.writeEscaped;
 
 // ---------------------------------------------------------------------------
 // Tests: the real command, against real relays on loopback.

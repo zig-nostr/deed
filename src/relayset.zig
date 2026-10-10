@@ -520,10 +520,16 @@ pub fn query(
                     if (opts.until_eose) finish(&sh, &live, &live_count, i);
                 },
                 .closed => |c| {
-                    try err.print("deed: a relay closed the subscription: {s}\n", .{c.message});
+                    try err.writeAll("deed: a relay closed the subscription: ");
+                    try writeEscaped(err, c.message);
+                    try err.writeAll("\n");
                     finish(&sh, &live, &live_count, i);
                 },
-                .notice => |notice| try err.print("deed: notice: {s}\n", .{notice.message}),
+                .notice => |notice| {
+                    try err.writeAll("deed: notice: ");
+                    try writeEscaped(err, notice.message);
+                    try err.writeAll("\n");
+                },
                 // A relay asking for NIP-42 when this run has no key to answer
                 // with. Saying so beats looking like a relay with nothing to say.
                 .auth => try err.print("deed: a relay wants authentication, which needs --auth\n", .{}),
@@ -532,7 +538,9 @@ pub fn query(
             },
             .authenticating => try err.print("deed: {s}: authenticating\n", .{url}),
             .auth_refused => |t| {
-                try err.print("deed: {s}: authentication refused: {s}\n", .{ url, t });
+                try err.print("deed: {s}: authentication refused: ", .{url});
+                try writeEscaped(err, t);
+                try err.writeAll("\n");
                 finish(&sh, &live, &live_count, i);
             },
             .no_challenge => try err.print("deed: {s}: no authentication challenge within {d} ms, asking without one\n", .{ url, sh.challenge_wait_ms }),
@@ -555,6 +563,28 @@ pub fn query(
     if (opts.store) |st| try pending.flush(gpa, st, out, &result);
     if (result.store_failed) try err.writeAll("deed: the store could not be written, so events from that point were not printed\n");
     return result;
+}
+
+/// Writes text a relay sent, with every control character shown as an escape:
+/// C0 and DEL as `\xNN`, and C1 (U+0080 to U+009F) as `\u00NN`.
+///
+/// A relay chooses these bytes. Printed raw, a newline would let it write a
+/// line of its own that looks like one of these, such as a relay claiming to
+/// have accepted an event, and a control sequence would reach the terminal.
+/// C1 matters because some terminals read U+009B as the start of one.
+pub fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c < 0x20 or c == 0x7f) {
+            try w.print("\\x{x:0>2}", .{c});
+        } else if (c == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f) {
+            try w.print("\\u00{x:0>2}", .{text[i + 1]});
+            i += 1;
+        } else {
+            try w.writeByte(c);
+        }
+    }
 }
 
 /// Relay `i` is done: its reader is stopped, and what it already handed over
@@ -649,6 +679,37 @@ test "events kept in a store are written in batches, and every one is stored and
     try std.testing.expectEqual(@as(usize, n), outcome.events);
     try std.testing.expectEqual(@as(usize, n), std.mem.count(u8, out.written(), "\n"));
     try std.testing.expectEqual(@as(usize, n), try st.eventCount());
+}
+
+test "text a relay sends is shown with its control characters escaped" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Hostile = struct {
+        fn handle(_: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+            if (std.mem.indexOf(u8, frame, "\"REQ\"") == null) return;
+            try testrelay.sendText(w, "[\"NOTICE\",\"hi\\u001b[31m\\nfake line\"]");
+            try testrelay.sendText(w, "[\"CLOSED\",\"deed\",\"bye\\u001b[2J\"]");
+        }
+    };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, Hostile.handle, null);
+    defer r.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, r.port());
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    _ = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 2_000 });
+    try std.testing.expect(std.mem.indexOfScalar(u8, err.written(), 0x1b) == null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "fake line") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, err.written(), "\n"));
 }
 
 test "a store that cannot take a batch prints nothing for it and says so" {
