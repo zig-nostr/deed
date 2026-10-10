@@ -7,10 +7,10 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
+const parallel = @import("parallel.zig");
 
 const keys = nostr.keys;
 const event = nostr.event;
-const hex = nostr.hex;
 
 /// An event that will not fit here is one no relay would carry either.
 const max_record_bytes = 1 << 20;
@@ -65,43 +65,174 @@ pub fn run(
 
     var input = cli.Input.init(positionals.items, &stdin_reader.interface);
 
-    var signer = keys.Signer.init();
-    defer signer.deinit();
+    var ctx: Ctx = .{ .signer = keys.Signer.init(), .err = err };
+    defer ctx.signer.deinit();
 
-    var failures: usize = 0;
-    while (try input.next()) |record| {
-        const json = switch (record) {
-            // Trimmed here rather than in `Input`: surrounding space around
-            // an event is noise, and `deed encrypt` needs the same bytes it was given.
-            .line => |l| std.mem.trim(u8, l, " \t"),
-            .too_long => {
-                try err.print(
-                    "deed verify: skipped an event longer than {d} bytes\n",
-                    .{max_record_bytes},
-                );
-                failures += 1;
+    // Records are gathered into chunks. A stream that ends inside the first
+    // chunk is verified right here on this thread, so a lone event pays for no
+    // thread at all. Past that, chunks go to a pool with one worker per core
+    // and come back in input order, so the failures read exactly as they would
+    // from a single thread.
+    var local = Chunk.init(gpa);
+    defer local.deinit();
+    var pool: ?*Pool = null;
+    defer if (pool) |p| p.deinit(Chunk.deinitPtr);
+
+    var read_error: ?anyerror = null;
+    var eof = false;
+    while (!eof) {
+        local.reset();
+        while (local.entries.items.len < chunk_records and local.bytes.items.len < chunk_bytes) {
+            const record = input.next() catch |e| {
+                read_error = e;
+                eof = true;
+                break;
+            } orelse {
+                eof = true;
+                break;
+            };
+            switch (record) {
+                // Trimmed here rather than in `Input`: surrounding space around
+                // an event is noise, and `deed encrypt` needs the same bytes it was given.
+                .line => |l| try local.add(std.mem.trim(u8, l, " \t")),
+                .too_long => try local.addTooLong(),
+            }
+        }
+        if (local.entries.items.len == 0) break;
+        try local.outcomes.resize(gpa, local.entries.items.len);
+
+        if (pool == null and eof) {
+            Ctx.process(&ctx, &local);
+            try ctx.deliver(&local);
+            break;
+        }
+        if (pool == null) pool = try Pool.init(gpa, io, &ctx, .{}, Chunk.init);
+        const slot = try pool.?.acquire();
+        std.mem.swap(Chunk, slot, &local);
+        try pool.?.submit();
+    }
+    if (pool) |p| try p.finish();
+    if (read_error) |e| return e;
+
+    return if (ctx.failures == 0) cli.exit_ok else cli.exit_fail;
+}
+
+/// A chunk closes at this many records or bytes, whichever comes first. About
+/// a millisecond or two of work: long enough to amortize the hand-off, short
+/// enough that every core has a chunk to chew on.
+const chunk_records = 64;
+const chunk_bytes = 256 * 1024;
+
+const Outcome = struct {
+    const Tag = enum { ok, too_long, not_event, bad_signature, out_of_memory };
+    tag: Tag = .ok,
+    /// Static, from `@errorName`.
+    error_name: []const u8 = "",
+    id: [64]u8 = undefined,
+};
+
+const Entry = struct { start: usize, len: usize, too_long: bool };
+
+/// A batch of records and, once processed, what became of each.
+const Chunk = struct {
+    gpa: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
+    outcomes: std.ArrayList(Outcome) = .empty,
+    /// Scratch for parsing; reset after every record.
+    arena: std.heap.ArenaAllocator,
+
+    fn init(gpa: std.mem.Allocator) Chunk {
+        return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+
+    fn deinit(self: *Chunk) void {
+        self.bytes.deinit(self.gpa);
+        self.entries.deinit(self.gpa);
+        self.outcomes.deinit(self.gpa);
+        self.arena.deinit();
+    }
+
+    fn deinitPtr(self: *Chunk) void {
+        self.deinit();
+    }
+
+    fn reset(self: *Chunk) void {
+        self.bytes.clearRetainingCapacity();
+        self.entries.clearRetainingCapacity();
+        self.outcomes.clearRetainingCapacity();
+    }
+
+    fn add(self: *Chunk, json: []const u8) !void {
+        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = json.len, .too_long = false });
+        try self.bytes.appendSlice(self.gpa, json);
+    }
+
+    fn addTooLong(self: *Chunk) !void {
+        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = 0, .too_long = true });
+    }
+};
+
+const Ctx = struct {
+    signer: keys.Signer,
+    err: *std.Io.Writer,
+    failures: usize = 0,
+
+    /// Parses and verifies every record of the chunk. Runs on any thread: the
+    /// signer's context is only read, and everything else is the chunk's own.
+    pub fn process(self: *Ctx, chunk: *Chunk) void {
+        const a = chunk.arena.allocator();
+        for (chunk.entries.items, chunk.outcomes.items) |entry, *out| {
+            out.* = .{};
+            if (entry.too_long) {
+                out.tag = .too_long;
                 continue;
-            },
-        };
-        var parsed = event.fromJson(gpa, json) catch |e| {
-            try err.print("deed verify: not an event: {s}\n", .{@errorName(e)});
-            failures += 1;
-            continue;
-        };
-        defer parsed.deinit();
-
-        // `event.verify` recomputes the id from the event's own fields before
-        // checking the signature, so a forged id fails here too.
-        if (!try event.verify(gpa, signer, parsed.value)) {
-            const id = try hex.encode(gpa, &parsed.value.id);
-            defer gpa.free(id);
-            try err.print("deed verify: bad signature: {s}\n", .{id});
-            failures += 1;
+            }
+            defer _ = chunk.arena.reset(.retain_capacity);
+            const json = chunk.bytes.items[entry.start..][0..entry.len];
+            const parsed = event.fromJson(a, json) catch |e| {
+                out.tag = .not_event;
+                out.error_name = @errorName(e);
+                continue;
+            };
+            // `event.verify` recomputes the id from the event's own fields before
+            // checking the signature, so a forged id fails here too.
+            const good = event.verify(a, self.signer, parsed.value) catch {
+                out.tag = .out_of_memory;
+                continue;
+            };
+            if (!good) {
+                out.tag = .bad_signature;
+                out.id = std.fmt.bytesToHex(parsed.value.id, .lower);
+            }
         }
     }
 
-    return if (failures == 0) cli.exit_ok else cli.exit_fail;
-}
+    /// Reports the chunk's failures, in record order, on the caller's thread.
+    pub fn deliver(self: *Ctx, chunk: *Chunk) !void {
+        for (chunk.outcomes.items) |out| switch (out.tag) {
+            .ok => {},
+            .too_long => {
+                try self.err.print(
+                    "deed verify: skipped an event longer than {d} bytes\n",
+                    .{max_record_bytes},
+                );
+                self.failures += 1;
+            },
+            .not_event => {
+                try self.err.print("deed verify: not an event: {s}\n", .{out.error_name});
+                self.failures += 1;
+            },
+            .bad_signature => {
+                try self.err.print("deed verify: bad signature: {s}\n", .{out.id});
+                self.failures += 1;
+            },
+            .out_of_memory => return error.OutOfMemory,
+        };
+    }
+};
+
+const Pool = parallel.Ordered(Chunk, Ctx);
 
 const Run = struct { code: u8, out: []const u8, err: []const u8 };
 
@@ -248,4 +379,83 @@ test "help is printed on stdout and succeeds" {
     try std.testing.expectEqual(cli.exit_ok, r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "deed verify") != null);
     try std.testing.expectEqualStrings("", r.err);
+}
+
+test "ten thousand mixed records report in input order and match one thread" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const tags = [_]event.Tag{};
+
+    const total = 10_000;
+    const records = try a.alloc([]const u8, total);
+    var expected: std.ArrayList(u8) = .empty;
+    const garbage = "this is not json";
+    const garbage_name = if (event.fromJson(a, garbage)) |_| unreachable else |e| @errorName(e);
+
+    for (records, 0..) |*rec, i| {
+        const content = try std.fmt.allocPrint(a, "note {d}", .{i});
+        const ev = try event.create(a, signer, kp, 1700000000 + @as(i64, @intCast(i)), 1, &tags, content, null);
+        switch (i % 5) {
+            1 => {
+                var bad = ev;
+                bad.content = "tampered";
+                rec.* = try event.toJson(a, bad);
+                try expected.print(a, "deed verify: bad signature: {s}\n", .{std.fmt.bytesToHex(ev.id, .lower)});
+            },
+            3 => {
+                rec.* = garbage;
+                try expected.print(a, "deed verify: not an event: {s}\n", .{garbage_name});
+            },
+            else => rec.* = try event.toJson(a, ev),
+        }
+    }
+
+    // The parallel run, through the real entry point.
+    const err_buf = try a.alloc(u8, expected.items.len + 1024);
+    var ob: [64]u8 = undefined;
+    const r = try runVerify(records, &ob, err_buf);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expectEqualStrings(expected.items, r.err);
+
+    // And one thread, record by record, which is what the old loop did.
+    var single_err: std.Io.Writer.Allocating = .init(a);
+    var ctx: Ctx = .{ .signer = signer, .err = &single_err.writer };
+    var chunk = Chunk.init(gpa);
+    defer chunk.deinit();
+    for (records) |rec| {
+        chunk.reset();
+        try chunk.add(rec);
+        try chunk.outcomes.resize(gpa, 1);
+        ctx.process(&chunk);
+        try ctx.deliver(&chunk);
+    }
+    try std.testing.expectEqualStrings(single_err.written(), r.err);
+}
+
+test "an over-long record is attributed among its neighbours" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eb: [4096]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&eb);
+    var ctx: Ctx = .{ .signer = keys.Signer.init(), .err = &err };
+    defer ctx.signer.deinit();
+    var chunk = Chunk.init(std.testing.allocator);
+    defer chunk.deinit();
+    try chunk.add(f.signed);
+    try chunk.addTooLong();
+    try chunk.add(f.content_tampered);
+    try chunk.outcomes.resize(std.testing.allocator, 3);
+    ctx.process(&chunk);
+    try ctx.deliver(&chunk);
+    const lines = err.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, lines, "deed verify: skipped an event longer than"));
+    try std.testing.expect(std.mem.indexOf(u8, lines, "bad signature") != null);
+    try std.testing.expectEqual(@as(usize, 2), ctx.failures);
 }
