@@ -10,8 +10,10 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
+const dial = @import("dial.zig");
 const keyinput = @import("keyinput.zig");
 const post = @import("cmd_post.zig");
+const outbox = @import("outbox.zig");
 const storepath = @import("storepath.zig");
 
 const event = nostr.event;
@@ -27,21 +29,26 @@ pub const usage =
     \\
     \\Usage:
     \\  deed profile [options] <npub|nprofile|hex> [<relay-url>...]
-    \\  deed profile set [options] <relay-url>...
+    \\  deed profile set [options] [<relay-url>...]
     \\
     \\Show fetches the newest kind 0 event from the relays named (and the relays an
     \\nprofile carries), checks its signature, and prints its fields. With --store
     \\and no relay it reads the store alone; with both, what the relays send is kept
-    \\in the store as well.
+    \\in the store as well. With neither, it asks the relays that person writes to,
+    \\found through the relays in DEED_RELAYS or given with --relay.
     \\
     \\Options for show:
     \\      --json           print the verified kind 0 event instead of the fields
+    \\  -r, --relay <url>  where to look up that person's relay list when no relay
+    \\                     is named, repeatable (and DEED_RELAYS)
     \\      --store <path>   a local store to read from, or to keep what arrives in
     \\      --timeout <ms>   how long the relays get (default 10000)
     \\
     \\Set reads your current profile from the relays, changes the fields given,
     \\keeps every other field as it was, signs the result with --sec and publishes
-    \\it to the same relays. It prints the event if a relay accepted it.
+    \\it to the same relays. With no relay named it uses the relays you write to,
+    \\found through the relays in DEED_RELAYS or given with --relay. It prints the event
+    \\if a relay accepted it.
     \\
     \\Options for set:
     \\      --sec <key>        secret key, as nsec1... or 64 hex characters.
@@ -53,6 +60,8 @@ pub const usage =
     \\      --force-new        publish a profile built from only these flags when
     \\                         none could be read back. Without it, a profile that
     \\                         could not be read is never written over.
+    \\  -r, --relay <url>   where to look up your relay list when no relay is
+    \\                         named, repeatable (and DEED_RELAYS)
     \\      --confirm          ask on the terminal before publishing
     \\      --dry-run          print the signed event and publish nothing
     \\      --timeout <ms>     how long the relays get (default 10000)
@@ -92,6 +101,8 @@ fn runShow(
     var code: ?[]const u8 = null;
     var urls: std.ArrayList([]const u8) = .empty;
     defer urls.deinit(gpa);
+    var bootstrap: std.ArrayList([]const u8) = .empty;
+    defer bootstrap.deinit(gpa);
     var store_path: ?[]const u8 = null;
     var as_json = false;
     var timeout_ms: i64 = timeout_default;
@@ -105,13 +116,15 @@ fn runShow(
         }
         if (std.mem.eql(u8, a, "--json")) {
             as_json = true;
-        } else if (cli.isOneOf(a, &.{ "--store", "--timeout" })) {
+        } else if (cli.isOneOf(a, &.{ "--store", "--timeout", "-r", "--relay" })) {
             i += 1;
             if (i >= args.len) {
                 try err.print("deed profile: '{s}' needs a value\n", .{a});
                 return cli.exit_usage;
             }
-            if (std.mem.eql(u8, a, "--store")) {
+            if (cli.isOneOf(a, &.{ "-r", "--relay" })) {
+                try bootstrap.append(gpa, args[i]);
+            } else if (std.mem.eql(u8, a, "--store")) {
                 store_path = args[i];
             } else {
                 timeout_ms = std.fmt.parseInt(i64, args[i], 10) catch 0;
@@ -172,6 +185,14 @@ fn runShow(
 
     var parsed: ?event.Parsed = null;
     defer if (parsed) |*p| p.deinit();
+
+    // Neither a relay nor a store: follow the person to the relays they write to.
+    var followed: ?outbox.Urls = null;
+    defer if (followed) |*fu| fu.deinit();
+    if (urls.items.len == 0 and store_path == null) {
+        followed = (try outbox.followWriteRelays(gpa, io, "profile", pubkey, bootstrap.items, null, timeout_ms, err)) orelse return cli.exit_usage;
+        try urls.appendSlice(gpa, followed.?.urls[0..@min(followed.?.urls.len, dial.max_relays)]);
+    }
 
     if (urls.items.len == 0) {
         const path = store_path orelse {
@@ -331,6 +352,8 @@ fn runSet(
 ) !u8 {
     var urls: std.ArrayList([]const u8) = .empty;
     defer urls.deinit(gpa);
+    var bootstrap: std.ArrayList([]const u8) = .empty;
+    defer bootstrap.deinit(gpa);
     var fields: std.ArrayList(Field) = .empty;
     defer fields.deinit(gpa);
     var sec: ?[]const u8 = null;
@@ -360,7 +383,7 @@ fn runSet(
             for (field_flags) |ff| {
                 if (std.mem.eql(u8, ff.flag, a)) flag_key = ff.key;
             }
-            if (flag_key == null and !cli.isOneOf(a, &.{ "--sec", "--metadata", "--timeout" })) {
+            if (flag_key == null and !cli.isOneOf(a, &.{ "--sec", "--metadata", "--timeout", "-r", "--relay" })) {
                 try err.print("deed profile set: unknown option '{s}'\n", .{a});
                 return cli.exit_usage;
             }
@@ -382,6 +405,8 @@ fn runSet(
                 if (!replaced) try fields.append(gpa, .{ .key = k, .value = v });
             } else if (std.mem.eql(u8, a, "--sec")) {
                 sec = v;
+            } else if (cli.isOneOf(a, &.{ "-r", "--relay" })) {
+                try bootstrap.append(gpa, v);
             } else if (std.mem.eql(u8, a, "--metadata")) {
                 metadata = v;
             } else {
@@ -396,10 +421,6 @@ fn runSet(
 
     if (fields.items.len == 0 and metadata == null) {
         try err.writeAll("deed profile set: nothing to change: give at least one field or --metadata\n");
-        return cli.exit_usage;
-    }
-    if (urls.items.len == 0 and !(dry_run and force_new)) {
-        try err.writeAll("deed profile set: name at least one relay: the current profile is read from them first\n");
         return cli.exit_usage;
     }
     const sk = (try post.readSecret(gpa, "profile set", sec, err)) orelse return cli.exit_usage;
@@ -433,6 +454,16 @@ fn runSet(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // No relay named: the relays you write to, which also holds your current
+    // profile. The read below still decides whether anything is written.
+    var followed: ?outbox.Urls = null;
+    defer if (followed) |*fu| fu.deinit();
+    if (urls.items.len == 0 and !(dry_run and force_new)) {
+        followed = (try outbox.followWriteRelays(gpa, io, "profile set", keypair.public_key, bootstrap.items, null, timeout_ms, err)) orelse return cli.exit_usage;
+        const take = @min(followed.?.urls.len, dial.max_relays);
+        try urls.appendSlice(gpa, followed.?.urls[0..take]);
+    }
 
     // The read comes first and decides everything after it.
     var current: ?event.Parsed = null;
@@ -654,4 +685,45 @@ test "show prints the fields, known ones first, and --json prints the event" {
     const as_json = try run(gpa, io, &.{ npub, url, "--json", "--timeout", "5000" }, &out.writer, &err.writer);
     try testing.expectEqual(cli.exit_ok, as_json);
     try testing.expectEqualStrings(current, std.mem.trimEnd(u8, out.written(), "\n"));
+}
+
+test "with no relay and no store, show follows the person to the relays they write to" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    const testrelay = @import("testrelay.zig");
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the profile verb leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const fx = Fixture{};
+    var home_script = post.Script{ .serve = try fx.profileJson(a, io, "{\"name\":\"followed\"}") };
+    var home: testrelay.Relay = undefined;
+    try home.startCustom(io, post.Script.handle, &home_script);
+    defer home.stop(io);
+    var home_buf: [40]u8 = undefined;
+    const home_url = try testrelay.url(&home_buf, home.port());
+
+    const tags = [_]event.Tag{&.{ "r", home_url, "write" }};
+    var dir_script: outbox.Script = .{ .list = try post.signedJson(a, io, fx.sk, 10002, &tags, "", 1_700_000_000) };
+    var directory: testrelay.Relay = undefined;
+    try outbox.startScript(&directory, io, &dir_script, 1);
+    defer directory.stop(io);
+    var dir_buf: [40]u8 = undefined;
+    const dir_url = try testrelay.url(&dir_buf, directory.port());
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey(fx.sk);
+    const npub = try nip19.encodeNpub(a, kp.public_key);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    const code = try run(gpa, io, &.{ npub, "--relay", dir_url, "--timeout", "5000" }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_ok, code);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "followed") != null);
 }

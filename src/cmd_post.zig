@@ -14,6 +14,8 @@ const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const dial = @import("dial.zig");
 const keyinput = @import("keyinput.zig");
+const outbox = @import("outbox.zig");
+const publish = @import("cmd_publish.zig");
 const relayset = @import("relayset.zig");
 
 const event = nostr.event;
@@ -35,12 +37,14 @@ pub const usage =
     \\deed post: publish a text note
     \\
     \\Usage:
-    \\  deed post [options] [<text>] <relay-url>...
+    \\  deed post [options] [<text>] [<relay-url>...]
     \\
     \\Signs a kind 1 note with --sec and offers it to every relay named. The text
     \\is the one argument that is not a relay URL; with none, it is read from
-    \\stdin. Prints the signed event if at least one relay accepted it, and each
-    \\relay's answer on stderr.
+    \\stdin. With no relay named it goes to the relays you write to, read from
+    \\your relay list on the relays in DEED_RELAYS or given with --relay. Prints
+    \\the signed event if at least one relay accepted it, and each relay's answer
+    \\on stderr.
     \\
     \\  deed post "hello" --sec nsec1... wss://relay.example
     \\  echo "hello" | deed post --sec nsec1... wss://relay.example
@@ -60,10 +64,13 @@ pub const usage =
     \\                          publishing. Refused when there is no terminal.
     \\      --dry-run           print the signed event and publish nothing. A
     \\                          reply or comment still fetches its parent.
+    \\  -r, --relay <url>       where to look up your relay list when no relay is
+    \\                          named, repeatable (and DEED_RELAYS)
     \\      --timeout <ms>      how long the relays get to answer (default 10000)
     \\
     \\A code carrying relay hints is looked up at those relays as well as the ones
-    \\named; the note itself goes only to the ones named.
+    \\named. A code with an author but no hints is also looked up at the relays that
+    \\author writes to. The note itself goes only to the ones named, or to yours.
     \\
     \\Exits 0 when a relay accepted the note, 1 when none did, and 2 when the
     \\command made no sense.
@@ -89,6 +96,8 @@ pub fn run(
     var opts = Options{};
     var urls: std.ArrayList([]const u8) = .empty;
     defer urls.deinit(gpa);
+    var bootstrap: std.ArrayList([]const u8) = .empty;
+    defer bootstrap.deinit(gpa);
     var text: ?[]const u8 = null;
 
     var i: usize = 0;
@@ -102,7 +111,7 @@ pub fn run(
             opts.confirm = true;
         } else if (std.mem.eql(u8, a, "--dry-run")) {
             opts.dry_run = true;
-        } else if (cli.isOneOf(a, &.{ "--sec", "--reply", "--comment", "--timeout" })) {
+        } else if (cli.isOneOf(a, &.{ "--sec", "--reply", "--comment", "--timeout", "-r", "--relay" })) {
             i += 1;
             if (i >= args.len) {
                 try err.print("deed post: '{s}' needs a value\n", .{a});
@@ -111,6 +120,8 @@ pub fn run(
             const v = args[i];
             if (std.mem.eql(u8, a, "--sec")) {
                 opts.sec = v;
+            } else if (cli.isOneOf(a, &.{ "-r", "--relay" })) {
+                try bootstrap.append(gpa, v);
             } else if (std.mem.eql(u8, a, "--reply")) {
                 opts.reply = v;
             } else if (std.mem.eql(u8, a, "--comment")) {
@@ -137,10 +148,6 @@ pub fn run(
 
     if (opts.reply != null and opts.comment != null) {
         try err.writeAll("deed post: --reply and --comment cannot be used together\n");
-        return cli.exit_usage;
-    }
-    if (urls.items.len == 0 and !opts.dry_run) {
-        try err.writeAll("deed post: name at least one relay to publish to\n");
         return cli.exit_usage;
     }
     if (urls.items.len > dial.max_relays) {
@@ -181,18 +188,29 @@ pub fn run(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var kind: u16 = 1;
-    var tags: []const event.Tag = &.{};
-    if (opts.reply) |code| {
-        tags = (try replyTagsFor(gpa, io, arena, code, urls.items, opts.timeout_ms, err)) orelse return cli.exit_fail;
-    } else if (opts.comment) |code| {
-        kind = 1111;
-        tags = (try commentTagsFor(gpa, io, arena, code, urls.items, opts.timeout_ms, err)) orelse return cli.exit_fail;
-    }
-
     var signer = try nostr.keys.Signer.initRandomized(io);
     defer signer.deinit();
     const keypair = try signer.keyPairFromSecretKey(sk);
+
+    // No relay named: the relays the author writes to. A dry run that fetches
+    // nothing needs no relay at all.
+    var followed: ?outbox.Urls = null;
+    defer if (followed) |*f| f.deinit();
+    if (urls.items.len == 0 and (!opts.dry_run or opts.reply != null or opts.comment != null)) {
+        followed = (try outbox.followWriteRelays(gpa, io, "post", keypair.public_key, bootstrap.items, null, opts.timeout_ms, err)) orelse return cli.exit_usage;
+        const take = @min(followed.?.urls.len, dial.max_relays);
+        try urls.appendSlice(gpa, followed.?.urls[0..take]);
+    }
+
+    var kind: u16 = 1;
+    var tags: []const event.Tag = &.{};
+    if (opts.reply) |code| {
+        tags = (try replyTagsFor(gpa, io, arena, code, urls.items, bootstrap.items, opts.timeout_ms, err)) orelse return cli.exit_fail;
+    } else if (opts.comment) |code| {
+        kind = 1111;
+        tags = (try commentTagsFor(gpa, io, arena, code, urls.items, bootstrap.items, opts.timeout_ms, err)) orelse return cli.exit_fail;
+    }
+
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
     const ev = try event.create(arena, signer, keypair, now, kind, tags, content, null);
     const wire = try event.toJson(arena, ev);
@@ -302,7 +320,8 @@ pub fn fetchNewest(
 // Publishing
 // ---------------------------------------------------------------------------
 
-/// Offers `ev` to every relay in `urls` and returns how many accepted it. Each
+/// Offers `ev` to every relay in `urls` and returns how many relays accepted
+/// it: one if any did, since the shared publisher stops counting there. Each
 /// relay's answer goes to `err`, with the event's id on it.
 pub fn publishEvent(
     gpa: std.mem.Allocator,
@@ -313,91 +332,7 @@ pub fn publishEvent(
     verb: []const u8,
     err: *std.Io.Writer,
 ) !usize {
-    const n = @min(urls.len, dial.max_relays);
-    const id = try hex.encode(gpa, &ev.id);
-    defer gpa.free(id);
-
-    var dialled: [dial.max_relays]dial.Outcome = undefined;
-    dial.all(gpa, io, urls[0..n], @min(dial.default_timeout_ms, timeout_ms), &dialled);
-
-    var conns: [dial.max_relays]?*nostr.relay.Relay = @splat(null);
-    var waiting: [dial.max_relays]bool = @splat(false);
-    defer for (conns[0..n]) |maybe| {
-        if (maybe) |r| {
-            r.shutdown(io);
-            r.deinit();
-        }
-    };
-
-    for (urls[0..n], 0..) |url, i| {
-        switch (dialled[i]) {
-            .connected => |r| {
-                conns[i] = r;
-                r.publish(ev) catch |e| {
-                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ verb, id, url, @errorName(e) });
-                    continue;
-                };
-                waiting[i] = true;
-            },
-            .failed => |e| try err.print("deed {s}: {s}: {s}: {s}\n", .{ verb, id, url, @errorName(e) }),
-            .timed_out => try err.print("deed {s}: {s}: {s}: no answer to the dial\n", .{ verb, id, url }),
-        }
-    }
-
-    var accepted: usize = 0;
-    // An absolute deadline, so a relay that keeps sending notices and never
-    // answers cannot hold the run.
-    const started = std.Io.Clock.Timestamp.now(io, .awake);
-    while (anyTrue(waiting[0..n])) {
-        if (started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds() >= timeout_ms) {
-            for (urls[0..n], 0..) |url, i| {
-                if (waiting[i]) try err.print("deed {s}: {s}: {s}: no answer within {d} ms\n", .{ verb, id, url, timeout_ms });
-            }
-            break;
-        }
-        for (urls[0..n], 0..) |url, i| {
-            if (!waiting[i]) continue;
-            const r = conns[i].?;
-            var msg = (r.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch |e| switch (e) {
-                error.Timeout => continue,
-                else => {
-                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ verb, id, url, @errorName(e) });
-                    waiting[i] = false;
-                    continue;
-                },
-            }) orelse {
-                try err.print("deed {s}: {s}: {s}: closed before answering\n", .{ verb, id, url });
-                waiting[i] = false;
-                continue;
-            };
-            defer msg.deinit();
-            switch (msg.value) {
-                .ok => |o| {
-                    if (!std.mem.eql(u8, &o.event_id, &ev.id)) continue;
-                    waiting[i] = false;
-                    if (o.accepted) accepted += 1;
-                    try err.print("deed {s}: {s}: {s}: {s}{s}{s}\n", .{
-                        verb,
-                        id,
-                        url,
-                        if (o.accepted) "accepted" else "refused",
-                        if (o.message.len > 0) ": " else "",
-                        o.message,
-                    });
-                },
-                .notice => |t| try err.print("deed {s}: {s}: notice: {s}\n", .{ verb, url, t.message }),
-                .auth => try err.print("deed {s}: {s}: wants authentication, which this verb cannot give\n", .{ verb, url }),
-                else => {},
-            }
-        }
-    }
-    try err.flush();
-    return accepted;
-}
-
-fn anyTrue(flags: []const bool) bool {
-    for (flags) |f| if (f) return true;
-    return false;
+    return if (try publish.publishOne(gpa, io, verb, urls, ev, timeout_ms, err)) 1 else 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -631,12 +566,40 @@ fn fetchById(
     return found.parsed;
 }
 
+/// The event `id`, asked of the relays in `urls` first. When they do not have
+/// it, or there are none, and the code names its author but carries no relay
+/// hints, it is asked of the relays that author writes to. `bootstrap` is where
+/// that author's relay list is looked for, with `DEED_RELAYS`.
+fn fetchParent(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    urls: []const []const u8,
+    ref: Ref,
+    id: [32]u8,
+    bootstrap: []const []const u8,
+    timeout_ms: i64,
+    err: *std.Io.Writer,
+) !?event.Parsed {
+    if (urls.len > 0) {
+        if (try fetchById(gpa, io, urls, id, timeout_ms, err)) |p| return p;
+    }
+    const author = ref.author orelse return null;
+    if (ref.hints.len > 0) return null;
+    // With relays already tried and nothing to look the author up through,
+    // there is nothing more to say than that the event was not found.
+    if (urls.len > 0 and bootstrap.len == 0 and getEnv("DEED_RELAYS") == null) return null;
+    var theirs = (try outbox.followWriteRelays(gpa, io, "post", author, bootstrap, null, timeout_ms, err)) orelse return null;
+    defer theirs.deinit();
+    return fetchById(gpa, io, theirs.urls, id, timeout_ms, err);
+}
+
 fn replyTagsFor(
     gpa: std.mem.Allocator,
     io: std.Io,
     arena: std.mem.Allocator,
     code: []const u8,
     named: []const []const u8,
+    bootstrap: []const []const u8,
     timeout_ms: i64,
     err: *std.Io.Writer,
 ) !?[]const event.Tag {
@@ -651,11 +614,11 @@ fn replyTagsFor(
     };
     var urls = try lookupUrls(gpa, named, ref);
     defer urls.deinit(gpa);
-    if (urls.items.len == 0) {
+    if (urls.items.len == 0 and ref.author == null) {
         try err.writeAll("deed post: the parent has to be fetched to build the thread: name a relay\n");
         return null;
     }
-    var parent = (try fetchById(gpa, io, urls.items, id, timeout_ms, err)) orelse {
+    var parent = (try fetchParent(gpa, io, urls.items, ref, id, bootstrap, timeout_ms, err)) orelse {
         // A reply tagged without reading its parent would start a new thread
         // under a wrong root, so it is not built.
         try err.writeAll("deed post: could not fetch the parent from those relays, so the reply is not built\n");
@@ -676,6 +639,7 @@ fn commentTagsFor(
     arena: std.mem.Allocator,
     code: []const u8,
     named: []const []const u8,
+    bootstrap: []const []const u8,
     timeout_ms: i64,
     err: *std.Io.Writer,
 ) !?[]const event.Tag {
@@ -703,11 +667,11 @@ fn commentTagsFor(
     }
     var urls = try lookupUrls(gpa, named, ref);
     defer urls.deinit(gpa);
-    if (urls.items.len == 0) {
+    if (urls.items.len == 0 and ref.author == null) {
         try err.writeAll("deed post: the target has to be fetched to learn its author and kind: name a relay\n");
         return null;
     }
-    var target = (try fetchById(gpa, io, urls.items, id, timeout_ms, err)) orelse {
+    var target = (try fetchParent(gpa, io, urls.items, ref, id, bootstrap, timeout_ms, err)) orelse {
         try err.writeAll("deed post: could not fetch the target from those relays, so the comment is not built\n");
         return null;
     };
@@ -975,4 +939,97 @@ test "a refused note is not printed and the exit says so" {
     try testing.expectEqual(cli.exit_fail, code);
     try testing.expectEqual(@as(usize, 0), out.written().len);
     try testing.expect(std.mem.indexOf(u8, err.written(), "refused: blocked: no") != null);
+}
+
+test "with no relay named a note goes to the relays its author writes to" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    const testrelay = @import("testrelay.zig");
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the post leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var home_script = Script{};
+    var home: testrelay.Relay = undefined;
+    try home.startCustom(io, Script.handle, &home_script);
+    defer home.stop(io);
+    var home_buf: [40]u8 = undefined;
+    const home_url = try testrelay.url(&home_buf, home.port());
+
+    const sk = [_]u8{0x33} ** 32;
+    const list_tags = [_]event.Tag{&.{ "r", home_url, "write" }};
+    const list_json = try signedJson(a, io, sk, 10002, &list_tags, "", 1_700_000_000);
+    var dir_script: outbox.Script = .{ .list = list_json };
+    var directory: testrelay.Relay = undefined;
+    try outbox.startScript(&directory, io, &dir_script, 1);
+    defer directory.stop(io);
+    var dir_buf: [40]u8 = undefined;
+    const dir_url = try testrelay.url(&dir_buf, directory.port());
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    const code = try run(gpa, io, &.{ "hello", "--sec", "33" ** 32, "--relay", dir_url, "--timeout", "5000" }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_ok, code);
+    try testing.expectEqual(@as(usize, 1), home_script.events);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"content\":\"hello\"") != null);
+    try testing.expect(std.mem.indexOf(u8, err.written(), "accepted") != null);
+}
+
+test "a reply to an event with an author and no hints reads the parent from the author's relays" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    const testrelay = @import("testrelay.zig");
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the post leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const parent_sk = [_]u8{0x21} ** 32;
+    const parent_json = try signedJson(a, io, parent_sk, 1, &.{}, "the parent", 1_700_000_000);
+    var parsed = try event.fromJson(a, parent_json);
+    defer parsed.deinit();
+    const code_text = try nip19.encodeNevent(a, parsed.value.id, &.{}, parsed.value.pubkey, null);
+
+    // The parent lives on its author's relay, which nobody told the reply about.
+    var parent_script = Script{ .serve = parent_json };
+    var parent_relay: testrelay.Relay = undefined;
+    try parent_relay.startCustom(io, Script.handle, &parent_script);
+    defer parent_relay.stop(io);
+    var parent_buf: [40]u8 = undefined;
+    const parent_url = try testrelay.url(&parent_buf, parent_relay.port());
+
+    const list_tags = [_]event.Tag{&.{ "r", parent_url, "write" }};
+    var dir_script: outbox.Script = .{ .list = try signedJson(a, io, parent_sk, 10002, &list_tags, "", 1_700_000_000) };
+    var directory: testrelay.Relay = undefined;
+    try outbox.startScript(&directory, io, &dir_script, 1);
+    defer directory.stop(io);
+    var dir_buf: [40]u8 = undefined;
+    const dir_url = try testrelay.url(&dir_buf, directory.port());
+
+    // Where the reply goes is named, and is another relay.
+    var mine_script = Script{};
+    var mine: testrelay.Relay = undefined;
+    // Asked for the parent first, then offered the reply.
+    try mine.startFor(io, .custom, 2);
+    mine.custom = Script.handle;
+    mine.custom_ctx = &mine_script;
+    defer mine.stop(io);
+    var mine_buf: [40]u8 = undefined;
+    const mine_url = try testrelay.url(&mine_buf, mine.port());
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    const code = try run(gpa, io, &.{ "answer", "--sec", "33" ** 32, "--reply", code_text, mine_url, "--relay", dir_url, "--timeout", "5000" }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_ok, code);
+    try testing.expectEqual(@as(usize, 1), mine_script.events);
+    try testing.expect(std.mem.indexOf(u8, mine_script.got[0..mine_script.got_len], "\"root\"") != null);
 }
