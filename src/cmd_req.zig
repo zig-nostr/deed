@@ -8,13 +8,12 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
-const keyinput = @import("keyinput.zig");
+const filterflags = @import("filterflags.zig");
 const relayset = @import("relayset.zig");
 const storepath = @import("storepath.zig");
 
 const filter = nostr.filter;
 const message = nostr.message;
-const hex = nostr.hex;
 
 pub const usage =
     \\deed req: build a subscription, and run it
@@ -72,53 +71,20 @@ pub const Request = struct {
 /// that a script does not hang on one gone quiet.
 pub const default_timeout_ms: i64 = 30_000;
 
-const max_values = 64;
+const Collected = filterflags.Collected;
 
-/// What a repeated flag collects. Fixed, because a command line naming more
-/// than this many authors is a file being piped in by the wrong route.
-fn Collected(comptime T: type) type {
-    return struct {
-        items: [max_values]T = undefined,
-        len: usize = 0,
-
-        fn push(self: *@This(), v: T) bool {
-            if (self.len >= self.items.len) return false;
-            self.items[self.len] = v;
-            self.len += 1;
-            return true;
-        }
-        fn slice(self: *const @This()) ?[]const T {
-            return if (self.len == 0) null else self.items[0..self.len];
-        }
-    };
-}
-
-/// A 32-byte key or id, as `npub1…`/`note1…`/`nsec1…` or 64 hex characters.
-fn idOrKey(gpa: std.mem.Allocator, s: []const u8) ?[32]u8 {
-    const t = std.mem.trim(u8, s, " \t\r\n");
-    if (t.len == 64) return hex.decodeFixed(32, t) catch null;
-    if (keyinput.hasPrefix(t, "npub1")) return nostr.nip19.decodeNpub(gpa, t) catch null;
-    if (keyinput.hasPrefix(t, "note1")) return nostr.nip19.decodeNote(gpa, t) catch null;
-    return null;
-}
-
-pub const ParseError = error{ Usage, BadValue };
+pub const ParseError = filterflags.ParseError;
 
 /// Reads the flags into a filter. The relays are whatever is left over.
+///
+/// The filter's slices point into `flags`, which the caller keeps alive.
 pub fn parse(
     gpa: std.mem.Allocator,
     args: []const []const u8,
-    ids: *Collected([32]u8),
-    authors: *Collected([32]u8),
-    kinds: *Collected(u16),
-    e_tags: *Collected([]const u8),
-    p_tags: *Collected([]const u8),
-    t_tags: *Collected([]const u8),
-    tags: *[3]filter.TagFilter,
+    flags: *filterflags.Flags,
     relays: *Collected([]const u8),
     err: *std.Io.Writer,
 ) !?Request {
-    var f = filter.Filter{};
     var bare = false;
     var stream = false;
     var local = false;
@@ -149,11 +115,7 @@ pub fn parse(
             continue;
         }
 
-        const takes_value = cli.isOneOf(a, &.{
-            "-k",      "--kind", "-a",      "--author", "-i",        "--id",
-            "-e",      "-p",     "-t",      "-l",       "--limit",   "-s",
-            "--since", "-u",     "--until", "--store",  "--timeout",
-        });
+        const takes_value = filterflags.isFilterFlag(a) or cli.isOneOf(a, &.{ "--store", "--timeout" });
         if (!takes_value) {
             try err.print("deed req: unknown option '{s}'\n", .{a});
             return ParseError.Usage;
@@ -165,40 +127,8 @@ pub fn parse(
         }
         const v = args[i];
 
-        if (cli.isOneOf(a, &.{ "-k", "--kind" })) {
-            const n = std.fmt.parseInt(u16, v, 10) catch {
-                try err.print("deed req: '{s}' is not a kind number\n", .{v});
-                return ParseError.BadValue;
-            };
-            _ = kinds.push(n);
-        } else if (cli.isOneOf(a, &.{ "-a", "--author" })) {
-            const k = idOrKey(gpa, v) orelse {
-                try err.print("deed req: '{s}' is not a key\n", .{v});
-                return ParseError.BadValue;
-            };
-            _ = authors.push(k);
-        } else if (cli.isOneOf(a, &.{ "-i", "--id" })) {
-            const k = idOrKey(gpa, v) orelse {
-                try err.print("deed req: '{s}' is not an id\n", .{v});
-                return ParseError.BadValue;
-            };
-            _ = ids.push(k);
-        } else if (std.mem.eql(u8, a, "-e")) {
-            _ = e_tags.push(v);
-        } else if (std.mem.eql(u8, a, "-p")) {
-            _ = p_tags.push(v);
-        } else if (std.mem.eql(u8, a, "-t")) {
-            _ = t_tags.push(v);
-        } else if (cli.isOneOf(a, &.{ "-l", "--limit" })) {
-            f.limit = std.fmt.parseInt(u32, v, 10) catch {
-                try err.print("deed req: '{s}' is not a limit\n", .{v});
-                return ParseError.BadValue;
-            };
-        } else if (cli.isOneOf(a, &.{ "-s", "--since" })) {
-            f.since = std.fmt.parseInt(i64, v, 10) catch {
-                try err.print("deed req: '{s}' is not a unix timestamp\n", .{v});
-                return ParseError.BadValue;
-            };
+        if (filterflags.isFilterFlag(a)) {
+            try flags.accept(gpa, "req", a, v, err);
         } else if (std.mem.eql(u8, a, "--store")) {
             store_path = v;
         } else if (std.mem.eql(u8, a, "--timeout")) {
@@ -206,36 +136,11 @@ pub fn parse(
                 try err.print("deed req: '{s}' is not a number of milliseconds\n", .{v});
                 return ParseError.BadValue;
             };
-        } else if (cli.isOneOf(a, &.{ "-u", "--until" })) {
-            f.until = std.fmt.parseInt(i64, v, 10) catch {
-                try err.print("deed req: '{s}' is not a unix timestamp\n", .{v});
-                return ParseError.BadValue;
-            };
         }
     }
 
-    f.ids = ids.slice();
-    f.authors = authors.slice();
-    f.kinds = kinds.slice();
-
-    // The tag filters live in the caller's array so they outlive this function.
-    var tag_len: usize = 0;
-    if (e_tags.slice()) |v| {
-        tags[tag_len] = .{ .letter = 'e', .values = v };
-        tag_len += 1;
-    }
-    if (p_tags.slice()) |v| {
-        tags[tag_len] = .{ .letter = 'p', .values = v };
-        tag_len += 1;
-    }
-    if (t_tags.slice()) |v| {
-        tags[tag_len] = .{ .letter = 't', .values = v };
-        tag_len += 1;
-    }
-    if (tag_len > 0) f.tags = tags[0..tag_len];
-
     return .{
-        .filter = f,
+        .filter = flags.finish(),
         .relays = relays.slice() orelse &.{},
         .bare = bare,
         .store_path = store_path,
@@ -260,16 +165,10 @@ pub fn run(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
-    var ids: Collected([32]u8) = .{};
-    var authors: Collected([32]u8) = .{};
-    var kinds: Collected(u16) = .{};
-    var e_tags: Collected([]const u8) = .{};
-    var p_tags: Collected([]const u8) = .{};
-    var t_tags: Collected([]const u8) = .{};
-    var tags: [3]filter.TagFilter = undefined;
+    var flags: filterflags.Flags = .{};
     var relays: Collected([]const u8) = .{};
 
-    const req = parse(gpa, args, &ids, &authors, &kinds, &e_tags, &p_tags, &t_tags, &tags, &relays, err) catch |e| {
+    const req = parse(gpa, args, &flags, &relays, err) catch |e| {
         return switch (e) {
             ParseError.Usage => cli.exit_usage,
             ParseError.BadValue => cli.exit_fail,
@@ -402,8 +301,8 @@ test "an uppercase npub or note is taken the same as a lowercase one" {
     const note_up = try std.ascii.allocUpperString(gpa, note);
     defer gpa.free(note_up);
 
-    try std.testing.expectEqual(key, idOrKey(gpa, npub_up).?);
-    try std.testing.expectEqual(key, idOrKey(gpa, note_up).?);
+    try std.testing.expectEqual(key, filterflags.idOrKey(gpa, npub_up).?);
+    try std.testing.expectEqual(key, filterflags.idOrKey(gpa, note_up).?);
 
     var ob: [4096]u8 = undefined;
     var eb: [1024]u8 = undefined;

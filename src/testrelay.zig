@@ -59,7 +59,15 @@ pub const Mode = enum {
     /// Refuses every EVENT with a reason carrying a terminal escape and a
     /// newline followed by a line that claims the event was accepted.
     hostile,
+    /// Hands every text frame to `Relay.custom`, which writes whatever the
+    /// test wants back. Lets a test file script its own relay.
+    custom,
 };
+
+/// What a `custom` relay runs for each text frame it receives. `ctx` is
+/// `Relay.custom_ctx`. Replies are written with `sendText`. Returning an
+/// error ends the connection.
+pub const CustomFn = *const fn (ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void;
 
 /// The allocator a test hands to anything that dials.
 ///
@@ -118,11 +126,25 @@ pub const Relay = struct {
     connections: usize = 1,
     /// Event JSON the `serve` mode sends in answer to a REQ.
     serving: []const []const u8 = &.{},
+    /// The handler for `Mode.custom`, and the context it is given. `startCustom`
+    /// sets both.
+    custom: ?CustomFn = null,
+    custom_ctx: ?*anyopaque = null,
     task: Io.Future(void),
 
     /// Starts serving in the background. `self` must not move until `stop`.
     pub fn start(self: *Relay, io: Io, mode: Mode) !void {
         return self.startFor(io, mode, 1);
+    }
+
+    /// Starts a `Mode.custom` relay: every text frame goes to `handler`, which
+    /// writes its replies with `sendText`. `ctx` is passed back untouched.
+    pub fn startCustom(self: *Relay, io: Io, handler: CustomFn, ctx: ?*anyopaque) !void {
+        try self.start(io, .custom);
+        // Set after the task is running, as `serving` is: nothing reads them
+        // before a client has connected, and the client dials after this.
+        self.custom = handler;
+        self.custom_ctx = ctx;
     }
 
     /// Like `start`, serving `connections` connections one after another.
@@ -235,6 +257,10 @@ pub const Relay = struct {
 
     fn answer(self: *Relay, gpa: std.mem.Allocator, w: *Io.Writer, payload: []const u8, seen: *usize) !void {
         if (self.mode == .silent) return;
+        if (self.mode == .custom) {
+            const handler = self.custom orelse return;
+            return handler(self.custom_ctx, payload, w);
+        }
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, payload, .{});
         defer parsed.deinit();
         const items = parsed.value.array.items;
@@ -298,14 +324,14 @@ pub const Relay = struct {
                     try sendText(w, "[\"COUNT\",\"x\",{\"count\":1}]");
                     try sendText(w, try std.fmt.bufPrint(&text, "[\"OK\",\"{s}\",true,\"\"]", .{id}));
                 },
-                .silent, .chatty, .notice_burst, .pongs, .deaf, .pings_deaf, .serve => {},
+                .silent, .chatty, .notice_burst, .pongs, .deaf, .pings_deaf, .serve, .custom => {},
             }
         }
     }
 };
 
 /// One unmasked server text frame.
-fn sendText(w: *Io.Writer, text: []const u8) !void {
+pub fn sendText(w: *Io.Writer, text: []const u8) !void {
     if (text.len < 126) {
         try w.writeAll(&.{ 0x81, @intCast(text.len) });
     } else {
@@ -313,4 +339,53 @@ fn sendText(w: *Io.Writer, text: []const u8) !void {
     }
     try w.writeAll(text);
     try w.flush();
+}
+
+test "a custom relay answers with whatever the test scripts" {
+    const io = std.testing.io;
+    var relay: Relay = undefined;
+    var count: usize = 0;
+    const Script = struct {
+        fn handle(ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void {
+            const n: *usize = @ptrCast(@alignCast(ctx.?));
+            n.* += 1;
+            if (std.mem.indexOf(u8, frame, "\"REQ\"") == null) return;
+            try sendText(w, "[\"NOTICE\",\"scripted\"]");
+            try sendText(w, "[\"EOSE\",\"deed\"]");
+        }
+    };
+    try relay.startCustom(io, Script.handle, &count);
+    defer relay.stop(io);
+
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", relay.port());
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    try w.interface.flush();
+    // The 101 answer, then a masked REQ frame (mask key zero keeps it plain).
+    while (std.mem.indexOf(u8, r.interface.buffered(), "\r\n\r\n") == null) try r.interface.fillMore();
+    const head_end = std.mem.indexOf(u8, r.interface.buffered(), "\r\n\r\n").? + 4;
+    r.interface.toss(head_end);
+    const req = "[\"REQ\",\"deed\",{}]";
+    try w.interface.writeAll(&.{ 0x81, 0x80 | req.len, 0, 0, 0, 0 });
+    try w.interface.writeAll(req);
+    try w.interface.flush();
+
+    var got: [128]u8 = undefined;
+    var have: usize = 0;
+    while (have < 2 + "[\"NOTICE\",\"scripted\"]".len + 2 + "[\"EOSE\",\"deed\"]".len) {
+        try r.interface.fillMore();
+        const b = r.interface.buffered();
+        @memcpy(got[have..][0..b.len], b);
+        have += b.len;
+        r.interface.toss(b.len);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, got[0..have], "scripted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got[0..have], "EOSE") != null);
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
