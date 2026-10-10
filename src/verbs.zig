@@ -58,12 +58,12 @@ fn runDecrypt(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out:
 
 /// Every verb, in the order `deed help` lists them.
 pub const table = [_]Verb{
-    .{ .name = "key", .summary = "make a key, or derive the public one from it", .usage = cmd_key.usage, .run = cmd_key.run, .ready = true },
+    .{ .name = "key", .summary = "generate, public, encrypt and decrypt with a password, validate, expand, mnemonics", .usage = cmd_key.usage, .run = cmd_key.run, .ready = true },
     .{ .name = "event", .summary = "build an event and sign it", .usage = cmd_event.usage, .run = cmd_event.run, .ready = true },
     .{ .name = "decode", .summary = "turn a NIP-19 code into the fields it carries", .usage = cmd_decode.usage, .run = cmd_decode.run, .ready = true },
     .{ .name = "encode", .summary = "build a NIP-19 code out of its parts", .usage = cmd_encode.usage, .run = runEncode, .ready = true },
-    .{ .name = "encrypt", .summary = "encrypt a message to someone, with NIP-44", .usage = cmd_crypt.encrypt_usage, .run = runEncrypt, .ready = true },
-    .{ .name = "decrypt", .summary = "decrypt a NIP-44 payload from someone", .usage = cmd_crypt.decrypt_usage, .run = runDecrypt, .ready = true },
+    .{ .name = "encrypt", .summary = "encrypt a message to someone, NIP-44, or NIP-04 with --nip04", .usage = cmd_crypt.encrypt_usage, .run = runEncrypt, .ready = true },
+    .{ .name = "decrypt", .summary = "decrypt a message from someone, NIP-44, or NIP-04 with --nip04", .usage = cmd_crypt.decrypt_usage, .run = runDecrypt, .ready = true },
     .{ .name = "req", .summary = "build a subscription, and run it", .usage = cmd_req.usage, .run = cmd_req.run, .ready = true },
     .{ .name = "fetch", .summary = "get the events a code names", .usage = cmd_fetch.usage, .run = cmd_fetch.run, .ready = true },
     .{ .name = "publish", .summary = "offer signed events to relays", .usage = cmd_publish.usage, .run = cmd_publish.run, .ready = true },

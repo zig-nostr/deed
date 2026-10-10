@@ -4,13 +4,14 @@ A guide to this repository for anyone changing it, people and coding agents alik
 
 ## What this is
 
-`deed` is a command line for nostr, written in Zig on top of the [`nostr`](https://github.com/zig-nostr/nostr) library. It makes keys, builds and signs events, reads and writes NIP-19 codes, encrypts and decrypts with NIP-44, checks signatures, asks relays for events, publishes to them, and keeps what it fetches in a local LMDB store.
+`deed` is a command line for nostr, written in Zig on top of the [`nostr`](https://github.com/zig-nostr/nostr) library. It makes and protects keys, builds and signs events, reads and writes NIP-19 codes, encrypts and decrypts, wraps private messages, checks signatures, asks relays for events, publishes to them, syncs, signs for remote clients, talks to relays and servers over HTTP, and keeps what it fetches in a local LMDB store.
 
 ## Build and test
 
 ```sh
 zig build                                        # binary at zig-out/bin/deed
 zig build test                                   # unit tests, including real relays on loopback
+zig build test -Dtest-filter=<text>              # only the tests whose name contains the text
 zig fmt --check .                                # CI fails on unformatted code
 zig build -Doptimize=ReleaseSafe -Dstrip=true    # the release build
 python3 bench/run.py zig-out/bin/deed            # benchmarks, see BENCHMARKS.md
@@ -28,9 +29,19 @@ src/
   main.zig        # dispatch, the stdout/stderr writers, exit codes
   cli.zig         # exit code constants, the stdin record reader
   console.zig     # Windows only: UTF-8 console code pages for the length of a run
-  cmd_*.zig       # one file per verb
-  relayset.zig    # the shared relay query behind req and fetch
+  verbs.zig       # the table of verbs; dispatch and help derive from it
+  cmd_*.zig       # one file per verb, each with summary, usage, ready and run
+  keyinput.zig    # reading secret and public keys in every form, ncryptsec included
+  filterflags.zig # the filter flags and JSON filters shared by req, filter, count, sync, store
+  relayset.zig    # the shared relay query, one reader task per relay
   dial.zig        # dialling every relay at once under one deadline
+  auth.zig        # NIP-42 answers for req, fetch and publish
+  http.zig        # bounded HTTP client for relay, curl, admin, blossom, NIP-05
+  parallel.zig    # ordered worker pool, used by verify
+  outbox.zig      # a person's NIP-65 relay list, found and checked
+  negclient.zig   # NIP-77 negentropy against one relay
+  password.zig    # passwords read with echo off or from NOSTR_PASSWORD
+  qr.zig          # QR encoder for bunker --qrcode
   storepath.zig   # opening the store a --store path names, and saying why one will not open
   testrelay.zig   # a websocket relay on loopback, for tests only
 bench/            # the benchmark script and its relay
@@ -41,6 +52,8 @@ skills/deed/      # the skill for agents that operate deed
 ## Conventions
 
 - Every verb takes its inputs as arguments or, given none, as newline-delimited records on stdin, and writes one result per line on stdout. Diagnostics go to stderr. Keep it that way: it is what makes the verbs compose.
+- A new verb is a `cmd_<name>.zig` plus one row in `verbs.zig`; see "Adding a verb" in `ARCHITECTURE.md`. Its `usage` string is the documentation: keep every flag in it, and keep the README table and the skill in step.
+- Passwords never come from arguments: use `password.zig`. A secret key is read through `keyinput.zig`, never parsed by hand.
 - Exit codes are an interface: 0 success, 1 ran and failed, 2 not understood, 141 the reader went away. Do not add new ones casually.
 - Match a NIP-19 prefix with `keyinput.hasPrefix` and strip `nostr:` with `keyinput.stripUri`, never `std.mem.startsWith`: bech32 allows all upper case, and a code in upper case has to reach the decoder.
 - Open a `--store` path with `storepath.open`, so a new store's directories are made and a store that will not open says why.

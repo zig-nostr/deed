@@ -7,6 +7,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
+const outbox = @import("outbox.zig");
 const relayset = @import("relayset.zig");
 const auth = @import("auth.zig");
 const storepath = @import("storepath.zig");
@@ -25,7 +26,14 @@ pub const usage =
     \\`nostr:`, in lower case or all upper case. A code carrying relay hints is
     \\looked for at those relays as well as any named here.
     \\
+    \\A code with no hints, and no relay named, is looked for at the author's own
+    \\write relays: their relay list is first asked of the relays in DEED_RELAYS or
+    \\given with --relay. A note or event id with no hints has no author to follow,
+    \\so it still needs a relay named.
+    \\
     \\Options:
+    \\  -r, --relay <url>    where to look up the author's relay list, for a code
+    \\                       with no hints, repeatable (and DEED_RELAYS)
     \\      --store <path>   keep every event this receives in a local store
     \\      --timeout <ms>   give up on relays still answering (default 30000)
 ++ auth.usage_lines ++
@@ -58,6 +66,8 @@ pub fn run(
     var code: ?[]const u8 = null;
     var urls: std.ArrayList([]const u8) = .empty;
     defer urls.deinit(gpa);
+    var bootstrap: std.ArrayList([]const u8) = .empty;
+    defer bootstrap.deinit(gpa);
     var store_path: ?[]const u8 = null;
     var timeout_ms: i64 = 30_000;
     var auth_flags: auth.Flags = .{};
@@ -78,7 +88,7 @@ pub fn run(
             .not_mine => {},
         }
         if (std.mem.startsWith(u8, a, "-")) {
-            if (!cli.isOneOf(a, &.{ "--store", "--timeout" })) {
+            if (!cli.isOneOf(a, &.{ "--store", "--timeout", "-r", "--relay" })) {
                 try err.print("deed fetch: unknown option '{s}'\n", .{a});
                 return cli.exit_usage;
             }
@@ -87,7 +97,9 @@ pub fn run(
                 try err.print("deed fetch: '{s}' needs a value\n", .{a});
                 return cli.exit_usage;
             }
-            if (std.mem.eql(u8, a, "--store")) store_path = args[i] else {
+            if (cli.isOneOf(a, &.{ "-r", "--relay" })) {
+                try bootstrap.append(gpa, args[i]);
+            } else if (std.mem.eql(u8, a, "--store")) store_path = args[i] else {
                 timeout_ms = std.fmt.parseInt(i64, args[i], 10) catch {
                     try err.print("deed fetch: '{s}' is not a number of milliseconds\n", .{args[i]});
                     return cli.exit_fail;
@@ -128,19 +140,36 @@ pub fn run(
     defer target.deinit(gpa);
 
     for (target.hints) |h| try urls.append(gpa, h);
-    if (urls.items.len == 0) {
-        // A bare npub or note carries no hints, and this verb does not go
-        // looking for the author's relay list to find some: that is a second
-        // round trip with its own caching question, and doing it badly is worse
-        // than saying plainly that it is not done.
-        try err.writeAll("deed fetch: that code carries no relay hints, so name a relay to look in\n");
-        return cli.exit_usage;
-    }
 
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();
     if (store_path) |path| {
         store = (try storepath.open(gpa, io, "fetch", path, .create, err)) orelse return cli.exit_fail;
+    }
+
+    // No relay named and none in the code: follow the author to the relays they
+    // write to. A code that names no author has nowhere to follow.
+    var followed: ?outbox.Urls = null;
+    defer if (followed) |*f| f.deinit();
+    if (urls.items.len == 0) {
+        if (target.filter.authors == null) {
+            try err.writeAll("deed fetch: that code carries no relay hints and names no author, so name a relay to look in\n");
+            return cli.exit_usage;
+        }
+        try outbox.appendEnvBootstrap(gpa, &bootstrap);
+        if (bootstrap.items.len == 0) {
+            try err.writeAll("deed fetch: that code carries no relay hints, so name a relay to look in, or name a relay (with --relay, or DEED_RELAYS) to find the author's relays through\n");
+            return cli.exit_usage;
+        }
+        followed = try outbox.writeRelays(gpa, io, target.filter.authors.?[0], .{
+            .bootstrap = bootstrap.items,
+            .store = if (store) |*st| st else null,
+        }, err);
+        if (followed.?.urls.len == 0) {
+            try err.writeAll("deed fetch: found no relays the author writes to, so name a relay to look in\n");
+            return cli.exit_fail;
+        }
+        for (followed.?.urls) |u| try urls.append(gpa, u);
     }
 
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{
@@ -150,6 +179,7 @@ pub fn run(
         .auth = auth_opts,
     });
 
+    if (outcome.store_failed) return cli.exit_fail;
     if (outcome.dialled == 0) {
         try err.writeAll("deed fetch: no relay answered\n");
         return cli.exit_fail;
@@ -393,4 +423,55 @@ test "64 hex characters are taken as an event id" {
     var r = try resolveFor("ab" ** 32, .{ .ids = &ids, .authors = &authors, .kinds = &kinds, .d = &d, .tags = &tags });
     defer r.deinit(testing.allocator);
     try testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), &r.filter.ids.?[0]);
+}
+
+const testrelay = @import("testrelay.zig");
+
+test "a bare npub is followed to the relays its author writes to" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the run leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x51} ** 32);
+
+    // The relay the author writes to holds their profile.
+    const profile = try nostr.event.create(arena, signer, kp, 1_700_000_000, 0, &.{}, "{\"name\":\"followed\"}", null);
+    var home: testrelay.Relay = undefined;
+    try home.start(io, .serve);
+    home.serving = &.{try nostr.event.toJson(arena, profile)};
+    defer home.stop(io);
+    var home_buf: [40]u8 = undefined;
+    const home_url = try testrelay.url(&home_buf, home.port());
+
+    // The bootstrap relay holds only their relay list, naming that one.
+    const tags = [_]nostr.event.Tag{&.{ "r", home_url, "write" }};
+    const list = try nostr.event.create(arena, signer, kp, 1_700_000_050, 10002, &tags, "", null);
+    var script: outbox.Script = .{ .list = try nostr.event.toJson(arena, list) };
+    var directory: testrelay.Relay = undefined;
+    try outbox.startScript(&directory, io, &script, 1);
+    defer directory.stop(io);
+    var dir_buf: [40]u8 = undefined;
+    const dir_url = try testrelay.url(&dir_buf, directory.port());
+
+    const npub = try nip19.encodeNpub(arena, kp.public_key);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const code = try run(gpa, io, &.{ npub, "--relay", dir_url }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_ok, code);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "followed") != null);
+
+    // With nothing to ask, it says what would help instead of guessing.
+    var out2: std.Io.Writer.Allocating = .init(arena);
+    var err2: std.Io.Writer.Allocating = .init(arena);
+    const none = try run(gpa, io, &.{npub}, &out2.writer, &err2.writer);
+    try testing.expectEqual(cli.exit_usage, none);
+    try testing.expect(std.mem.indexOf(u8, err2.written(), "DEED_RELAYS") != null);
+    try testing.expect(std.mem.indexOf(u8, err2.written(), "--relay") != null);
 }

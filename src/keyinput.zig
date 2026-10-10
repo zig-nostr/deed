@@ -61,6 +61,24 @@ pub fn secretKey(gpa: std.mem.Allocator, s: []const u8) !keys.SecretKey {
     };
 }
 
+/// `secretKeyWith` for a verb that reports on `err`: one line saying what is
+/// wrong with the key, never two. Fails with `error.BadKey` after saying it.
+pub fn secretKeyOrSay(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, source: anytype, err: *std.Io.Writer) !keys.SecretKey {
+    return secretKeyWith(gpa, s, source) catch |e| {
+        switch (e) {
+            Error.WrongPassword => try err.print("deed {s}: wrong password for that ncryptsec\n", .{verb}),
+            Error.NoPassword => try err.print("deed {s}: an ncryptsec needs a password: run on a terminal, or set {s}\n", .{ verb, password.password_env }),
+            else => try err.print("deed {s}: not a secret key (want nsec1..., ncryptsec1... or 64 hex characters)\n", .{verb}),
+        }
+        return error.BadKey;
+    };
+}
+
+/// `secretKeyOrSay`, asking for an ncryptsec's password where `secretKey` does.
+pub fn secretKeyForVerb(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, err: *std.Io.Writer) !keys.SecretKey {
+    return secretKeyOrSay(gpa, verb, s, TerminalPassword{}, err);
+}
+
 /// `secretKey` with the password source passed in, so a test can supply one.
 pub fn secretKeyWith(gpa: std.mem.Allocator, s: []const u8, source: anytype) !keys.SecretKey {
     const t = std.mem.trim(u8, s, " \t\r\n");
@@ -166,6 +184,17 @@ test "a wrong password and a missing one are told apart from a bad key" {
     try std.testing.expectError(Error.WrongPassword, secretKeyWith(gpa, spec_ncryptsec, FixedPassword{ .text = "nostR" }));
     try std.testing.expectError(Error.NoPassword, secretKeyWith(gpa, spec_ncryptsec, NoTerminal{}));
     try std.testing.expectError(Error.UnrecognizedKey, secretKeyWith(gpa, "ncryptsec1qqqq", FixedPassword{ .text = "nostr" }));
+}
+
+test "a wrong password is one line, and a bad key is one line" {
+    const gpa = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.BadKey, secretKeyOrSay(gpa, "post", spec_ncryptsec, FixedPassword{ .text = "nostR" }, &w));
+    try std.testing.expectEqualStrings("deed post: wrong password for that ncryptsec\n", w.buffered());
+    var w2: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.BadKey, secretKeyOrSay(gpa, "post", "nope", NoTerminal{}, &w2));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w2.buffered(), "\n"));
 }
 
 test "nsec and hex never ask for a password" {

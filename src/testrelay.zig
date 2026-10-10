@@ -130,6 +130,9 @@ pub const Relay = struct {
     /// sets both.
     custom: ?CustomFn = null,
     custom_ctx: ?*anyopaque = null,
+    /// A frame sent right after the upgrade, before the client has said
+    /// anything: a NIP-42 challenge, for instance. Set before the client dials.
+    greeting: ?[]const u8 = null,
     task: Io.Future(void),
 
     /// Starts serving in the background. `self` must not move until `stop`.
@@ -209,6 +212,8 @@ pub const Relay = struct {
         const accept_key = ws.acceptKey(req.items[ks..ke]);
         try w.interface.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{&accept_key});
         try w.interface.flush();
+
+        if (self.greeting) |g| try sendText(&w.interface, g);
 
         switch (self.mode) {
             .chatty => {

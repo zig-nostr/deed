@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const nostr = @import("nostr");
+const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const filterflags = @import("filterflags.zig");
 const relayset = @import("relayset.zig");
@@ -24,7 +25,7 @@ pub const usage =
     \\deed req: build a subscription, and run it
     \\
     \\Usage:
-    \\  deed req [options] [<filter-json>...] [<relay-url>...]
+    \\  deed req [options] [<filter-json>...] [-] [<relay-url>...]
     \\
     \\Options:
     \\  -k, --kind <n>       event kind, repeatable
@@ -48,11 +49,15 @@ pub const usage =
     \\      --local          answer from the store alone, dialling nothing
     \\      --stream         keep reading after the relays have sent what they hold
     \\      --timeout <ms>   give up on relays still answering (default 30000)
+++ auth.usage_lines ++
     \\
     \\A filter can also be given as JSON: as an argument that starts with {, or
-    \\on stdin when it is not a terminal (one object, several, or an array of
-    \\them). Flags are laid over each JSON filter: a field a flag sets replaces
+    \\on stdin when a lone - is given (one object, several, or an array of them).
+    \\Stdin is read only for that -, never on its own, so a caller that leaves a
+    \\pipe open cannot stall a request; reading it gives up after --timeout. Flags are laid over each JSON filter: a field a flag sets replaces
     \\the one in the JSON. Several filters make one subscription.
+    \\More than 500 ids or authors in a filter go out as several filters in the
+    \\same REQ, so none is dropped.
     \\
     \\With --paginate, --limit is the total across all pages, not a page size.
     \\Each page asks for events older than the oldest one seen so far, and an
@@ -90,6 +95,9 @@ pub const Request = struct {
     ids_only: bool = false,
     paginate: bool = false,
     paginate_interval_ms: i64 = 0,
+    auth: auth.Flags = .{},
+    /// A lone `-` was given: read filters from stdin.
+    stdin: bool = false,
 };
 
 /// How long a run waits on relays still answering, once they are reached.
@@ -150,6 +158,8 @@ pub fn parse(
     var paginate_interval_ms: i64 = 0;
     var store_path: ?[]const u8 = null;
     var timeout_ms: i64 = default_timeout_ms;
+    var auth_flags: auth.Flags = .{};
+    var from_stdin = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -157,6 +167,18 @@ pub fn parse(
         if (cli.isOneOf(a, &.{ "help", "--help" })) return null;
         // `-h` names the `h` tag when a value follows, and asks for help alone.
         if (std.mem.eql(u8, a, "-h") and i + 1 >= args.len) return null;
+        switch (auth_flags.take(args, &i)) {
+            .taken => continue,
+            .missing_value => {
+                try err.print("deed req: '{s}' needs a value\n", .{a});
+                return ParseError.Usage;
+            },
+            .not_mine => {},
+        }
+        if (std.mem.eql(u8, a, "-")) {
+            from_stdin = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--bare")) {
             bare = true;
             continue;
@@ -242,6 +264,8 @@ pub fn parse(
         .ids_only = ids_only,
         .paginate = paginate,
         .paginate_interval_ms = paginate_interval_ms,
+        .auth = auth_flags,
+        .stdin = from_stdin,
     };
 }
 
@@ -316,6 +340,43 @@ pub fn parseJsonFilters(
     }
 }
 
+const StdinArrival = union(enum) {
+    read: anyerror![]u8,
+    timer: std.Io.Cancelable!void,
+};
+
+fn readAll(arena: std.mem.Allocator, r: *std.Io.Reader) anyerror![]u8 {
+    return r.allocRemaining(arena, .limited(max_stdin_bytes));
+}
+
+/// All of `r`, or `error.Timeout` when it has not ended within `timeout_ms`.
+fn readStdin(arena: std.mem.Allocator, io: std.Io, r: *std.Io.Reader, timeout_ms: i64) ![]u8 {
+    var buf: [2]StdinArrival = undefined;
+    var sel = std.Io.Select(StdinArrival).init(io, &buf);
+    var result: anyerror![]u8 = error.Timeout;
+    var started = false;
+    if (sel.concurrent(.read, readAll, .{ arena, r })) {
+        started = true;
+        sel.concurrent(.timer, std.Io.sleep, .{ io, .fromMilliseconds(timeout_ms), .awake }) catch {};
+        if (sel.await()) |first| switch (first) {
+            .read => |v| result = v,
+            .timer => {},
+        } else |_| {}
+    } else |_| {
+        // No second thread to read on: read inline, as unbounded as before.
+        result = readAll(arena, r);
+    }
+    if (started) {
+        while (sel.cancel()) |late| switch (late) {
+            .read => |v| if (v) |text| {
+                result = text;
+            } else |_| {},
+            .timer => {},
+        };
+    }
+    return result;
+}
+
 pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -324,12 +385,10 @@ pub fn run(
     err: *std.Io.Writer,
 ) !u8 {
     var buf: [4096]u8 = undefined;
-    // Streaming for the reason `main` gives for the writers. Stdin is only
-    // read when it is not a terminal, and only once the command line has been
-    // understood and carries no filter of its own.
+    // Streaming for the reason `main` gives for the writers. Stdin is read
+    // only for an explicit `-`, once the command line has been understood.
     var reader = std.Io.File.stdin().readerStreaming(io, &buf);
-    const piped = !(std.Io.File.stdin().isTty(io) catch true);
-    return runWith(gpa, io, args, if (piped) &reader.interface else null, out, err);
+    return runWith(gpa, io, args, &reader.interface, out, err);
 }
 
 /// `run`, with the stdin to read a JSON filter from given (or none).
@@ -360,8 +419,8 @@ pub fn runWith(
         return cli.exit_ok;
     };
 
-    // The filters: JSON given as arguments, else JSON on stdin, else the flags
-    // alone. Flags lay over whichever JSON there was.
+    // The filters: JSON given as arguments and, with `-`, on stdin; else the
+    // flags alone. Flags lay over whichever JSON there was.
     var filters: std.ArrayList(filter.Filter) = .empty;
     var parsed_ok = true;
     parseAll: {
@@ -374,11 +433,15 @@ pub fn runWith(
                 else => return e,
             };
         }
-        if (jsons.len == 0) if (stdin) |r| {
-            const text = r.allocRemaining(arena, .limited(max_stdin_bytes)) catch |e| switch (e) {
+        if (req.stdin) if (stdin) |r| {
+            const text = readStdin(arena, io, r, req.timeout_ms) catch |e| switch (e) {
                 error.OutOfMemory => return e,
                 error.StreamTooLong => {
                     try err.print("deed req: the filter on stdin is longer than {d} bytes\n", .{max_stdin_bytes});
+                    return cli.exit_fail;
+                },
+                error.Timeout => {
+                    try err.print("deed req: nothing ended the filter on stdin within {d} ms\n", .{req.timeout_ms});
                     return cli.exit_fail;
                 },
                 else => {
@@ -401,6 +464,8 @@ pub fn runWith(
     } else if (flags.any()) {
         for (filters.items) |*f| f.* = try filterflags.overlay(arena, f.*, req.filter);
     }
+    // A long list of ids goes out as several filters in the one REQ, never cut.
+    filters.items = try filterflags.splitLarge(arena, filters.items);
 
     // Answered from what is already kept, without dialling. This is the half
     // that makes keeping worth doing: a store nothing reads back is a log.
@@ -452,6 +517,12 @@ pub fn runWith(
         return cli.exit_ok;
     }
 
+    const auth_opts = auth.resolve(gpa, req.auth, "req", err) catch |e| switch (e) {
+        error.Usage => return cli.exit_usage,
+        error.BadKey => return cli.exit_fail,
+        else => |other| return other,
+    };
+
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();
     if (req.store_path) |path| {
@@ -460,19 +531,20 @@ pub fn runWith(
     const store_ptr: ?*nostr.store.Store = if (store) |*st| st else null;
 
     if (req.paginate or req.ids_only) {
-        return pages(gpa, io, req, filters.items, store_ptr, out, err);
+        return pages(gpa, io, req, auth_opts, filters.items, store_ptr, out, err);
     }
 
     const outcome = try relayset.query(gpa, io, req.relays, filters.items, out, err, .{
         .until_eose = !req.stream,
         .deadline_ms = req.timeout_ms,
-        .poll_ms = 100,
         .store = store_ptr,
+        .auth = auth_opts,
     });
 
     // Reaching no relay at all is a failed run. Reaching some is not: the
     // events that arrived are real, and every relay that did not answer was
     // named on stderr as it failed.
+    if (outcome.store_failed) return cli.exit_fail;
     if (outcome.dialled == 0) {
         try err.writeAll("deed req: no relay answered\n");
         return cli.exit_fail;
@@ -496,6 +568,7 @@ fn pages(
     gpa: std.mem.Allocator,
     io: std.Io,
     req: Request,
+    auth_opts: ?auth.Options,
     filters: []const filter.Filter,
     store: ?*nostr.store.Store,
     out: *std.Io.Writer,
@@ -524,9 +597,10 @@ fn pages(
         const outcome = try relayset.query(gpa, io, req.relays, page_filters, &capture.writer, err, .{
             .until_eose = true,
             .deadline_ms = req.timeout_ms,
-            .poll_ms = 100,
             .store = store,
+            .auth = auth_opts,
         });
+        if (outcome.store_failed) return cli.exit_fail;
         if (outcome.dialled == 0) {
             try err.writeAll("deed req: no relay answered\n");
             return cli.exit_fail;
@@ -792,26 +866,136 @@ test "filters given as JSON arguments are printed as one REQ, with flags laid ov
 test "a filter on stdin is read, several are kept, and a bad one is refused" {
     var ob: [4096]u8 = undefined;
     var eb: [1024]u8 = undefined;
-    const one = try runReqStdin(&.{"--bare"}, "{\"kinds\": [1],\n \"#t\": [\"a\"]}\n", &ob, &eb);
+    const one = try runReqStdin(&.{ "-", "--bare" }, "{\"kinds\": [1],\n \"#t\": [\"a\"]}\n", &ob, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[1],\"#t\":[\"a\"]}\n", one.out);
 
     var ob2: [4096]u8 = undefined;
-    const many = try runReqStdin(&.{ "-l", "4" }, "{\"kinds\":[1]}\n{\"kinds\":[7]}\n", &ob2, &eb);
+    const many = try runReqStdin(&.{ "-", "-l", "4" }, "{\"kinds\":[1]}\n{\"kinds\":[7]}\n", &ob2, &eb);
     try std.testing.expectEqualStrings("[\"REQ\",\"deed\",{\"kinds\":[1],\"limit\":4},{\"kinds\":[7],\"limit\":4}]\n", many.out);
 
     var ob3: [4096]u8 = undefined;
-    const array = try runReqStdin(&.{"--bare"}, "[{\"kinds\":[1]},{\"kinds\":[7]}]", &ob3, &eb);
+    const array = try runReqStdin(&.{ "-", "--bare" }, "[{\"kinds\":[1]},{\"kinds\":[7]}]", &ob3, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[1]}\n{\"kinds\":[7]}\n", array.out);
 
     var ob4: [4096]u8 = undefined;
-    const bad = try runReqStdin(&.{"--bare"}, "{\"kinds\": nope}\n", &ob4, &eb);
+    const bad = try runReqStdin(&.{ "-", "--bare" }, "{\"kinds\": nope}\n", &ob4, &eb);
     try std.testing.expectEqual(cli.exit_fail, bad.code);
     try std.testing.expect(std.mem.indexOf(u8, bad.err, "deed req: the filter is not valid JSON") != null);
 
-    // Filters given as arguments mean stdin is not read at all.
+    // Without a lone -, stdin is not read at all, whatever is on it.
     var ob5: [4096]u8 = undefined;
     const args_win = try runReqStdin(&.{ "{\"kinds\":[2]}", "--bare" }, "{\"kinds\":[9]}", &ob5, &eb);
     try std.testing.expectEqualStrings("{\"kinds\":[2]}\n", args_win.out);
+    var ob6: [4096]u8 = undefined;
+    const flags_only = try runReqStdin(&.{ "-k", "7", "--bare" }, "{\"kinds\":[9]}", &ob6, &eb);
+    try std.testing.expectEqualStrings("{\"kinds\":[7]}\n", flags_only.out);
+}
+
+/// A reader whose input never ends: it waits, as a pipe nobody closes does.
+const Stuck = struct {
+    io: std.Io,
+    interface: std.Io.Reader,
+
+    fn init(io: std.Io, buf: []u8) Stuck {
+        return .{ .io = io, .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buf, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(r: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Stuck = @alignCast(@fieldParentPtr("interface", r));
+        while (true) self.io.sleep(.fromMilliseconds(50), .awake) catch return error.ReadFailed;
+    }
+};
+
+test "a stdin that never ends is given up on at --timeout, not waited for" {
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    var stuck = Stuck.init(io, &buf);
+    var out_buf: [256]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err: std.Io.Writer = .fixed(&err_buf);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const code = try runWith(std.testing.allocator, io, &.{ "-", "--timeout", "300" }, &stuck.interface, &out, &err);
+    const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expectEqual(cli.exit_fail, code);
+    try std.testing.expect(took < 3_000);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "within 300 ms") != null);
+}
+
+test "--auth answers a relay that holds events behind NIP-42, and --sec needs --auth" {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the run leaked");
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var script: relayset.AuthRelay = .{ .want_url = undefined, .event = try relayset.testEvent(arena, io, "members only") };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, relayset.AuthRelay.handle, &script);
+    defer r.stop(io);
+    var url_buf: [40]u8 = undefined;
+    const url = try testrelay.url(&url_buf, r.port());
+    script.want_url = url;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const sec = "44" ** 32;
+    const code = try runWith(da.allocator(), io, &.{ "-k", "1", "--auth", "--sec", sec, url }, null, &out.writer, &err.writer);
+    try std.testing.expectEqual(cli.exit_ok, code);
+    try std.testing.expectEqual(@as(usize, 1), script.auths);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "members only") != null);
+
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{ "--sec", sec, url }, &ob, &eb)).code);
+    try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{"--sec"}, &ob, &eb)).code);
+    try std.testing.expectEqual(cli.exit_fail, (try runReq(&.{ "--auth", "--sec", "nope", url }, &ob, &eb)).code);
+}
+
+test "repeated -i is never truncated: 100 ids go in one filter, 1200 in three" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 100, 1200 }) |n| {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(gpa);
+        var store: std.ArrayList([]u8) = .empty;
+        defer {
+            for (store.items) |b| gpa.free(b);
+            store.deinit(gpa);
+        }
+        try args.append(gpa, "--bare");
+        for (0..n) |k| {
+            const id = try std.fmt.allocPrint(gpa, "{x:0>64}", .{k + 1});
+            try store.append(gpa, id);
+            try args.append(gpa, "-i");
+            try args.append(gpa, id);
+        }
+        const ob = try gpa.alloc(u8, 1 << 20);
+        defer gpa.free(ob);
+        var eb: [1024]u8 = undefined;
+        const r = try runReq(args.items, ob, &eb);
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expectEqual(@as(usize, if (n == 100) 1 else 3), std.mem.count(u8, r.out, "\n"));
+        // Every id is somewhere in what would be sent.
+        for (store.items) |id| try std.testing.expect(std.mem.indexOf(u8, r.out, id) != null);
+    }
+}
+
+test "more ids than a command line can hold is refused, not cut" {
+    const gpa = std.testing.allocator;
+    const n = filterflags.max_keys + 1;
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(gpa);
+    const id = "ab" ** 32;
+    for (0..n) |_| {
+        try args.append(gpa, "-i");
+        try args.append(gpa, id);
+    }
+    var ob: [64]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    const r = try runReq(args.items, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "too many ids") != null);
 }
 
 test "combining flags that cannot go together is a usage error" {

@@ -14,6 +14,7 @@ const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const dial = @import("dial.zig");
 const auth = @import("auth.zig");
+const relayset = @import("relayset.zig");
 
 const hex = nostr.hex;
 const relay = nostr.relay;
@@ -147,7 +148,7 @@ pub fn run(
     // Dialled when the first event that checks out arrives, not before. Empty
     // or unreadable input has nothing to publish, and opens no connection.
     var set: Set = undefined;
-    set.init(gpa, io, urls.items, auth_opts);
+    set.init(gpa, io, "publish", urls.items, auth_opts);
     defer set.deinit();
 
     // Every record is something the caller asked to have published, whether
@@ -219,6 +220,36 @@ pub fn run(
     return cli.exit_ok;
 }
 
+/// Offers one signed event to `urls` and says whether any relay accepted it.
+/// The shared publisher for the verbs that sign something themselves: one
+/// reader per relay, the relays asked at once, every answer written to `err`
+/// under `verb`. At most `dial.max_relays` relays are used.
+pub fn publishOne(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    verb: []const u8,
+    urls: []const []const u8,
+    ev: nostr.event.Event,
+    timeout_ms: i64,
+    err: *std.Io.Writer,
+) !bool {
+    const id = try hex.encode(gpa, &ev.id);
+    defer gpa.free(id);
+    var set: Set = undefined;
+    set.init(gpa, io, verb, urls[0..@min(urls.len, dial.max_relays)], null);
+    defer set.deinit();
+    try set.ready(@min(dial.default_timeout_ms, timeout_ms), err);
+    if (set.live() == 0) {
+        try err.print("deed {s}: {s}: not published, no relay could be reached\n", .{ verb, id });
+        try err.flush();
+        return false;
+    }
+    const accepted = try set.offer(ev, id, timeout_ms, err);
+    try set.reportAll(err);
+    try err.flush();
+    return accepted;
+}
+
 /// The relays one run publishes to.
 ///
 /// Each connected relay has its own reader for the whole run. It answers pings,
@@ -230,6 +261,8 @@ pub fn run(
 const Set = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// The verb the messages are written under: `publish`, `post`, `profile set`.
+    verb: []const u8,
     urls: []const []const u8,
     conns: [dial.max_relays]?*relay.Relay,
     state: [dial.max_relays]State,
@@ -290,10 +323,11 @@ const Set = struct {
         },
     };
 
-    fn init(self: *Set, gpa: std.mem.Allocator, io: std.Io, urls: []const []const u8, auth_opts: ?auth.Options) void {
+    fn init(self: *Set, gpa: std.mem.Allocator, io: std.Io, verb: []const u8, urls: []const []const u8, auth_opts: ?auth.Options) void {
         self.* = .{
             .gpa = gpa,
             .io = io,
+            .verb = verb,
             .urls = urls,
             .conns = @splat(null),
             .state = @splat(.idle),
@@ -367,7 +401,7 @@ const Set = struct {
     fn drop(self: *Set, i: usize, next: State, err: *std.Io.Writer) !void {
         const unreadable = self.release(i);
         self.state[i] = next;
-        try reportUnreadable(err, self.urls[i], unreadable);
+        try reportUnreadable(err, self.verb, self.urls[i], unreadable);
     }
 
     fn startReader(self: *Set, i: usize) !void {
@@ -465,7 +499,7 @@ const Set = struct {
                     .lost => try self.drop(h.index, .closed, err),
                     .challenge => |t| try self.keepChallenge(h.index, t),
                     .notice => |t| try self.printNotice(err, h.index, t),
-                    .more_notices => try err.print("deed publish: {s}: more notices, not shown\n", .{self.urls[h.index]}),
+                    .more_notices => try err.print("deed {s}: {s}: more notices, not shown\n", .{ self.verb, self.urls[h.index] }),
                     .ok, .deadline => {},
                 }
             }
@@ -505,11 +539,11 @@ const Set = struct {
         };
         for (outcomes[0..which.len], which) |o, i| switch (o) {
             .connected => self.startReader(i) catch |e| {
-                try err.print("deed publish: {s}: {s}\n", .{ self.urls[i], @errorName(e) });
+                try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], @errorName(e) });
                 try self.drop(i, .gone, err);
             },
-            .failed => |e| try err.print("deed publish: {s}: {s}\n", .{ self.urls[i], @errorName(e) }),
-            .timed_out => try err.print("deed publish: {s}: no answer within {d} ms\n", .{ self.urls[i], bound_ms }),
+            .failed => |e| try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], @errorName(e) }),
+            .timed_out => try err.print("deed {s}: {s}: no answer within {d} ms\n", .{ self.verb, self.urls[i], bound_ms }),
         };
     }
 
@@ -609,13 +643,13 @@ const Set = struct {
                 if (late[i]) {
                     // Still sending at the deadline. Whatever reached the
                     // socket is half a frame, so this connection is done.
-                    try err.print("deed publish: {s}: {s}: could not send within {d} ms\n", .{ id, self.urls[i], timeout_ms });
+                    try err.print("deed {s}: {s}: {s}: could not send within {d} ms\n", .{ self.verb, id, self.urls[i], timeout_ms });
                     try self.drop(i, stalled, err);
                 } else if (send_failed) |f| {
                     f[i] = e;
                     try self.drop(i, .closed, err);
                 } else {
-                    try err.print("deed publish: {s}: {s}: {s}\n", .{ id, self.urls[i], @errorName(e) });
+                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], @errorName(e) });
                     try self.drop(i, .closed, err);
                 }
             }
@@ -661,7 +695,7 @@ const Set = struct {
                     continue;
                 }
             }
-            try err.print("deed publish: {s}: {s}: {s}\n", .{ id, self.urls[i], @errorName(e) });
+            try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], @errorName(e) });
         }
 
         self.seq += 1;
@@ -682,7 +716,7 @@ const Set = struct {
             if (h.what == .deadline) {
                 if (h.what.deadline != self.seq) continue;
                 for (0..self.urls.len) |i| {
-                    if (waiting[i]) try err.print("deed publish: {s}: {s}: no answer within {d} ms\n", .{ id, self.urls[i], timeout_ms });
+                    if (waiting[i]) try err.print("deed {s}: {s}: {s}: no answer within {d} ms\n", .{ self.verb, id, self.urls[i], timeout_ms });
                 }
                 break;
             }
@@ -699,7 +733,7 @@ const Set = struct {
                             // is offering it.
                             try self.sendSome(&.{i}, ev, .event, id, deadline, timeout_ms, .closed, &waiting, null, err);
                         } else {
-                            try err.print("deed publish: {s}: {s}: authentication refused: ", .{ id, url });
+                            try err.print("deed {s}: {s}: {s}: authentication refused: ", .{ self.verb, id, url });
                             try writeEscaped(err, o.message);
                             try err.writeAll("\n");
                         }
@@ -710,7 +744,7 @@ const Set = struct {
                     if (!waiting[i] or !std.mem.eql(u8, &o.id, &ev.id)) continue;
                     if (!o.accepted and self.auth != null and !auth_tried[i] and auth.isAuthRequired(o.message)) {
                         auth_tried[i] = true;
-                        try err.print("deed publish: {s}: {s}: authenticating\n", .{ id, url });
+                        try err.print("deed {s}: {s}: {s}: authenticating\n", .{ self.verb, id, url });
                         if (self.challenge[i] != null) {
                             auth_id[i] = try self.authenticate(i, id, deadline, timeout_ms, &waiting, err);
                         } else {
@@ -721,7 +755,7 @@ const Set = struct {
                     }
                     waiting[i] = false;
                     if (o.accepted) accepted = true;
-                    try err.print("deed publish: {s}: {s}: {s}", .{ id, url, if (o.accepted) "accepted" else "refused: " });
+                    try err.print("deed {s}: {s}: {s}: {s}", .{ self.verb, id, url, if (o.accepted) "accepted" else "refused: " });
                     if (o.accepted and o.message.len > 0) {
                         try err.writeAll(" (");
                         try writeEscaped(err, o.message);
@@ -739,7 +773,7 @@ const Set = struct {
                     }
                 },
                 .notice => |t| try self.printNotice(err, i, t),
-                .more_notices => try err.print("deed publish: {s}: more notices, not shown\n", .{url}),
+                .more_notices => try err.print("deed {s}: {s}: more notices, not shown\n", .{ self.verb, url }),
                 .lost => |why| {
                     const was_waiting = waiting[i];
                     waiting[i] = false;
@@ -760,9 +794,9 @@ const Set = struct {
                         }
                     }
                     if (why) |e| {
-                        try err.print("deed publish: {s}: {s}: {s}\n", .{ id, url, @errorName(e) });
+                        try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, url, @errorName(e) });
                     } else {
-                        try err.print("deed publish: {s}: {s}: closed before answering\n", .{ id, url });
+                        try err.print("deed {s}: {s}: {s}: closed before answering\n", .{ self.verb, id, url });
                     }
                 },
                 .deadline => unreachable,
@@ -831,9 +865,9 @@ const Set = struct {
                     if (!pending[i]) continue;
                     self.pre_authed[i] = true;
                     if (auth_id[i] == null) {
-                        try err.print("deed publish: {s}: no authentication challenge within {d} ms, publishing without one\n", .{ self.urls[i], bound_ms });
+                        try err.print("deed {s}: {s}: no authentication challenge within {d} ms, publishing without one\n", .{ self.verb, self.urls[i], bound_ms });
                     } else {
-                        try err.print("deed publish: {s}: no answer to authentication within {d} ms\n", .{ self.urls[i], bound_ms });
+                        try err.print("deed {s}: {s}: no answer to authentication within {d} ms\n", .{ self.verb, self.urls[i], bound_ms });
                     }
                 }
                 break;
@@ -854,13 +888,13 @@ const Set = struct {
                     pending[i] = false;
                     self.pre_authed[i] = true;
                     if (!o.accepted) {
-                        try err.print("deed publish: {s}: authentication refused: ", .{self.urls[i]});
+                        try err.print("deed {s}: {s}: authentication refused: ", .{ self.verb, self.urls[i] });
                         try writeEscaped(err, o.message);
                         try err.writeAll("\n");
                     }
                 },
                 .notice => |t| try self.printNotice(err, i, t),
-                .more_notices => try err.print("deed publish: {s}: more notices, not shown\n", .{self.urls[i]}),
+                .more_notices => try err.print("deed {s}: {s}: more notices, not shown\n", .{ self.verb, self.urls[i] }),
                 .lost => {
                     pending[i] = false;
                     try self.drop(i, .closed, err);
@@ -871,7 +905,7 @@ const Set = struct {
     }
 
     fn printNotice(self: *Set, err: *std.Io.Writer, i: usize, text: []const u8) !void {
-        try err.print("deed publish: {s}: notice: ", .{self.urls[i]});
+        try err.print("deed {s}: {s}: notice: ", .{ self.verb, self.urls[i] });
         try writeEscaped(err, text);
         try err.writeAll("\n");
     }
@@ -879,7 +913,7 @@ const Set = struct {
     fn reportAll(self: *Set, err: *std.Io.Writer) !void {
         for (0..self.urls.len) |i| {
             if (self.conns[i] == null) continue;
-            try reportUnreadable(err, self.urls[i], self.release(i));
+            try reportUnreadable(err, self.verb, self.urls[i], self.release(i));
         }
     }
 };
@@ -901,8 +935,8 @@ const challenge_wait_ms: i64 = 3_000;
 /// and sent the event again.
 const min_resend_ms = 250;
 
-fn reportUnreadable(err: *std.Io.Writer, url: []const u8, n: u64) !void {
-    if (n > 0) try err.print("deed publish: {s}: skipped {d} unreadable {s}\n", .{ url, n, if (n == 1) "message" else "messages" });
+fn reportUnreadable(err: *std.Io.Writer, verb: []const u8, url: []const u8, n: u64) !void {
+    if (n > 0) try err.print("deed {s}: {s}: skipped {d} unreadable {s}\n", .{ verb, url, n, if (n == 1) "message" else "messages" });
 }
 
 /// Milliseconds until `deadline`, never below zero.
@@ -912,27 +946,7 @@ fn msLeft(io: std.Io, deadline: std.Io.Clock.Timestamp) i64 {
     return @intCast(@min(@divFloor(left, std.time.ns_per_ms), std.math.maxInt(i64)));
 }
 
-/// Writes text a relay sent, with every control character shown as an escape:
-/// C0 and DEL as `\xNN`, and C1 (U+0080 to U+009F) as `\u00NN`.
-///
-/// A relay chooses these bytes. Printed raw, a newline would let it write a
-/// line of its own that looks like one of these, such as a relay claiming to
-/// have accepted an event, and a control sequence would reach the terminal.
-/// C1 matters because some terminals read U+009B as the start of one.
-fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        const c = text[i];
-        if (c < 0x20 or c == 0x7f) {
-            try w.print("\\x{x:0>2}", .{c});
-        } else if (c == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f) {
-            try w.print("\\u00{x:0>2}", .{text[i + 1]});
-            i += 1;
-        } else {
-            try w.writeByte(c);
-        }
-    }
-}
+const writeEscaped = relayset.writeEscaped;
 
 // ---------------------------------------------------------------------------
 // Tests: the real command, against real relays on loopback.

@@ -248,4 +248,24 @@ test {
     _ = @import("cmd_verify.zig");
     _ = @import("verbs.zig");
     _ = @import("filterflags.zig");
+    _ = @import("auth.zig");
+    _ = @import("cmd_admin.zig");
+    _ = @import("cmd_blossom.zig");
+    _ = @import("cmd_bunker.zig");
+    _ = @import("cmd_count.zig");
+    _ = @import("cmd_curl.zig");
+    _ = @import("cmd_filter.zig");
+    _ = @import("cmd_gift.zig");
+    _ = @import("cmd_kind.zig");
+    _ = @import("cmd_post.zig");
+    _ = @import("cmd_profile.zig");
+    _ = @import("cmd_relay.zig");
+    _ = @import("cmd_relays.zig");
+    _ = @import("cmd_serve.zig");
+    _ = @import("cmd_store.zig");
+    _ = @import("cmd_sync.zig");
+    _ = @import("kinds.zig");
+    _ = @import("outbox.zig");
+    _ = @import("parallel.zig");
+    _ = @import("password.zig");
 }

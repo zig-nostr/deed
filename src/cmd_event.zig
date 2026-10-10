@@ -323,7 +323,13 @@ pub fn run(
         var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
         var input = cli.Input.init(&.{}, &stdin_reader.interface);
 
-        while (try input.next()) |record| {
+        // Without --pow, drafts are signed in chunks on every core. With it,
+        // each event is already mined on `--pow-threads` threads, so another
+        // layer of workers would only oversubscribe the cores: that path signs
+        // one event at a time, as it always did.
+        if (ov.pow == 0) {
+            failures += try signStream(gpa, io, signer, keypair, ov, &sink, &input, err);
+        } else while (try input.next()) |record| {
             const json = switch (record) {
                 // Trimmed here rather than in `Input`: surrounding space around
                 // a draft is noise, and `deed encrypt` needs the same bytes it was given.
@@ -396,6 +402,8 @@ const Sink = struct {
     ov: Overrides,
     out: *std.Io.Writer,
     pending: ?*std.ArrayList([]const u8),
+    /// False while a chunk is being delivered: the caller flushes once after it.
+    flush_each: bool = true,
 
     fn add(self: *Sink, json: []const u8) !void {
         if (self.pending) |p| {
@@ -422,7 +430,7 @@ const Sink = struct {
             defer self.gpa.free(code);
             try self.out.print("{s}\n", .{code});
         }
-        try self.out.flush();
+        if (self.flush_each) try self.out.flush();
     }
 };
 
@@ -547,6 +555,31 @@ fn tagOf(arena: std.mem.Allocator, parts: []const []const u8) ShortcutError!even
     return arena.dupe([]const u8, parts) catch error.OutOfMemory;
 }
 
+/// The signed event for a draft, as JSON allocated from `a`. No proof of work.
+/// Touches nothing shared but the read-only overrides, so any thread may call
+/// it, each with a signer of its own.
+fn signDraft(
+    a: std.mem.Allocator,
+    io: std.Io,
+    signer: keys.Signer,
+    keypair: keys.KeyPair,
+    draft: Draft,
+    ov: Overrides,
+) ![]u8 {
+    const kind = ov.kind orelse draft.kind orelse 1;
+    const content = ov.content orelse draft.content orelse "";
+    const created_at = ov.created_at orelse draft.created_at orelse
+        std.Io.Timestamp.now(io, .real).toSeconds();
+    const tags: []const event.Tag = if (ov.tags_given)
+        ov.tags
+    else if (draft.tags) |t|
+        t
+    else
+        &.{};
+    const ev = try event.create(a, signer, keypair, created_at, kind, tags, content, null);
+    return event.toJson(a, ev);
+}
+
 fn emit(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -576,8 +609,7 @@ fn emit(
         &.{};
 
     if (ov.pow == 0) {
-        const ev = try event.create(a, signer, keypair, created_at, kind, tags, content, null);
-        const json = try event.toJson(a, ev);
+        const json = try signDraft(a, io, signer, keypair, draft, ov);
         try sink.add(json);
         return;
     }
@@ -606,6 +638,213 @@ fn emit(
     ev.sig = signer.signId(ev.id, keypair, null) catch return error.PowFailed;
     const json = try event.toJson(a, ev);
     try sink.add(json);
+}
+
+/// A chunk closes at this many records or bytes, whichever comes first.
+const chunk_records = 64;
+const chunk_bytes = 256 * 1024;
+
+const Outcome = struct {
+    const Tag = enum { ok, too_long, not_draft, fatal };
+    tag: Tag = .ok,
+    /// For `ok`, where the event JSON sits in the chunk's `signed`.
+    start: usize = 0,
+    len: usize = 0,
+    /// Static, from `@errorName`.
+    error_name: []const u8 = "",
+    fatal: anyerror = error.Unexpected,
+};
+
+const Entry = struct { start: usize, len: usize, too_long: bool };
+
+/// A batch of drafts and, once processed, what became of each.
+const Chunk = struct {
+    gpa: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
+    outcomes: std.ArrayList(Outcome) = .empty,
+    signed: std.ArrayList(u8) = .empty,
+    /// Scratch for parsing and signing; reset after every record.
+    arena: std.heap.ArenaAllocator,
+    /// A signing context of this chunk's own. A context is not safe to sign
+    /// with from two threads, and a chunk is on one thread at a time.
+    signer: ?keys.Signer = null,
+    /// Set only on the caller's local chunk, which signs with the run's signer.
+    use_main: bool = false,
+
+    fn init(gpa: std.mem.Allocator) Chunk {
+        return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+
+    fn deinit(self: *Chunk) void {
+        self.bytes.deinit(self.gpa);
+        self.entries.deinit(self.gpa);
+        self.outcomes.deinit(self.gpa);
+        self.signed.deinit(self.gpa);
+        self.arena.deinit();
+        if (self.signer) |*s| s.deinit();
+    }
+
+    fn deinitPtr(self: *Chunk) void {
+        self.deinit();
+    }
+
+    fn reset(self: *Chunk) void {
+        self.bytes.clearRetainingCapacity();
+        self.entries.clearRetainingCapacity();
+        self.outcomes.clearRetainingCapacity();
+        self.signed.clearRetainingCapacity();
+    }
+
+    fn add(self: *Chunk, json: []const u8) !void {
+        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = json.len, .too_long = false });
+        try self.bytes.appendSlice(self.gpa, json);
+    }
+
+    fn addTooLong(self: *Chunk) !void {
+        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = 0, .too_long = true });
+    }
+};
+
+const StreamCtx = struct {
+    io: std.Io,
+    main_signer: keys.Signer,
+    keypair: keys.KeyPair,
+    ov: Overrides,
+    sink: *Sink,
+    err: *std.Io.Writer,
+    failures: usize = 0,
+
+    /// Parses and signs every draft of the chunk. Runs on any thread.
+    pub fn process(self: *StreamCtx, chunk: *Chunk) void {
+        const a = chunk.arena.allocator();
+        var signer = self.main_signer;
+        if (!chunk.use_main) {
+            if (chunk.signer == null) chunk.signer = keys.Signer.initRandomized(self.io) catch null;
+            if (chunk.signer) |s| signer = s;
+        }
+        const signer_failed = !chunk.use_main and chunk.signer == null;
+        for (chunk.entries.items, chunk.outcomes.items) |entry, *out| {
+            out.* = .{};
+            if (entry.too_long) {
+                out.tag = .too_long;
+                continue;
+            }
+            if (signer_failed) {
+                out.tag = .fatal;
+                out.fatal = error.ContextRandomizationFailed;
+                continue;
+            }
+            defer _ = chunk.arena.reset(.retain_capacity);
+            const json = chunk.bytes.items[entry.start..][0..entry.len];
+            const draft = std.json.parseFromSliceLeaky(
+                Draft,
+                a,
+                json,
+                .{ .ignore_unknown_fields = true },
+            ) catch |e| {
+                out.tag = .not_draft;
+                out.error_name = @errorName(e);
+                continue;
+            };
+            const signed = signDraft(a, self.io, signer, self.keypair, draft, self.ov) catch |e| {
+                out.tag = .fatal;
+                out.fatal = e;
+                continue;
+            };
+            out.start = chunk.signed.items.len;
+            out.len = signed.len;
+            chunk.signed.appendSlice(chunk.gpa, signed) catch {
+                out.tag = .fatal;
+                out.fatal = error.OutOfMemory;
+            };
+        }
+    }
+
+    /// Prints the chunk's events and failures in draft order, on the caller's thread.
+    pub fn deliver(self: *StreamCtx, chunk: *Chunk) !void {
+        self.sink.flush_each = false;
+        defer self.sink.flush_each = true;
+        for (chunk.outcomes.items) |out| switch (out.tag) {
+            .ok => try self.sink.add(chunk.signed.items[out.start..][0..out.len]),
+            .too_long => {
+                try self.err.print(
+                    "deed event: skipped a draft longer than {d} bytes\n",
+                    .{max_record_bytes},
+                );
+                self.failures += 1;
+            },
+            .not_draft => {
+                try self.err.print("deed event: not a draft: {s}\n", .{out.error_name});
+                self.failures += 1;
+            },
+            .fatal => return out.fatal,
+        };
+        try self.sink.out.flush();
+    }
+};
+
+const Pool = parallel.Ordered(Chunk, StreamCtx);
+
+/// Signs the drafts on stdin and returns how many were skipped. A stream that
+/// ends inside the first chunk is signed on this thread, so one draft pays for
+/// no thread at all. Past that, chunks go to a pool with one worker per core
+/// and come back in input order, so output and diagnostics read exactly as
+/// they would from a single thread.
+fn signStream(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    signer: keys.Signer,
+    keypair: keys.KeyPair,
+    ov: Overrides,
+    sink: *Sink,
+    input: *cli.Input,
+    err: *std.Io.Writer,
+) !usize {
+    var ctx: StreamCtx = .{ .io = io, .main_signer = signer, .keypair = keypair, .ov = ov, .sink = sink, .err = err };
+
+    var local = Chunk.init(gpa);
+    defer local.deinit();
+    var pool: ?*Pool = null;
+    defer if (pool) |p| p.deinit(Chunk.deinitPtr);
+
+    var read_error: ?anyerror = null;
+    var eof = false;
+    while (!eof) {
+        local.reset();
+        while (local.entries.items.len < chunk_records and local.bytes.items.len < chunk_bytes) {
+            const record = input.next() catch |e| {
+                read_error = e;
+                eof = true;
+                break;
+            } orelse {
+                eof = true;
+                break;
+            };
+            switch (record) {
+                // Trimmed here rather than in `Input`: surrounding space around
+                // a draft is noise, and `deed encrypt` needs the same bytes it was given.
+                .line => |l| try local.add(std.mem.trim(u8, l, " \t")),
+                .too_long => try local.addTooLong(),
+            }
+        }
+        if (local.entries.items.len == 0) break;
+        try local.outcomes.resize(gpa, local.entries.items.len);
+
+        if (pool == null and eof) {
+            local.use_main = true;
+            ctx.process(&local);
+            try ctx.deliver(&local);
+            break;
+        }
+        if (pool == null) pool = try Pool.init(gpa, io, &ctx, .{}, Chunk.init);
+        const slot = try pool.?.acquire();
+        std.mem.swap(Chunk, slot, &local);
+        try pool.?.submit();
+    }
+    if (pool) |p| try p.finish();
+    if (read_error) |e| return e;
+    return ctx.failures;
 }
 
 /// Prints why an event was not made and returns the exit code for it.
@@ -971,4 +1210,116 @@ test "pow: a mined event is published to a relay that accepts it" {
     try std.testing.expectEqual(cli.exit_ok, r.code);
     try std.testing.expect(has(r.out, "\"nonce\",\""));
     try std.testing.expect(has(r.err, ": accepted"));
+}
+
+/// Drafts `i` in 0..n, one with a tag so the tag path is exercised too.
+fn testDrafts(arena: std.mem.Allocator, n: usize, bad_at: ?usize) ![]const u8 {
+    var buf: std.Io.Writer.Allocating = .init(arena);
+    for (0..n) |i| {
+        if (bad_at != null and i == bad_at.?) {
+            try buf.writer.writeAll("{not json\n");
+            continue;
+        }
+        try buf.writer.print(
+            "{{\"kind\":{d},\"created_at\":{d},\"content\":\"draft {d}\",\"tags\":[[\"t\",\"x{d}\"]]}}\n",
+            .{ 1 + i % 3, 1700000000 + i, i, i },
+        );
+    }
+    return buf.written();
+}
+
+fn streamTest(
+    arena: std.mem.Allocator,
+    input_text: []const u8,
+    out: *std.Io.Writer,
+    ov_in: Overrides,
+) !usize {
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const sk = try keyinput.secretKey(arena, test_sec);
+    const keypair = try signer.keyPairFromSecretKey(sk);
+    var sink = Sink{ .gpa = std.testing.allocator, .ov = ov_in, .out = out, .pending = null };
+    var reader: std.Io.Reader = .fixed(input_text);
+    var input = cli.Input.init(&.{}, &reader);
+    return signStream(std.testing.allocator, std.testing.io, signer, keypair, ov_in, &sink, &input, out);
+}
+
+test "10000 drafts signed in parallel keep their order and carry valid signatures" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+
+    const n = 10_000;
+    const text = try testDrafts(arena, n, null);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const skipped = try streamTest(arena, text, &out.writer, .{});
+    try std.testing.expectEqual(@as(usize, 0), skipped);
+
+    // Sequential reference: signing is deterministic here, so the bytes match.
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const sk = try keyinput.secretKey(arena, test_sec);
+    const keypair = try signer.keyPairFromSecretKey(sk);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var got = std.mem.splitScalar(u8, out.written(), '\n');
+    var count: usize = 0;
+    while (lines.next()) |l| {
+        if (l.len == 0) continue;
+        const draft = try std.json.parseFromSliceLeaky(Draft, arena, l, .{ .ignore_unknown_fields = true });
+        const want = try signDraft(arena, std.testing.io, signer, keypair, draft, .{});
+        const line = got.next().?;
+        try std.testing.expectEqualStrings(want, line);
+        var parsed = try event.fromJson(std.testing.allocator, line);
+        defer parsed.deinit();
+        try std.testing.expect(try event.verify(std.testing.allocator, signer, parsed.value));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, n), count);
+    try std.testing.expectEqualStrings("", got.next().?);
+}
+
+test "a bad draft in the middle is reported at its place in the output" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+
+    const text = try testDrafts(arena, 500, 250);
+    // One writer for both streams, so the position of the message is visible.
+    var both: std.Io.Writer.Allocating = .init(arena);
+    const skipped = try streamTest(arena, text, &both.writer, .{});
+    try std.testing.expectEqual(@as(usize, 1), skipped);
+
+    var it = std.mem.splitScalar(u8, both.written(), '\n');
+    var i: usize = 0;
+    while (it.next()) |l| {
+        if (l.len == 0) continue;
+        if (i == 250) {
+            try std.testing.expect(std.mem.startsWith(u8, l, "deed event: not a draft: "));
+        } else {
+            const want_content = try std.fmt.allocPrint(arena, "\"draft {d}\"", .{i});
+            try std.testing.expect(has(l, want_content));
+        }
+        i += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 500), i);
+}
+
+test "a small stream signs on the calling thread and matches the sequential bytes" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+
+    const text = try testDrafts(arena, 3, null);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    _ = try streamTest(arena, text, &out.writer, .{});
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    var n: usize = 0;
+    while (lines.next()) |l| {
+        if (l.len == 0) continue;
+        try std.testing.expect(has(l, test_pk));
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
 }
