@@ -41,8 +41,6 @@ pub const Options = struct {
     /// is survivable at an interactive prompt and not in a script, which is
     /// where a command line spends most of its life.
     deadline_ms: i64,
-    /// Not used. Every relay has its own reader now, so nothing polls.
-    poll_ms: i64 = 0,
     /// Every event that arrives is written here before it is printed.
     store: ?*nostr.store.Store = null,
     /// Answer NIP-42 challenges with this key. Null answers none.
@@ -61,6 +59,9 @@ pub const Outcome = struct {
     events: usize = 0,
     /// Relays that reached EOSE before the deadline.
     complete: usize = 0,
+    /// The store could not take a batch. Nothing from that batch or after it
+    /// was printed, because printing comes after storing; the run has failed.
+    store_failed: bool = false,
 };
 
 const max_relays = dial.max_relays;
@@ -92,7 +93,13 @@ const Pending = struct {
         var outcomes: [batch_max]nostr.store.IngestResult = undefined;
         for (self.msgs.items, 0..) |m, i| events[i] = m.value.event.event;
         const n = self.msgs.items.len;
-        store.ingestBatch(gpa, events[0..n], .{}, outcomes[0..n]) catch {};
+        // Once the store has failed, nothing more is printed: an event shown
+        // but not kept is what storing first is there to prevent.
+        if (result.store_failed) return;
+        store.ingestBatch(gpa, events[0..n], .{}, outcomes[0..n]) catch {
+            result.store_failed = true;
+            return;
+        };
         for (events[0..n]) |ev| {
             const json = try nostr.event.toJson(gpa, ev);
             defer gpa.free(json);
@@ -513,10 +520,16 @@ pub fn query(
                     if (opts.until_eose) finish(&sh, &live, &live_count, i);
                 },
                 .closed => |c| {
-                    try err.print("deed: a relay closed the subscription: {s}\n", .{c.message});
+                    try err.writeAll("deed: a relay closed the subscription: ");
+                    try writeEscaped(err, c.message);
+                    try err.writeAll("\n");
                     finish(&sh, &live, &live_count, i);
                 },
-                .notice => |notice| try err.print("deed: notice: {s}\n", .{notice.message}),
+                .notice => |notice| {
+                    try err.writeAll("deed: notice: ");
+                    try writeEscaped(err, notice.message);
+                    try err.writeAll("\n");
+                },
                 // A relay asking for NIP-42 when this run has no key to answer
                 // with. Saying so beats looking like a relay with nothing to say.
                 .auth => try err.print("deed: a relay wants authentication, which needs --auth\n", .{}),
@@ -525,7 +538,9 @@ pub fn query(
             },
             .authenticating => try err.print("deed: {s}: authenticating\n", .{url}),
             .auth_refused => |t| {
-                try err.print("deed: {s}: authentication refused: {s}\n", .{ url, t });
+                try err.print("deed: {s}: authentication refused: ", .{url});
+                try writeEscaped(err, t);
+                try err.writeAll("\n");
                 finish(&sh, &live, &live_count, i);
             },
             .no_challenge => try err.print("deed: {s}: no authentication challenge within {d} ms, asking without one\n", .{ url, sh.challenge_wait_ms }),
@@ -546,7 +561,30 @@ pub fn query(
     }
 
     if (opts.store) |st| try pending.flush(gpa, st, out, &result);
+    if (result.store_failed) try err.writeAll("deed: the store could not be written, so events from that point were not printed\n");
     return result;
+}
+
+/// Writes text a relay sent, with every control character shown as an escape:
+/// C0 and DEL as `\xNN`, and C1 (U+0080 to U+009F) as `\u00NN`.
+///
+/// A relay chooses these bytes. Printed raw, a newline would let it write a
+/// line of its own that looks like one of these, such as a relay claiming to
+/// have accepted an event, and a control sequence would reach the terminal.
+/// C1 matters because some terminals read U+009B as the start of one.
+pub fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c < 0x20 or c == 0x7f) {
+            try w.print("\\x{x:0>2}", .{c});
+        } else if (c == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f) {
+            try w.print("\\u00{x:0>2}", .{text[i + 1]});
+            i += 1;
+        } else {
+            try w.writeByte(c);
+        }
+    }
 }
 
 /// Relay `i` is done: its reader is stopped, and what it already handed over
@@ -586,7 +624,7 @@ test "a relay that never answers the dial costs the run its deadline, not foreve
     var err: std.Io.Writer = .fixed(&err_buf);
 
     const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    const outcome = try query(gpa, io, &urls, &filters, &out, &err, .{ .deadline_ms = 500, .poll_ms = 50 });
+    const outcome = try query(gpa, io, &urls, &filters, &out, &err, .{ .deadline_ms = 500 });
     const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
 
     try std.testing.expectEqual(@as(usize, 1), outcome.dialled);
@@ -636,11 +674,89 @@ test "events kept in a store are written in batches, and every one is stored and
     var out: std.Io.Writer.Allocating = .init(arena);
     var err: std.Io.Writer.Allocating = .init(arena);
     const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
-    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 10_000, .poll_ms = 50, .store = &st });
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 10_000, .store = &st });
 
     try std.testing.expectEqual(@as(usize, n), outcome.events);
     try std.testing.expectEqual(@as(usize, n), std.mem.count(u8, out.written(), "\n"));
     try std.testing.expectEqual(@as(usize, n), try st.eventCount());
+}
+
+test "text a relay sends is shown with its control characters escaped" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Hostile = struct {
+        fn handle(_: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+            if (std.mem.indexOf(u8, frame, "\"REQ\"") == null) return;
+            try testrelay.sendText(w, "[\"NOTICE\",\"hi\\u001b[31m\\nfake line\"]");
+            try testrelay.sendText(w, "[\"CLOSED\",\"deed\",\"bye\\u001b[2J\"]");
+        }
+    };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, Hostile.handle, null);
+    defer r.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, r.port());
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    _ = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 2_000 });
+    try std.testing.expect(std.mem.indexOfScalar(u8, err.written(), 0x1b) == null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "fake line") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, err.written(), "\n"));
+}
+
+test "a store that cannot take a batch prints nothing for it and says so" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    // Together far more than the map below can hold.
+    const serving = try arena.alloc([]const u8, 60);
+    for (serving, 0..) |*ev, i| {
+        const body = try arena.alloc(u8, 8_000);
+        @memset(body, 'x');
+        _ = try std.fmt.bufPrint(body, "{d}", .{i});
+        const e = try nostr.event.create(arena, signer, kp, 1_700_000_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+        ev.* = try nostr.event.toJson(arena, e);
+    }
+    var relay_: testrelay.Relay = undefined;
+    try relay_.start(io, .serve);
+    relay_.serving = serving;
+    defer relay_.stop(io);
+    var buf: [40]u8 = undefined;
+    const urls = [_][]const u8{try testrelay.url(&buf, relay_.port())};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/store.mdb", .{dir_buf[0..dir_len]});
+    var st = try nostr.store.Store.open(path.ptr, .{ .map_size = 1 << 17 });
+    defer st.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 5_000, .store = &st });
+    try std.testing.expect(outcome.store_failed);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "the store could not be written") != null);
 }
 
 test "a relay that pings and never reads does not hold the run past its deadline" {
@@ -671,7 +787,7 @@ test "a relay that pings and never reads does not hold the run past its deadline
     defer err.deinit();
 
     const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 1000, .poll_ms = 50, .until_eose = true });
+    const outcome = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 1000, .until_eose = true });
     const took = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
 
     try std.testing.expectEqual(@as(usize, 1), outcome.complete);
@@ -699,7 +815,7 @@ test "relays past the most one run dials are named as left out, not dropped quie
     defer out.deinit();
     var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err.deinit();
-    _ = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 500, .poll_ms = 50 });
+    _ = try query(gpa, io, &urls, &filters, &out.writer, &err.writer, .{ .deadline_ms = 500 });
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "deed: 33 relays were named, and only the first 32 are asked\n") != null);
 }
 
@@ -720,7 +836,7 @@ const FirstWrite = struct {
 };
 
 /// One signed kind 1 event as JSON, from a fixed key.
-fn testEvent(arena: std.mem.Allocator, io: std.Io, content: []const u8) ![]const u8 {
+pub fn testEvent(arena: std.mem.Allocator, io: std.Io, content: []const u8) ![]const u8 {
     var signer = try nostr.keys.Signer.initRandomized(io);
     defer signer.deinit();
     const kp = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
@@ -774,7 +890,7 @@ test "an event from the last of five relays is printed at once, although four ne
 /// A relay that keeps its events behind NIP-42. It refuses a REQ with
 /// `auth-required:` until it gets an AUTH whose `relay` tag is `want_url` and
 /// whose challenge is its own, and serves `event` after that.
-const AuthRelay = struct {
+pub const AuthRelay = struct {
     want_url: []const u8,
     event: []const u8,
     /// Send the challenge after the refusal rather than before it.
@@ -783,9 +899,9 @@ const AuthRelay = struct {
     reqs: usize = 0,
     auths: usize = 0,
 
-    const challenge = "chal-7f3a";
+    pub const challenge = "chal-7f3a";
 
-    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+    pub fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
         const testrelay = @import("testrelay.zig");
         const self: *AuthRelay = @ptrCast(@alignCast(ctx.?));
         const a = std.heap.page_allocator;
@@ -831,7 +947,7 @@ const AuthRelay = struct {
     }
 };
 
-fn authOptions() !auth.Options {
+pub fn authOptions() !auth.Options {
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
     return .{ .keypair = try signer.keyPairFromSecretKey([_]u8{0x44} ** 32) };
@@ -963,6 +1079,39 @@ test "--force-pre-auth against a relay that sends no challenge asks without one,
     try std.testing.expect(took >= 150);
     try std.testing.expect(took < 2_000);
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "no authentication challenge within 150 ms, asking without one\n") != null);
+}
+
+test "--force-pre-auth against a relay that sends its challenge first authenticates before asking" {
+    const io = std.testing.io;
+    const testrelay = @import("testrelay.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the query leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var script: AuthRelay = .{ .want_url = undefined, .event = try testEvent(arena, io, "members only") };
+    var r: testrelay.Relay = undefined;
+    try r.startCustom(io, AuthRelay.handle, &script);
+    r.greeting = "[\"AUTH\",\"" ++ AuthRelay.challenge ++ "\"]";
+    defer r.stop(io);
+    var buf: [40]u8 = undefined;
+    const url = try testrelay.url(&buf, r.port());
+    script.want_url = url;
+
+    var opts = try authOptions();
+    opts.force_pre_auth = true;
+    const filters = [_]filter.Filter{.{ .kinds = &.{1} }};
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const outcome = try query(gpa, io, &.{url}, &filters, &out.writer, &err.writer, .{ .deadline_ms = 3_000, .auth = opts });
+
+    try std.testing.expectEqual(@as(usize, 1), outcome.events);
+    try std.testing.expectEqual(@as(usize, 1), script.auths);
+    // Asked once, after the answer, not refused first and asked again.
+    try std.testing.expectEqual(@as(usize, 1), script.reqs);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "no authentication challenge") == null);
 }
 
 test "a relay still answering at the deadline is let go, whatever its reader is doing" {

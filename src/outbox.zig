@@ -47,7 +47,6 @@ pub const Options = struct {
     /// list replaces the cached one.
     refresh: bool = false,
     timeout_ms: i64 = 10_000,
-    poll_ms: i64 = 100,
 };
 
 pub const Entry = struct {
@@ -105,6 +104,36 @@ fn appendSplit(gpa: std.mem.Allocator, list: *std.ArrayList([]const u8), text: [
 /// notes from.
 pub fn writeRelays(gpa: std.mem.Allocator, io: std.Io, pubkey: [32]u8, opts: Options, err: *std.Io.Writer) !Urls {
     return pick(gpa, io, pubkey, opts, err, .write);
+}
+
+/// The relays a verb falls back to when none was named: where `pubkey` writes,
+/// found through the relays in `extra` and `DEED_RELAYS`. Null after saying
+/// why on `err` when there is nowhere to ask, or the person lists no relay.
+pub fn followWriteRelays(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    verb: []const u8,
+    pubkey: [32]u8,
+    extra: []const []const u8,
+    store: ?*nostr.store.Store,
+    timeout_ms: i64,
+    err: *std.Io.Writer,
+) !?Urls {
+    var bootstrap: std.ArrayList([]const u8) = .empty;
+    defer bootstrap.deinit(gpa);
+    try bootstrap.appendSlice(gpa, extra);
+    try appendEnvBootstrap(gpa, &bootstrap);
+    if (bootstrap.items.len == 0) {
+        try err.print("deed {s}: name a relay, or name one to find the relays in use through (with --relay, or DEED_RELAYS)\n", .{verb});
+        return null;
+    }
+    var found = try writeRelays(gpa, io, pubkey, .{ .bootstrap = bootstrap.items, .store = store, .timeout_ms = timeout_ms }, err);
+    if (found.urls.len == 0) {
+        found.deinit();
+        try err.print("deed {s}: found no relay list to follow, so name a relay\n", .{verb});
+        return null;
+    }
+    return found;
 }
 
 /// The relays this person lists as theirs to read from: the ones to send them
@@ -206,7 +235,6 @@ fn fill(
     _ = try relayset.query(gpa, io, opts.bootstrap, &.{.{ .authors = missing.items, .kinds = &kinds }}, &out.writer, err, .{
         .until_eose = true,
         .deadline_ms = opts.timeout_ms,
-        .poll_ms = opts.poll_ms,
         .store = opts.store,
     });
 
