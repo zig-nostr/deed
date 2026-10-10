@@ -476,6 +476,15 @@ fn runSet(
         const kinds = [1]u16{0};
         const found = try post.fetchNewest(gpa, io, urls.items, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }, timeout_ms, null, err);
         current = found.parsed;
+        // The newest profile may be on the relay that did not finish. A merge
+        // built on an older one would replace it, so every relay has to have
+        // said it sent all it holds. --force-new does not waive this.
+        if (found.complete < urls.items.len) {
+            try err.print("deed profile set: only {d} of {d} relays finished sending their profile, so the current one may be newer than what was read. Nothing was written\n", .{ found.complete, urls.items.len });
+            if (current) |*c| c.deinit();
+            current = null;
+            return cli.exit_fail;
+        }
         if (current == null and !force_new) {
             if (found.dialled == 0) {
                 try err.writeAll("deed profile set: no relay answered, so the current profile could not be read. Nothing was written\n");
@@ -729,4 +738,46 @@ test "with no relay and no store, show follows the person to the relays they wri
     const code = try run(gpa, io, &.{ npub, "--relay", dir_url, "--timeout", "5000" }, &out.writer, &err.writer);
     try testing.expectEqual(cli.exit_ok, code);
     try testing.expect(std.mem.indexOf(u8, out.written(), "followed") != null);
+}
+
+test "set writes nothing when a relay did not finish sending its profile, even with --force-new" {
+    const testrelay = @import("testrelay.zig");
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the profile verb leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const fx = Fixture{};
+    var script = post.Script{ .serve = try fx.profileJson(a, io, "{\"name\":\"old\"}") };
+    var good: testrelay.Relay = undefined;
+    try good.startFor(io, .custom, 2);
+    good.custom = post.Script.handle;
+    good.custom_ctx = &script;
+    defer good.stop(io);
+    var quiet: testrelay.Relay = undefined;
+    try quiet.start(io, .silent);
+    defer quiet.stop(io);
+    var b1: [40]u8 = undefined;
+    var b2: [40]u8 = undefined;
+    const good_url = try testrelay.url(&b1, good.port());
+    const quiet_url = try testrelay.url(&b2, quiet.port());
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    for ([_][]const u8{ "--name", "--force-new" }) |extra| {
+        err.clearRetainingCapacity();
+        const args = if (std.mem.eql(u8, extra, "--name"))
+            &[_][]const u8{ "set", "--sec", "44" ** 32, "--name", "me", good_url, quiet_url, "--timeout", "800" }
+        else
+            &[_][]const u8{ "set", "--sec", "44" ** 32, "--name", "me", "--force-new", good_url, quiet_url, "--timeout", "800" };
+        const code = try run(gpa, io, args, &out.writer, &err.writer);
+        try testing.expectEqual(cli.exit_fail, code);
+        try testing.expectEqual(@as(usize, 0), script.events);
+        try testing.expect(std.mem.indexOf(u8, err.written(), "1 of 2 relays") != null);
+    }
 }
