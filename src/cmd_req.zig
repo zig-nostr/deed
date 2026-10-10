@@ -15,11 +15,16 @@ const storepath = @import("storepath.zig");
 const filter = nostr.filter;
 const message = nostr.message;
 
+/// Shown beside the name in `deed help`.
+pub const summary = "build a subscription, and run it";
+
+pub const ready = true;
+
 pub const usage =
     \\deed req: build a subscription, and run it
     \\
     \\Usage:
-    \\  deed req [options] [<relay-url>...]
+    \\  deed req [options] [<filter-json>...] [<relay-url>...]
     \\
     \\Options:
     \\  -k, --kind <n>       event kind, repeatable
@@ -28,14 +33,31 @@ pub const usage =
     \\  -e <id>              an `e` tag value, repeatable
     \\  -p <key>             a `p` tag value, repeatable
     \\  -t <topic>           a `t` tag value, repeatable
+    \\  -d <name>            a `d` tag value, repeatable
+    \\  -h <name>            an `h` tag value, repeatable
+    \\  -T, --tag <x=value>  a tag value under any one-letter name, repeatable
+    \\      --search <text>  a NIP-50 search, for relays that support it
     \\  -l, --limit <n>      how many events to ask each relay for
-    \\  -s, --since <n>      unix seconds, events at or after
-    \\  -u, --until <n>      unix seconds, events at or before
+    \\  -s, --since <time>   events at or after: unix seconds, 2h, 3d, 2026-10-01
+    \\  -u, --until <time>   events at or before: the same forms as --since
     \\      --bare           print the filter alone, without the REQ envelope
+    \\      --ids-only       print each event's id and nothing else
+    \\      --paginate       ask again for older events until a page comes back empty
+    \\      --paginate-interval <t>  wait between pages (default 0; 500, 500ms, 2s)
     \\      --store <path>   keep every event this receives in a local store
     \\      --local          answer from the store alone, dialling nothing
     \\      --stream         keep reading after the relays have sent what they hold
     \\      --timeout <ms>   give up on relays still answering (default 30000)
+    \\
+    \\A filter can also be given as JSON: as an argument that starts with {, or
+    \\on stdin when it is not a terminal (one object, several, or an array of
+    \\them). Flags are laid over each JSON filter: a field a flag sets replaces
+    \\the one in the JSON. Several filters make one subscription.
+    \\
+    \\With --paginate, --limit is the total across all pages, not a page size.
+    \\Each page asks for events older than the oldest one seen so far, and an
+    \\event two pages return is printed once. --paginate cannot be combined
+    \\with --stream or --local, and --ids-only cannot be combined with --stream.
     \\
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
@@ -51,6 +73,9 @@ pub const usage =
     \\  deed req -k 1 -l 5
     \\  ["REQ","deed",{"kinds":[1],"limit":5}]
     \\
+    \\Exits: 0 on success; 1 if a value or a filter is bad, a store cannot be
+    \\read, or no relay answered; 2 if the command line was not understood.
+    \\
 ;
 
 /// The filter a run is about, and the relays to ask.
@@ -62,6 +87,9 @@ pub const Request = struct {
     stream: bool = false,
     local: bool = false,
     timeout_ms: i64 = default_timeout_ms,
+    ids_only: bool = false,
+    paginate: bool = false,
+    paginate_interval_ms: i64 = 0,
 };
 
 /// How long a run waits on relays still answering, once they are reached.
@@ -71,11 +99,39 @@ pub const Request = struct {
 /// that a script does not hang on one gone quiet.
 pub const default_timeout_ms: i64 = 30_000;
 
+/// The most events one page asks for. Relays commonly cap a page lower than
+/// this, which is why a short page does not end a paginated run: only an
+/// empty one does.
+const page_size: u32 = 500;
+
+/// The most JSON read from stdin.
+const max_stdin_bytes = 1 << 20;
+
 const Collected = filterflags.Collected;
 
 pub const ParseError = filterflags.ParseError;
 
-/// Reads the flags into a filter. The relays are whatever is left over.
+/// A duration in milliseconds: a bare number, or one followed by `ms`, `s` or `m`.
+fn parseInterval(v: []const u8) ?i64 {
+    var digits = v;
+    var mult: i64 = 1;
+    if (std.mem.endsWith(u8, v, "ms")) {
+        digits = v[0 .. v.len - 2];
+    } else if (std.mem.endsWith(u8, v, "s")) {
+        digits = v[0 .. v.len - 1];
+        mult = 1000;
+    } else if (std.mem.endsWith(u8, v, "m")) {
+        digits = v[0 .. v.len - 1];
+        mult = 60_000;
+    }
+    const n = std.fmt.parseInt(i64, digits, 10) catch return null;
+    if (n < 0) return null;
+    return std.math.mul(i64, n, mult) catch null;
+}
+
+/// Reads the flags into a filter. The relays are whatever is left over, except
+/// an argument that starts with `{`, which is a filter in JSON and goes to
+/// `jsons`.
 ///
 /// The filter's slices point into `flags`, which the caller keeps alive.
 pub fn parse(
@@ -83,18 +139,24 @@ pub fn parse(
     args: []const []const u8,
     flags: *filterflags.Flags,
     relays: *Collected([]const u8),
+    jsons: *Collected([]const u8),
     err: *std.Io.Writer,
 ) !?Request {
     var bare = false;
     var stream = false;
     var local = false;
+    var ids_only = false;
+    var paginate = false;
+    var paginate_interval_ms: i64 = 0;
     var store_path: ?[]const u8 = null;
     var timeout_ms: i64 = default_timeout_ms;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) return null;
+        if (cli.isOneOf(a, &.{ "help", "--help" })) return null;
+        // `-h` names the `h` tag when a value follows, and asks for help alone.
+        if (std.mem.eql(u8, a, "-h") and i + 1 >= args.len) return null;
         if (std.mem.eql(u8, a, "--bare")) {
             bare = true;
             continue;
@@ -107,6 +169,21 @@ pub fn parse(
             local = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--ids-only")) {
+            ids_only = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--paginate")) {
+            paginate = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "{")) {
+            if (!jsons.push(a)) {
+                try err.writeAll("deed req: too many filters\n");
+                return ParseError.Usage;
+            }
+            continue;
+        }
         if (!std.mem.startsWith(u8, a, "-")) {
             if (!relays.push(a)) {
                 try err.writeAll("deed req: too many relays\n");
@@ -115,7 +192,8 @@ pub fn parse(
             continue;
         }
 
-        const takes_value = filterflags.isFilterFlag(a) or cli.isOneOf(a, &.{ "--store", "--timeout" });
+        const takes_value = filterflags.isFilterFlag(a) or
+            cli.isOneOf(a, &.{ "--store", "--timeout", "--paginate-interval" });
         if (!takes_value) {
             try err.print("deed req: unknown option '{s}'\n", .{a});
             return ParseError.Usage;
@@ -136,7 +214,21 @@ pub fn parse(
                 try err.print("deed req: '{s}' is not a number of milliseconds\n", .{v});
                 return ParseError.BadValue;
             };
+        } else if (std.mem.eql(u8, a, "--paginate-interval")) {
+            paginate_interval_ms = parseInterval(v) orelse {
+                try err.print("deed req: '{s}' is not a duration like 500, 500ms or 2s\n", .{v});
+                return ParseError.BadValue;
+            };
         }
+    }
+
+    if (paginate and (stream or local)) {
+        try err.writeAll("deed req: --paginate cannot be combined with --stream or --local\n");
+        return ParseError.Usage;
+    }
+    if (ids_only and stream) {
+        try err.writeAll("deed req: --ids-only cannot be combined with --stream\n");
+        return ParseError.Usage;
     }
 
     return .{
@@ -147,6 +239,9 @@ pub fn parse(
         .stream = stream,
         .local = local,
         .timeout_ms = timeout_ms,
+        .ids_only = ids_only,
+        .paginate = paginate,
+        .paginate_interval_ms = paginate_interval_ms,
     };
 }
 
@@ -158,6 +253,69 @@ pub fn parse(
 /// output people paste into issues.
 pub const subscription_id = "deed";
 
+/// The end of the JSON value that starts at `text[0]`, which must be `{` or `[`.
+fn valueEnd(text: []const u8) ?usize {
+    var depth: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Reads every top-level JSON value in `text`: an object is one filter, an
+/// array is a list of them. Slices of the filters live in `arena`.
+pub fn parseJsonFilters(
+    arena: std.mem.Allocator,
+    verb: []const u8,
+    text: []const u8,
+    list: *std.ArrayList(filter.Filter),
+    err: *std.Io.Writer,
+) !void {
+    var rest = std.mem.trim(u8, text, " \t\r\n,");
+    while (rest.len > 0) {
+        if (rest[0] != '{' and rest[0] != '[') {
+            try err.print("deed {s}: the filter is not valid JSON\n", .{verb});
+            return ParseError.BadValue;
+        }
+        const end = valueEnd(rest) orelse {
+            try err.print("deed {s}: the filter is not valid JSON\n", .{verb});
+            return ParseError.BadValue;
+        };
+        const piece = rest[0..end];
+        if (piece[0] == '{') {
+            try list.append(arena, try filterflags.parseJson(arena, verb, piece, err));
+        } else {
+            const v = std.json.parseFromSliceLeaky(std.json.Value, arena, piece, .{}) catch {
+                try err.print("deed {s}: the filter is not valid JSON\n", .{verb});
+                return ParseError.BadValue;
+            };
+            for (v.array.items) |item| {
+                try list.append(arena, try filterflags.fromValue(arena, verb, item, err));
+            }
+        }
+        rest = std.mem.trim(u8, rest[end..], " \t\r\n,");
+    }
+}
+
 pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -165,10 +323,33 @@ pub fn run(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
+    var buf: [4096]u8 = undefined;
+    // Streaming for the reason `main` gives for the writers. Stdin is only
+    // read when it is not a terminal, and only once the command line has been
+    // understood and carries no filter of its own.
+    var reader = std.Io.File.stdin().readerStreaming(io, &buf);
+    const piped = !(std.Io.File.stdin().isTty(io) catch true);
+    return runWith(gpa, io, args, if (piped) &reader.interface else null, out, err);
+}
+
+/// `run`, with the stdin to read a JSON filter from given (or none).
+pub fn runWith(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+    stdin: ?*std.Io.Reader,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     var flags: filterflags.Flags = .{};
     var relays: Collected([]const u8) = .{};
+    var jsons: Collected([]const u8) = .{};
 
-    const req = parse(gpa, args, &flags, &relays, err) catch |e| {
+    const req = parse(gpa, args, &flags, &relays, &jsons, err) catch |e| {
         return switch (e) {
             ParseError.Usage => cli.exit_usage,
             ParseError.BadValue => cli.exit_fail,
@@ -178,6 +359,48 @@ pub fn run(
         try out.writeAll(usage);
         return cli.exit_ok;
     };
+
+    // The filters: JSON given as arguments, else JSON on stdin, else the flags
+    // alone. Flags lay over whichever JSON there was.
+    var filters: std.ArrayList(filter.Filter) = .empty;
+    var parsed_ok = true;
+    parseAll: {
+        for (jsons.items[0..jsons.len]) |text| {
+            parseJsonFilters(arena, "req", text, &filters, err) catch |e| switch (e) {
+                ParseError.BadValue => {
+                    parsed_ok = false;
+                    break :parseAll;
+                },
+                else => return e,
+            };
+        }
+        if (jsons.len == 0) if (stdin) |r| {
+            const text = r.allocRemaining(arena, .limited(max_stdin_bytes)) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                error.StreamTooLong => {
+                    try err.print("deed req: the filter on stdin is longer than {d} bytes\n", .{max_stdin_bytes});
+                    return cli.exit_fail;
+                },
+                else => {
+                    try err.print("deed req: stdin could not be read: {s}\n", .{@errorName(e)});
+                    return cli.exit_fail;
+                },
+            };
+            parseJsonFilters(arena, "req", text, &filters, err) catch |e| switch (e) {
+                ParseError.BadValue => {
+                    parsed_ok = false;
+                    break :parseAll;
+                },
+                else => return e,
+            };
+        };
+    }
+    if (!parsed_ok) return cli.exit_fail;
+    if (filters.items.len == 0) {
+        try filters.append(arena, req.filter);
+    } else if (flags.any()) {
+        for (filters.items) |*f| f.* = try filterflags.overlay(arena, f.*, req.filter);
+    }
 
     // Answered from what is already kept, without dialling. This is the half
     // that makes keeping worth doing: a store nothing reads back is a log.
@@ -189,15 +412,24 @@ pub fn run(
         var st = (try storepath.open(gpa, io, "req", path, .existing, err)) orelse return cli.exit_fail;
         defer st.deinit();
 
-        var result = st.query(gpa, req.filter) catch |e| {
-            try err.print("deed req: the store could not answer: {s}\n", .{@errorName(e)});
-            return cli.exit_fail;
-        };
-        defer result.deinit();
-        for (result.events) |ev| {
-            const json = try nostr.event.toJson(gpa, ev);
-            defer gpa.free(json);
-            try out.print("{s}\n", .{json});
+        var seen = std.AutoHashMap([32]u8, void).init(gpa);
+        defer seen.deinit();
+        for (filters.items) |f| {
+            var result = st.query(gpa, f) catch |e| {
+                try err.print("deed req: the store could not answer: {s}\n", .{@errorName(e)});
+                return cli.exit_fail;
+            };
+            defer result.deinit();
+            for (result.events) |ev| {
+                if ((try seen.fetchPut(ev.id, {})) != null) continue;
+                if (req.ids_only) {
+                    try printId(gpa, out, ev.id);
+                    continue;
+                }
+                const json = try nostr.event.toJson(gpa, ev);
+                defer gpa.free(json);
+                try out.print("{s}\n", .{json});
+            }
         }
         return cli.exit_ok;
     }
@@ -205,14 +437,18 @@ pub fn run(
     // No relay named: say what would be sent, and stop. The filter is the thing
     // worth seeing before it is asked of anybody.
     if (req.relays.len == 0) {
-        const text = if (req.bare) blk: {
-            var list: std.ArrayList(u8) = .empty;
-            errdefer list.deinit(gpa);
-            try req.filter.appendJson(&list, gpa);
-            break :blk try list.toOwnedSlice(gpa);
-        } else try message.encodeReq(gpa, subscription_id, &.{req.filter});
-        defer gpa.free(text);
-        try out.print("{s}\n", .{text});
+        if (req.bare) {
+            for (filters.items) |f| {
+                var list: std.ArrayList(u8) = .empty;
+                defer list.deinit(gpa);
+                try f.appendJson(&list, gpa);
+                try out.print("{s}\n", .{list.items});
+            }
+        } else {
+            const text = try message.encodeReq(gpa, subscription_id, filters.items);
+            defer gpa.free(text);
+            try out.print("{s}\n", .{text});
+        }
         return cli.exit_ok;
     }
 
@@ -221,12 +457,17 @@ pub fn run(
     if (req.store_path) |path| {
         store = (try storepath.open(gpa, io, "req", path, .create, err)) orelse return cli.exit_fail;
     }
+    const store_ptr: ?*nostr.store.Store = if (store) |*st| st else null;
 
-    const outcome = try relayset.query(gpa, io, req.relays, &.{req.filter}, out, err, .{
+    if (req.paginate or req.ids_only) {
+        return pages(gpa, io, req, filters.items, store_ptr, out, err);
+    }
+
+    const outcome = try relayset.query(gpa, io, req.relays, filters.items, out, err, .{
         .until_eose = !req.stream,
         .deadline_ms = req.timeout_ms,
         .poll_ms = 100,
-        .store = if (store) |*st| st else null,
+        .store = store_ptr,
     });
 
     // Reaching no relay at all is a failed run. Reaching some is not: the
@@ -239,12 +480,101 @@ pub fn run(
     return cli.exit_ok;
 }
 
+fn printId(gpa: std.mem.Allocator, out: *std.Io.Writer, id: [32]u8) !void {
+    const h = try nostr.hex.encode(gpa, &id);
+    defer gpa.free(h);
+    try out.print("{s}\n", .{h});
+}
+
+/// Asks the relays page by page, or once when only the ids are wanted.
+///
+/// Each page is a whole `relayset.query` whose output is read back to learn the
+/// oldest `created_at` it held, so the next page can ask for everything before
+/// it. A page that adds nothing new ends the run, which also stops a relay that
+/// ignores `until` from being asked the same thing forever.
+fn pages(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    req: Request,
+    filters: []const filter.Filter,
+    store: ?*nostr.store.Store,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var remaining: ?u64 = if (req.paginate) (if (filters[0].limit) |l| l else null) else null;
+    var cursor: ?i64 = null;
+
+    var seen = std.AutoHashMap([32]u8, void).init(gpa);
+    defer seen.deinit();
+    const page_filters = try gpa.alloc(filter.Filter, filters.len);
+    defer gpa.free(page_filters);
+
+    while (true) {
+        for (filters, page_filters) |f, *pf| {
+            pf.* = f;
+            if (req.paginate) {
+                if (cursor) |c| pf.until = if (f.until) |u| @min(u, c) else c;
+                const want: u64 = @min(remaining orelse page_size, page_size);
+                pf.limit = @intCast(want);
+            }
+        }
+
+        var capture: std.Io.Writer.Allocating = .init(gpa);
+        defer capture.deinit();
+        const outcome = try relayset.query(gpa, io, req.relays, page_filters, &capture.writer, err, .{
+            .until_eose = true,
+            .deadline_ms = req.timeout_ms,
+            .poll_ms = 100,
+            .store = store,
+        });
+        if (outcome.dialled == 0) {
+            try err.writeAll("deed req: no relay answered\n");
+            return cli.exit_fail;
+        }
+
+        var fresh: usize = 0;
+        var oldest: ?i64 = null;
+        var lines = std.mem.splitScalar(u8, capture.written(), '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var parsed = nostr.event.fromJson(gpa, line) catch continue;
+            defer parsed.deinit();
+            const ev = parsed.value;
+            oldest = if (oldest) |o| @min(o, ev.created_at) else ev.created_at;
+            if (remaining) |r| if (r == 0) continue;
+            if ((try seen.fetchPut(ev.id, {})) != null) continue;
+            if (req.ids_only) {
+                try printId(gpa, out, ev.id);
+            } else {
+                try out.print("{s}\n", .{line});
+            }
+            fresh += 1;
+            if (remaining) |*r| r.* -= 1;
+        }
+
+        if (!req.paginate or fresh == 0) break;
+        if (remaining) |r| if (r == 0) break;
+        const next = (oldest orelse break) - 1;
+        // Below every filter's `since`, nothing is left to ask for.
+        var any_left = false;
+        for (filters) |f| {
+            if (f.since == null or f.since.? <= next) any_left = true;
+        }
+        if (!any_left) break;
+        cursor = next;
+        if (req.paginate_interval_ms > 0) {
+            try std.Io.sleep(io, .fromMilliseconds(req.paginate_interval_ms), .awake);
+        }
+    }
+    return cli.exit_ok;
+}
+
 const Run = struct { code: u8, out: []const u8, err: []const u8 };
 
 fn runReq(args: []const []const u8, out_buf: []u8, err_buf: []u8) !Run {
     var out: std.Io.Writer = .fixed(out_buf);
     var err: std.Io.Writer = .fixed(err_buf);
-    const code = try run(std.testing.allocator, std.testing.io, args, &out, &err);
+    const code = try runWith(std.testing.allocator, std.testing.io, args, null, &out, &err);
     return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
 }
 
@@ -383,7 +713,6 @@ test "--local reads only a store that exists, and creates nothing" {
 
 test "--store creates the directories a new store needs" {
     const io = std.testing.io;
-    const testrelay = @import("testrelay.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root: [std.fs.max_path_bytes]u8 = undefined;
@@ -405,4 +734,285 @@ test "--store creates the directories a new store needs" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "the store") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "no relay answered") != null);
     _ = try tmp.dir.statFile(io, "a/b/store.mdb", .{});
+}
+
+fn runReqStdin(args: []const []const u8, stdin: []const u8, out_buf: []u8, err_buf: []u8) !Run {
+    var out: std.Io.Writer = .fixed(out_buf);
+    var err: std.Io.Writer = .fixed(err_buf);
+    var reader: std.Io.Reader = .fixed(stdin);
+    const code = try runWith(std.testing.allocator, std.testing.io, args, &reader, &out, &err);
+    return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
+}
+
+test "search, generic tags, d and h land in the filter" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runReq(&.{ "--search", "best nostr", "-T", "r=wss://x", "-d", "slug", "-h", "grp", "-t", "zig", "--bare" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expectEqualStrings(
+        "{\"#t\":[\"zig\"],\"#r\":[\"wss://x\"],\"#d\":[\"slug\"],\"#h\":[\"grp\"],\"search\":\"best nostr\"}\n",
+        r.out,
+    );
+}
+
+test "-h alone is help, and -h with a value is the h tag" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const help = try runReq(&.{"-h"}, &ob, &eb);
+    try std.testing.expect(std.mem.indexOf(u8, help.out, "deed req") != null);
+    var ob2: [4096]u8 = undefined;
+    const tag = try runReq(&.{ "-h", "g", "--bare" }, &ob2, &eb);
+    try std.testing.expectEqualStrings("{\"#h\":[\"g\"]}\n", tag.out);
+}
+
+test "a time can be a span or a date" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runReq(&.{ "-s", "2026-10-01", "-u", "1790899200", "--bare" }, &ob, &eb);
+    try std.testing.expectEqualStrings("{\"since\":1790812800,\"until\":1790899200}\n", r.out);
+    var ob2: [1024]u8 = undefined;
+    const bad = try runReq(&.{ "-s", "lately" }, &ob2, &eb);
+    try std.testing.expectEqual(cli.exit_fail, bad.code);
+}
+
+test "filters given as JSON arguments are printed as one REQ, with flags laid over" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runReq(&.{ "{\"kinds\":[1],\"limit\":2}", "{\"kinds\":[7]}", "-l", "9" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expectEqualStrings(
+        "[\"REQ\",\"deed\",{\"kinds\":[1],\"limit\":9},{\"kinds\":[7],\"limit\":9}]\n",
+        r.out,
+    );
+    var ob2: [4096]u8 = undefined;
+    const bare = try runReq(&.{ "{\"kinds\":[1]}", "{\"kinds\":[7]}", "--bare" }, &ob2, &eb);
+    try std.testing.expectEqualStrings("{\"kinds\":[1]}\n{\"kinds\":[7]}\n", bare.out);
+}
+
+test "a filter on stdin is read, several are kept, and a bad one is refused" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const one = try runReqStdin(&.{"--bare"}, "{\"kinds\": [1],\n \"#t\": [\"a\"]}\n", &ob, &eb);
+    try std.testing.expectEqualStrings("{\"kinds\":[1],\"#t\":[\"a\"]}\n", one.out);
+
+    var ob2: [4096]u8 = undefined;
+    const many = try runReqStdin(&.{ "-l", "4" }, "{\"kinds\":[1]}\n{\"kinds\":[7]}\n", &ob2, &eb);
+    try std.testing.expectEqualStrings("[\"REQ\",\"deed\",{\"kinds\":[1],\"limit\":4},{\"kinds\":[7],\"limit\":4}]\n", many.out);
+
+    var ob3: [4096]u8 = undefined;
+    const array = try runReqStdin(&.{"--bare"}, "[{\"kinds\":[1]},{\"kinds\":[7]}]", &ob3, &eb);
+    try std.testing.expectEqualStrings("{\"kinds\":[1]}\n{\"kinds\":[7]}\n", array.out);
+
+    var ob4: [4096]u8 = undefined;
+    const bad = try runReqStdin(&.{"--bare"}, "{\"kinds\": nope}\n", &ob4, &eb);
+    try std.testing.expectEqual(cli.exit_fail, bad.code);
+    try std.testing.expect(std.mem.indexOf(u8, bad.err, "deed req: the filter is not valid JSON") != null);
+
+    // Filters given as arguments mean stdin is not read at all.
+    var ob5: [4096]u8 = undefined;
+    const args_win = try runReqStdin(&.{ "{\"kinds\":[2]}", "--bare" }, "{\"kinds\":[9]}", &ob5, &eb);
+    try std.testing.expectEqualStrings("{\"kinds\":[2]}\n", args_win.out);
+}
+
+test "combining flags that cannot go together is a usage error" {
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{ "--paginate", "--stream" }, &ob, &eb)).code);
+    try std.testing.expectEqual(cli.exit_usage, (try runReq(&.{ "--ids-only", "--stream" }, &ob, &eb)).code);
+    try std.testing.expectEqual(cli.exit_fail, (try runReq(&.{ "--paginate-interval", "soon" }, &ob, &eb)).code);
+}
+
+test "an interval is milliseconds, or carries its unit" {
+    try std.testing.expectEqual(@as(?i64, 250), parseInterval("250"));
+    try std.testing.expectEqual(@as(?i64, 250), parseInterval("250ms"));
+    try std.testing.expectEqual(@as(?i64, 2000), parseInterval("2s"));
+    try std.testing.expectEqual(@as(?i64, 60000), parseInterval("1m"));
+    try std.testing.expect(parseInterval("-1") == null);
+    try std.testing.expect(parseInterval("x") == null);
+}
+
+const testrelay = @import("testrelay.zig");
+
+/// A relay that holds a fixed run of events, newest first, and answers a REQ
+/// the way a relay should: nothing newer than `until`, no more than `limit`
+/// (and no more than `max_page`), then EOSE.
+const PageRelay = struct {
+    events: []const []const u8,
+    times: []const i64,
+    max_page: usize = 1000,
+    ignore_until: bool = false,
+    reqs: std.atomic.Value(usize) = .init(0),
+
+    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+        const self: *PageRelay = @ptrCast(@alignCast(ctx.?));
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, a, frame, .{});
+        const items = v.array.items;
+        if (!std.mem.eql(u8, items[0].string, "REQ")) return;
+        _ = self.reqs.fetchAdd(1, .monotonic);
+        const f = items[2].object;
+        var until: i64 = std.math.maxInt(i64);
+        if (!self.ignore_until) if (f.get("until")) |u| {
+            until = u.integer;
+        };
+        var limit: usize = self.max_page;
+        if (f.get("limit")) |l| limit = @min(limit, @as(usize, @intCast(l.integer)));
+        var sent: usize = 0;
+        for (self.events, self.times) |e, t| {
+            if (t > until) continue;
+            if (sent >= limit) break;
+            const msg = try std.fmt.allocPrint(a, "[\"EVENT\",\"{s}\",{s}]", .{ items[1].string, e });
+            try testrelay.sendText(w, msg);
+            sent += 1;
+        }
+        try testrelay.sendText(w, try std.fmt.allocPrint(a, "[\"EOSE\",\"{s}\"]", .{items[1].string}));
+    }
+};
+
+/// Seven signed kind-1 events at 700, 600 ... 100.
+const Held = struct {
+    arena: std.heap.ArenaAllocator,
+    json: [7][]const u8 = undefined,
+    times: [7]i64 = undefined,
+
+    fn init() !Held {
+        var h: Held = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        errdefer h.arena.deinit();
+        const a = h.arena.allocator();
+        var signer = try nostr.keys.Signer.initRandomized(std.testing.io);
+        defer signer.deinit();
+        const kp = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+        for (0..7) |i| {
+            const t: i64 = @intCast((7 - i) * 100);
+            const content = try std.fmt.allocPrint(a, "n{d}", .{t});
+            const ev = try nostr.event.create(a, signer, kp, t, 1, &.{}, content, null);
+            h.json[i] = try nostr.event.toJson(a, ev);
+            h.times[i] = t;
+        }
+        return h;
+    }
+};
+
+/// Runs `req` against a paging relay that serves `pages` connections, and
+/// returns the output and how many REQs the relay saw.
+fn pagedRun(held: *const Held, relay_cfg: PageRelay, pages_n: usize, args: []const []const u8, ob: []u8, eb: []u8) !struct { run: Run, reqs: usize } {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the run leaked");
+    const gpa = da.allocator();
+
+    var state = relay_cfg;
+    state.events = &held.json;
+    state.times = &held.times;
+    var relay: testrelay.Relay = undefined;
+    try relay.startFor(io, .custom, pages_n);
+    relay.custom = PageRelay.handle;
+    relay.custom_ctx = &state;
+    defer relay.stop(io);
+
+    var url_buf: [40]u8 = undefined;
+    const url = try testrelay.url(&url_buf, relay.port());
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, args);
+    try argv.append(gpa, url);
+
+    var out: std.Io.Writer = .fixed(ob);
+    var err: std.Io.Writer = .fixed(eb);
+    const code = try runWith(gpa, io, argv.items, null, &out, &err);
+    return .{ .run = .{ .code = code, .out = out.buffered(), .err = err.buffered() }, .reqs = state.reqs.load(.monotonic) };
+}
+
+fn countLines(s: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |l| {
+        if (l.len > 0) n += 1;
+    }
+    return n;
+}
+
+test "--paginate walks back in time until a page is empty" {
+    var held = try Held.init();
+    defer held.arena.deinit();
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    // Pages of three over seven events: 3, 3, 1, then an empty page.
+    const r = try pagedRun(&held, .{ .events = &.{}, .times = &.{}, .max_page = 3 }, 4, &.{ "-k", "1", "--paginate" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.run.code);
+    try std.testing.expectEqual(@as(usize, 4), r.reqs);
+    try std.testing.expectEqual(@as(usize, 7), countLines(r.run.out));
+    // Newest first, every one once.
+    var it = std.mem.splitScalar(u8, r.run.out, '\n');
+    var want: i64 = 700;
+    while (it.next()) |l| {
+        if (l.len == 0) continue;
+        var buf: [16]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&buf, "\"n{d}\"", .{want});
+        try std.testing.expect(std.mem.indexOf(u8, l, needle) != null);
+        want -= 100;
+    }
+}
+
+test "--paginate treats --limit as the total across pages" {
+    var held = try Held.init();
+    defer held.arena.deinit();
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try pagedRun(&held, .{ .events = &.{}, .times = &.{}, .max_page = 3 }, 2, &.{ "-k", "1", "--paginate", "-l", "5" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.run.code);
+    try std.testing.expectEqual(@as(usize, 2), r.reqs);
+    try std.testing.expectEqual(@as(usize, 5), countLines(r.run.out));
+    try std.testing.expect(std.mem.indexOf(u8, r.run.out, "\"n300\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.run.out, "\"n200\"") == null);
+}
+
+test "--paginate stops at once when the whole limit fits in a page" {
+    var held = try Held.init();
+    defer held.arena.deinit();
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try pagedRun(&held, .{ .events = &.{}, .times = &.{} }, 1, &.{ "--paginate", "-l", "4" }, &ob, &eb);
+    try std.testing.expectEqual(@as(usize, 1), r.reqs);
+    try std.testing.expectEqual(@as(usize, 4), countLines(r.run.out));
+}
+
+test "--paginate stops when --since is reached" {
+    var held = try Held.init();
+    defer held.arena.deinit();
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    // Page one holds 700..500 and the next page would start below 450.
+    const r = try pagedRun(&held, .{ .events = &.{}, .times = &.{}, .max_page = 3 }, 1, &.{ "--paginate", "-s", "500" }, &ob, &eb);
+    try std.testing.expectEqual(@as(usize, 1), r.reqs);
+    try std.testing.expectEqual(@as(usize, 3), countLines(r.run.out));
+}
+
+test "--paginate prints an event once even when the relay ignores until" {
+    var held = try Held.init();
+    defer held.arena.deinit();
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try pagedRun(&held, .{ .events = &.{}, .times = &.{}, .max_page = 3, .ignore_until = true }, 2, &.{"--paginate"}, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.run.code);
+    try std.testing.expectEqual(@as(usize, 2), r.reqs);
+    try std.testing.expectEqual(@as(usize, 3), countLines(r.run.out));
+}
+
+test "--ids-only prints ids and nothing else" {
+    var held = try Held.init();
+    defer held.arena.deinit();
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try pagedRun(&held, .{ .events = &.{}, .times = &.{} }, 1, &.{ "--ids-only", "-l", "2" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.run.code);
+    try std.testing.expectEqual(@as(usize, 2), countLines(r.run.out));
+    var it = std.mem.splitScalar(u8, r.run.out, '\n');
+    while (it.next()) |l| {
+        if (l.len == 0) continue;
+        try std.testing.expectEqual(@as(usize, 64), l.len);
+        _ = try nostr.hex.decodeFixed(32, l);
+    }
 }

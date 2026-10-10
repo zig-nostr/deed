@@ -47,14 +47,81 @@ pub const ParseError = error{ Usage, BadValue };
 
 /// The flags that take a value and describe a filter.
 pub const value_flags = [_][]const u8{
-    "-k",      "--kind", "-a",      "--author", "-i",      "--id",
-    "-e",      "-p",     "-t",      "-l",       "--limit", "-s",
-    "--since", "-u",     "--until",
+    "-k",      "--kind",   "-a",      "--author", "-i",      "--id",
+    "-e",      "-p",       "-t",      "-l",       "--limit", "-s",
+    "--since", "-u",       "--until", "-d",       "-h",      "-T",
+    "--tag",   "--search",
 };
 
 /// True when `a` is one of the filter flags (all of which take a value).
 pub fn isFilterFlag(a: []const u8) bool {
     return cli.isOneOf(a, &value_flags);
+}
+
+/// One `#x` constraint value, before values are grouped by letter.
+const TagPair = struct { letter: u8, value: []const u8 };
+
+/// Days from 1970-01-01 to a civil date (proleptic Gregorian).
+fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
+    const y = if (m <= 2) y_in - 1 else y_in;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn nowSeconds() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return std.Io.Timestamp.now(io, .real).toSeconds();
+}
+
+/// A point in time, as unix seconds. Takes a plain number of seconds, `now`,
+/// a span back from `now` (`90s`, `30m`, `2h`, `3d`, `1w`), a date
+/// (`2026-10-01`, midnight UTC) or a UTC date and time
+/// (`2026-10-01T12:30:00Z`, seconds and the `Z` optional).
+pub fn parseTime(v: []const u8, now: i64) ?i64 {
+    if (v.len == 0) return null;
+    if (std.fmt.parseInt(i64, v, 10)) |n| return n else |_| {}
+    if (std.mem.eql(u8, v, "now")) return now;
+
+    const unit = v[v.len - 1];
+    const per: ?i64 = switch (unit) {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        'w' => 604800,
+        else => null,
+    };
+    if (per) |p| {
+        const n = std.fmt.parseInt(i64, v[0 .. v.len - 1], 10) catch return null;
+        if (n < 0) return null;
+        const span = std.math.mul(i64, n, p) catch return null;
+        return now - span;
+    }
+
+    // YYYY-MM-DD, then optionally T or space, HH:MM, optionally :SS, optionally Z.
+    if (v.len < 10 or v[4] != '-' or v[7] != '-') return null;
+    const y = std.fmt.parseInt(i64, v[0..4], 10) catch return null;
+    const mo = std.fmt.parseInt(i64, v[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(i64, v[8..10], 10) catch return null;
+    if (mo < 1 or mo > 12 or d < 1 or d > 31) return null;
+    var secs: i64 = daysFromCivil(y, mo, d) * 86400;
+    var rest = v[10..];
+    if (rest.len > 0 and rest[rest.len - 1] == 'Z') rest = rest[0 .. rest.len - 1];
+    if (rest.len == 0) return secs;
+    if (rest[0] != 'T' and rest[0] != ' ') return null;
+    rest = rest[1..];
+    if (rest.len != 5 and rest.len != 8) return null;
+    if (rest[2] != ':' or (rest.len == 8 and rest[5] != ':')) return null;
+    const hh = std.fmt.parseInt(i64, rest[0..2], 10) catch return null;
+    const mm = std.fmt.parseInt(i64, rest[3..5], 10) catch return null;
+    const ss: i64 = if (rest.len == 8) (std.fmt.parseInt(i64, rest[6..8], 10) catch return null) else 0;
+    if (hh > 23 or mm > 59 or ss > 60) return null;
+    secs += hh * 3600 + mm * 60 + ss;
+    return secs;
 }
 
 /// Everything the filter flags collect while a command line is read.
@@ -65,13 +132,26 @@ pub const Flags = struct {
     ids: Collected([32]u8) = .{},
     authors: Collected([32]u8) = .{},
     kinds: Collected(u16) = .{},
-    e_tags: Collected([]const u8) = .{},
-    p_tags: Collected([]const u8) = .{},
-    t_tags: Collected([]const u8) = .{},
-    tag_filters: [3]filter.TagFilter = undefined,
+    tag_pairs: Collected(TagPair) = .{},
+    tag_filters: [max_values]filter.TagFilter = undefined,
+    tag_values: [max_values][]const u8 = undefined,
+    search: ?[]const u8 = null,
     limit: ?u32 = null,
     since: ?i64 = null,
     until: ?i64 = null,
+
+    /// True when any flag has been taken.
+    pub fn any(self: *const Flags) bool {
+        return self.ids.len + self.authors.len + self.kinds.len + self.tag_pairs.len > 0 or
+            self.search != null or self.limit != null or self.since != null or self.until != null;
+    }
+
+    fn pushTag(self: *Flags, verb: []const u8, letter: u8, v: []const u8, err: *std.Io.Writer) !void {
+        if (!self.tag_pairs.push(.{ .letter = letter, .value = v })) {
+            try err.print("deed {s}: too many tag values\n", .{verb});
+            return ParseError.BadValue;
+        }
+    }
 
     /// Takes one flag, `flag`, with its value `v`. `flag` must satisfy
     /// `isFilterFlag`. `verb` names the command in the message a bad value
@@ -103,25 +183,29 @@ pub const Flags = struct {
                 return ParseError.BadValue;
             };
             _ = self.ids.push(k);
-        } else if (std.mem.eql(u8, a, "-e")) {
-            _ = self.e_tags.push(v);
-        } else if (std.mem.eql(u8, a, "-p")) {
-            _ = self.p_tags.push(v);
-        } else if (std.mem.eql(u8, a, "-t")) {
-            _ = self.t_tags.push(v);
+        } else if (a.len == 2 and std.mem.indexOfScalar(u8, "eptdh", a[1]) != null and a[0] == '-') {
+            try self.pushTag(verb, a[1], v, err);
+        } else if (cli.isOneOf(a, &.{ "-T", "--tag" })) {
+            if (v.len < 2 or v[1] != '=' or !std.ascii.isAlphabetic(v[0])) {
+                try err.print("deed {s}: '{s}' is not a tag like x=value\n", .{ verb, v });
+                return ParseError.BadValue;
+            }
+            try self.pushTag(verb, v[0], v[2..], err);
+        } else if (std.mem.eql(u8, a, "--search")) {
+            self.search = v;
         } else if (cli.isOneOf(a, &.{ "-l", "--limit" })) {
             self.limit = std.fmt.parseInt(u32, v, 10) catch {
                 try err.print("deed {s}: '{s}' is not a limit\n", .{ verb, v });
                 return ParseError.BadValue;
             };
         } else if (cli.isOneOf(a, &.{ "-s", "--since" })) {
-            self.since = std.fmt.parseInt(i64, v, 10) catch {
-                try err.print("deed {s}: '{s}' is not a unix timestamp\n", .{ verb, v });
+            self.since = parseTime(v, nowSeconds()) orelse {
+                try err.print("deed {s}: '{s}' is not a time (unix seconds, 2h, 3d, 2026-10-01)\n", .{ verb, v });
                 return ParseError.BadValue;
             };
         } else if (cli.isOneOf(a, &.{ "-u", "--until" })) {
-            self.until = std.fmt.parseInt(i64, v, 10) catch {
-                try err.print("deed {s}: '{s}' is not a unix timestamp\n", .{ verb, v });
+            self.until = parseTime(v, nowSeconds()) orelse {
+                try err.print("deed {s}: '{s}' is not a time (unix seconds, 2h, 3d, 2026-10-01)\n", .{ verb, v });
                 return ParseError.BadValue;
             };
         }
@@ -133,27 +217,145 @@ pub const Flags = struct {
         f.limit = self.limit;
         f.since = self.since;
         f.until = self.until;
+        f.search = self.search;
         f.ids = self.ids.slice();
         f.authors = self.authors.slice();
         f.kinds = self.kinds.slice();
 
-        var tag_len: usize = 0;
-        if (self.e_tags.slice()) |v| {
-            self.tag_filters[tag_len] = .{ .letter = 'e', .values = v };
-            tag_len += 1;
+        // Grouped by letter. `e`, `p` and `t` come first, in that order, so the
+        // filter reads the same whatever order the flags came in; any other
+        // letter follows in the order it was first named.
+        const pairs = self.tag_pairs.items[0..self.tag_pairs.len];
+        var letters: [max_values]u8 = undefined;
+        var n_letters: usize = 0;
+        for ("ept") |c| {
+            for (pairs) |p| if (p.letter == c) {
+                letters[n_letters] = c;
+                n_letters += 1;
+                break;
+            };
         }
-        if (self.p_tags.slice()) |v| {
-            self.tag_filters[tag_len] = .{ .letter = 'p', .values = v };
-            tag_len += 1;
+        for (pairs) |p| {
+            if (std.mem.indexOfScalar(u8, letters[0..n_letters], p.letter) == null) {
+                letters[n_letters] = p.letter;
+                n_letters += 1;
+            }
         }
-        if (self.t_tags.slice()) |v| {
-            self.tag_filters[tag_len] = .{ .letter = 't', .values = v };
-            tag_len += 1;
+        var used: usize = 0;
+        for (letters[0..n_letters], 0..) |c, i| {
+            const start = used;
+            for (pairs) |p| if (p.letter == c) {
+                self.tag_values[used] = p.value;
+                used += 1;
+            };
+            self.tag_filters[i] = .{ .letter = c, .values = self.tag_values[start..used] };
         }
-        if (tag_len > 0) f.tags = self.tag_filters[0..tag_len];
+        if (n_letters > 0) f.tags = self.tag_filters[0..n_letters];
         return f;
     }
 };
+
+/// Reads one filter object, as JSON text, into a `Filter` whose slices live in
+/// `arena`. Unknown keys are ignored. Errors are written to `err`, naming `verb`.
+pub fn parseJson(
+    arena: std.mem.Allocator,
+    verb: []const u8,
+    text: []const u8,
+    err: *std.Io.Writer,
+) !filter.Filter {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch {
+        try err.print("deed {s}: the filter is not valid JSON\n", .{verb});
+        return ParseError.BadValue;
+    };
+    return fromValue(arena, verb, root, err);
+}
+
+fn badField(err: *std.Io.Writer, verb: []const u8, key: []const u8) !filter.Filter {
+    try err.print("deed {s}: the filter's \"{s}\" is not valid\n", .{ verb, key });
+    return ParseError.BadValue;
+}
+
+pub fn fromValue(
+    arena: std.mem.Allocator,
+    verb: []const u8,
+    root: std.json.Value,
+    err: *std.Io.Writer,
+) !filter.Filter {
+    if (root != .object) {
+        try err.print("deed {s}: a filter is a JSON object\n", .{verb});
+        return ParseError.BadValue;
+    }
+    var f = filter.Filter{};
+    var tags: std.ArrayList(filter.TagFilter) = .empty;
+    var it = root.object.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        const val = kv.value_ptr.*;
+        if (std.mem.eql(u8, key, "ids") or std.mem.eql(u8, key, "authors")) {
+            if (val != .array) return badField(err, verb, key);
+            const out = try arena.alloc([32]u8, val.array.items.len);
+            for (val.array.items, 0..) |item, i| {
+                if (item != .string) return badField(err, verb, key);
+                out[i] = idOrKey(arena, item.string) orelse return badField(err, verb, key);
+            }
+            if (key[0] == 'i') f.ids = out else f.authors = out;
+        } else if (std.mem.eql(u8, key, "kinds")) {
+            if (val != .array) return badField(err, verb, key);
+            const out = try arena.alloc(u16, val.array.items.len);
+            for (val.array.items, 0..) |item, i| {
+                if (item != .integer) return badField(err, verb, key);
+                out[i] = std.math.cast(u16, item.integer) orelse return badField(err, verb, key);
+            }
+            f.kinds = out;
+        } else if (std.mem.eql(u8, key, "since") or std.mem.eql(u8, key, "until")) {
+            if (val != .integer) return badField(err, verb, key);
+            if (key[0] == 's') f.since = val.integer else f.until = val.integer;
+        } else if (std.mem.eql(u8, key, "limit")) {
+            if (val != .integer) return badField(err, verb, key);
+            f.limit = std.math.cast(u32, val.integer) orelse return badField(err, verb, key);
+        } else if (std.mem.eql(u8, key, "search")) {
+            if (val != .string) return badField(err, verb, key);
+            f.search = val.string;
+        } else if (key.len == 2 and key[0] == '#' and std.ascii.isAlphabetic(key[1])) {
+            if (val != .array) return badField(err, verb, key);
+            const out = try arena.alloc([]const u8, val.array.items.len);
+            for (val.array.items, 0..) |item, i| {
+                if (item != .string) return badField(err, verb, key);
+                out[i] = item.string;
+            }
+            try tags.append(arena, .{ .letter = key[1], .values = out });
+        }
+    }
+    if (tags.items.len > 0) f.tags = tags.items;
+    return f;
+}
+
+/// `over` laid on `base`: every field `over` sets replaces the one in `base`,
+/// and a tag letter `over` names replaces that letter's values. Slices of the
+/// result live in `arena` or in the inputs.
+pub fn overlay(arena: std.mem.Allocator, base: filter.Filter, over: filter.Filter) !filter.Filter {
+    var f = base;
+    if (over.ids) |v| f.ids = v;
+    if (over.authors) |v| f.authors = v;
+    if (over.kinds) |v| f.kinds = v;
+    if (over.since) |v| f.since = v;
+    if (over.until) |v| f.until = v;
+    if (over.limit) |v| f.limit = v;
+    if (over.search) |v| f.search = v;
+    if (over.tags) |ot| {
+        var list: std.ArrayList(filter.TagFilter) = .empty;
+        if (base.tags) |bt| for (bt) |t| {
+            var replaced = false;
+            for (ot) |o| if (o.letter == t.letter) {
+                replaced = true;
+            };
+            if (!replaced) try list.append(arena, t);
+        };
+        try list.appendSlice(arena, ot);
+        f.tags = list.items;
+    }
+    return f;
+}
 
 test "filterflags: repeated flags collect and the filter points at them" {
     var flags: Flags = .{};
@@ -184,4 +386,98 @@ test "filterflags: only the filter flags are claimed" {
     try std.testing.expect(isFilterFlag("--author"));
     try std.testing.expect(!isFilterFlag("--store"));
     try std.testing.expect(!isFilterFlag("--bare"));
+}
+
+test "filterflags: generic tags, d, h and search reach the filter, e p t first" {
+    var flags: Flags = .{};
+    var eb: [256]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&eb);
+    const gpa = std.testing.allocator;
+    try flags.accept(gpa, "x", "-T", "r=wss://a", &err);
+    try flags.accept(gpa, "x", "-d", "slug", &err);
+    try flags.accept(gpa, "x", "-h", "grp", &err);
+    try flags.accept(gpa, "x", "--tag", "r=wss://b", &err);
+    try flags.accept(gpa, "x", "-t", "zig", &err);
+    try flags.accept(gpa, "x", "--search", "best nostr", &err);
+    const f = flags.finish();
+    try std.testing.expectEqualStrings("best nostr", f.search.?);
+    const t = f.tags.?;
+    try std.testing.expectEqual(@as(usize, 4), t.len);
+    try std.testing.expectEqual(@as(u8, 't'), t[0].letter);
+    try std.testing.expectEqual(@as(u8, 'r'), t[1].letter);
+    try std.testing.expectEqual(@as(usize, 2), t[1].values.len);
+    try std.testing.expectEqualStrings("wss://b", t[1].values[1]);
+    try std.testing.expectEqual(@as(u8, 'd'), t[2].letter);
+    try std.testing.expectEqual(@as(u8, 'h'), t[3].letter);
+
+    // And it goes on the wire as `#r`, `#d`, `#h` and `search`.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try f.appendJson(&list, gpa);
+    try std.testing.expectEqualStrings(
+        "{\"#t\":[\"zig\"],\"#r\":[\"wss://a\",\"wss://b\"],\"#d\":[\"slug\"],\"#h\":[\"grp\"],\"search\":\"best nostr\"}",
+        list.items,
+    );
+}
+
+test "filterflags: a malformed --tag is refused" {
+    var flags: Flags = .{};
+    var eb: [256]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&eb);
+    try std.testing.expectError(ParseError.BadValue, flags.accept(std.testing.allocator, "x", "-T", "rx", &err));
+    try std.testing.expectError(ParseError.BadValue, flags.accept(std.testing.allocator, "x", "--tag", "1=x", &err));
+}
+
+test "filterflags: times take seconds, spans and dates" {
+    try std.testing.expectEqual(@as(?i64, 1700000000), parseTime("1700000000", 5));
+    try std.testing.expectEqual(@as(?i64, 1000), parseTime("now", 1000));
+    try std.testing.expectEqual(@as(?i64, 1000 - 7200), parseTime("2h", 1000));
+    try std.testing.expectEqual(@as(?i64, 1000000 - 3 * 86400), parseTime("3d", 1000000));
+    try std.testing.expectEqual(@as(?i64, 1000000 - 90), parseTime("90s", 1000000));
+    try std.testing.expectEqual(@as(?i64, 0), parseTime("1970-01-01", 5));
+    try std.testing.expectEqual(@as(?i64, 1790812800), parseTime("2026-10-01", 5));
+    try std.testing.expectEqual(@as(?i64, 1790812800 + 12 * 3600 + 30 * 60), parseTime("2026-10-01T12:30:00Z", 5));
+    try std.testing.expectEqual(@as(?i64, 1790812800 + 12 * 3600 + 30 * 60), parseTime("2026-10-01T12:30", 5));
+    try std.testing.expect(parseTime("yesterday", 5) == null);
+    try std.testing.expect(parseTime("2026-13-01", 5) == null);
+    try std.testing.expect(parseTime("", 5) == null);
+}
+
+test "filterflags: --since accepts a span and refuses nonsense" {
+    var flags: Flags = .{};
+    var eb: [256]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&eb);
+    try flags.accept(std.testing.allocator, "x", "-s", "1h", &err);
+    try std.testing.expect(flags.since.? > 1700000000);
+    try std.testing.expectError(ParseError.BadValue, flags.accept(std.testing.allocator, "req", "-u", "soon", &err));
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "'soon' is not a time") != null);
+}
+
+test "filterflags: a JSON filter is read, and flags overlay it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var eb: [256]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&eb);
+    const base = try parseJson(arena, "x", "{\"kinds\":[1,6],\"#t\":[\"a\"],\"#p\":[\"b\"],\"since\":5,\"limit\":3,\"search\":\"q\",\"extra\":1}", &err);
+    try std.testing.expectEqual(@as(usize, 2), base.kinds.?.len);
+    try std.testing.expectEqual(@as(i64, 5), base.since.?);
+    try std.testing.expectEqualStrings("q", base.search.?);
+
+    var flags: Flags = .{};
+    try flags.accept(std.testing.allocator, "x", "-t", "z", &err);
+    try flags.accept(std.testing.allocator, "x", "-u", "9", &err);
+    const merged = try overlay(arena, base, flags.finish());
+    try std.testing.expectEqual(@as(i64, 9), merged.until.?);
+    try std.testing.expectEqual(@as(i64, 5), merged.since.?);
+    // `t` is replaced, `p` is kept.
+    var list: std.ArrayList(u8) = .empty;
+    try merged.appendJson(&list, arena);
+    try std.testing.expect(std.mem.indexOf(u8, list.items, "\"#t\":[\"z\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list.items, "\"#p\":[\"b\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list.items, "\"#t\":[\"a\"]") == null);
+
+    try std.testing.expectError(ParseError.BadValue, parseJson(arena, "x", "{\"kinds\":[\"a\"]}", &err));
+    try std.testing.expectError(ParseError.BadValue, parseJson(arena, "x", "[1]", &err));
+    try std.testing.expectError(ParseError.BadValue, parseJson(arena, "x", "{", &err));
 }
