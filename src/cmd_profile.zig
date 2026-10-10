@@ -423,7 +423,10 @@ fn runSet(
         try err.writeAll("deed profile set: nothing to change: give at least one field or --metadata\n");
         return cli.exit_usage;
     }
-    const sk = (try post.readSecret(gpa, "profile set", sec, err)) orelse return cli.exit_usage;
+    const sk = (post.readSecret(gpa, "profile set", sec, err) catch |e| switch (e) {
+        error.BadKey => return cli.exit_fail,
+        else => return e,
+    }) orelse return cli.exit_usage;
 
     // Checked here, before any relay is asked, so a bad --metadata costs nothing.
     {

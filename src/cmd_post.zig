@@ -155,7 +155,10 @@ pub fn run(
         return cli.exit_usage;
     }
 
-    const sk = (try readSecret(gpa, "post", opts.sec, err)) orelse return cli.exit_usage;
+    const sk = (readSecret(gpa, "post", opts.sec, err) catch |e| switch (e) {
+        error.BadKey => return cli.exit_fail,
+        else => return e,
+    }) orelse return cli.exit_usage;
 
     var content_owned: ?[]u8 = null;
     defer if (content_owned) |c| gpa.free(c);
@@ -247,7 +250,9 @@ fn getEnv(name: [*:0]const u8) ?[]const u8 {
 }
 
 /// The secret key from the flag or `$NOSTR_SECRET_KEY`, or null after saying
-/// why there is none. A key nobody chose is never invented.
+/// why there is none (a usage error). A key that is there and cannot be read
+/// fails with `error.BadKey` after one line saying why. A key nobody chose is
+/// never invented.
 pub fn readSecret(
     gpa: std.mem.Allocator,
     verb: []const u8,
@@ -258,10 +263,7 @@ pub fn readSecret(
         try err.print("deed {s}: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n", .{verb});
         return null;
     };
-    return keyinput.secretKey(gpa, raw) catch {
-        try err.print("deed {s}: not a secret key (want nsec1... or 64 hex characters)\n", .{verb});
-        return null;
-    };
+    return try keyinput.secretKeyForVerb(gpa, verb, raw, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,4 +1034,15 @@ test "a reply to an event with an author and no hints reads the parent from the 
     try testing.expectEqual(cli.exit_ok, code);
     try testing.expectEqual(@as(usize, 1), mine_script.events);
     try testing.expect(std.mem.indexOf(u8, mine_script.got[0..mine_script.got_len], "\"root\"") != null);
+}
+
+test "a key that cannot be read exits 1 with one line, and a missing key is a usage error" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    const code = try run(testing.allocator, testing.io, &.{ "hi", "--sec", "nope", "--dry-run" }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_fail, code);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, err.written(), "\n"));
+    try testing.expect(std.mem.indexOf(u8, err.written(), "not a secret key") != null);
 }

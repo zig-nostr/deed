@@ -86,9 +86,9 @@ pub fn resolve(gpa: std.mem.Allocator, flags: Flags, verb: []const u8, err: *std
         try err.print("deed {s}: --auth needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n", .{verb});
         return ResolveError.Usage;
     };
-    const sk = keyinput.secretKey(gpa, raw) catch {
-        try err.print("deed {s}: not a secret key (want nsec1... or 64 hex characters)\n", .{verb});
-        return ResolveError.BadKey;
+    const sk = keyinput.secretKeyForVerb(gpa, verb, raw, err) catch |e| switch (e) {
+        error.BadKey => return ResolveError.BadKey,
+        else => |other| return other,
     };
     var signer = keys.Signer.init();
     defer signer.deinit();
