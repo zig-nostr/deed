@@ -551,7 +551,7 @@ fn withStore(ctx: *Ctx, url: []const u8, path: []const u8, direction: Direction)
     var r = (try ctx.connect(url)) orelse return cli.exit_fail;
     defer negclient.release(r, ctx.deadline);
 
-    var storage = nip77.Storage.fromStore(gpa, &store, ctx.filter) catch |e| {
+    var storage = nip77.Storage.fromStore(gpa, &store, ctx.filter, .{}) catch |e| {
         try ctx.err.print("deed sync: the store could not be read: {s}\n", .{@errorName(e)});
         return cli.exit_fail;
     };

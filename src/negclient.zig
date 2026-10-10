@@ -27,7 +27,6 @@ const Io = std.Io;
 const nip77 = nostr.nip77;
 const message = nostr.message;
 const relay = nostr.relay;
-const ws = nostr.websocket;
 const Filter = nostr.filter.Filter;
 const Event = nostr.event.Event;
 
@@ -207,22 +206,16 @@ pub fn release(r: *relay.Relay, deadline: Io.Clock.Timestamp) void {
     r.deinit();
 }
 
-/// Builds the frame the way the library's own sender does: masked, under the
-/// connection's write lock, written whole. The library has no NEG-* sender.
-fn sendTextNow(gpa: std.mem.Allocator, r: *relay.Relay, text: []const u8) anyerror!void {
-    var frame: std.ArrayList(u8) = .empty;
-    defer frame.deinit(gpa);
-    var mask: [4]u8 = undefined;
-    r.io.randomSecure(&mask) catch return error.RandomFailed;
-    try ws.appendClientFrame(&frame, gpa, .text, text, mask);
-    r.conn.write_lock.lockUncancelable(r.io);
-    defer r.conn.write_lock.unlock(r.io);
-    try r.conn.stream.writeAll(frame.items);
+fn negOpenNow(r: *relay.Relay, filter: Filter, initial_hex: []const u8) anyerror!void {
+    return r.negOpen(neg_sub_id, filter, initial_hex);
 }
 
-/// Sends one text frame on `r`, giving up at `deadline`.
-pub fn sendText(gpa: std.mem.Allocator, r: *relay.Relay, text: []const u8, deadline: Io.Clock.Timestamp) anyerror!void {
-    return writeBy(r.io, deadline, sendTextNow, .{ gpa, r, text });
+fn negMsgNow(r: *relay.Relay, hex: []const u8) anyerror!void {
+    return r.negMsg(neg_sub_id, hex);
+}
+
+fn negCloseNow(r: *relay.Relay) anyerror!void {
+    return r.negClose(neg_sub_id);
 }
 
 fn subscribeNow(r: *relay.Relay, sub_id: []const u8, filters: []const Filter) anyerror!void {
@@ -233,10 +226,8 @@ fn unsubscribeNow(r: *relay.Relay, sub_id: []const u8) anyerror!void {
     return r.unsubscribe(sub_id);
 }
 
-fn sendNegClose(gpa: std.mem.Allocator, r: *relay.Relay, deadline: Io.Clock.Timestamp) void {
-    const text = message.encodeNegClose(gpa, neg_sub_id) catch return;
-    defer gpa.free(text);
-    sendText(gpa, r, text, deadline) catch {};
+fn sendNegClose(r: *relay.Relay, deadline: Io.Clock.Timestamp) void {
+    writeBy(r.io, deadline, negCloseNow, .{r}) catch {};
 }
 
 /// Whether a NOTICE reads as a relay turning down a command it does not know.
@@ -280,9 +271,7 @@ pub fn reconcile(
         defer gpa.free(first);
         const first_hex = try nip77.toHex(gpa, first);
         defer gpa.free(first_hex);
-        const open = try message.encodeNegOpen(gpa, neg_sub_id, filter, first_hex);
-        defer gpa.free(open);
-        sendText(gpa, r, open, opts.deadline) catch |e| switch (e) {
+        writeBy(io, opts.deadline, negOpenNow, .{ r, filter, first_hex }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             error.Timeout => return .{ .failed = .of(false, "the relay stopped reading before the time ran out", .{}) },
@@ -305,7 +294,7 @@ pub fn reconcile(
         var msg = (r.receiveTimeout(.{ .deadline = wait_until }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Timeout => {
-                sendNegClose(gpa, r, opts.deadline);
+                sendNegClose(r, opts.deadline);
                 if (engaged) return .{ .failed = .of(false, "the time ran out partway through", .{}) };
                 if (notice.len > 0) return .{ .unsupported = .of(false, "no answer to NEG-OPEN; the relay said: {s}", .{notice.text()}) };
                 return .{ .unsupported = .of(false, "no answer to NEG-OPEN", .{}) };
@@ -327,7 +316,7 @@ pub fn reconcile(
                 const bytes = nip77.fromHex(gpa, m.hex) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
-                        sendNegClose(gpa, r, opts.deadline);
+                        sendNegClose(r, opts.deadline);
                         return .{ .failed = .of(false, "the relay's reply is not hex", .{}) };
                     },
                 };
@@ -335,7 +324,7 @@ pub fn reconcile(
                 var step = initiator.reconcile(gpa, bytes) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
-                        sendNegClose(gpa, r, opts.deadline);
+                        sendNegClose(r, opts.deadline);
                         return .{ .failed = .of(false, "the relay's reply could not be read: {s}", .{@errorName(e)}) };
                     },
                 };
@@ -344,7 +333,7 @@ pub fn reconcile(
                 for (step.need) |id| try need.put(gpa, id, {});
 
                 const next = step.message orelse {
-                    sendNegClose(gpa, r, opts.deadline);
+                    sendNegClose(r, opts.deadline);
                     const have_out = try gpa.dupe(Id, have.keys());
                     errdefer gpa.free(have_out);
                     const need_out = try gpa.dupe(Id, need.keys());
@@ -352,9 +341,7 @@ pub fn reconcile(
                 };
                 const next_hex = try nip77.toHex(gpa, next);
                 defer gpa.free(next_hex);
-                const text = try message.encodeNegMsg(gpa, neg_sub_id, next_hex);
-                defer gpa.free(text);
-                sendText(gpa, r, text, opts.deadline) catch |e| switch (e) {
+                writeBy(io, opts.deadline, negMsgNow, .{ r, next_hex }) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Canceled => return error.Canceled,
                     error.Timeout => return .{ .failed = .of(false, "the relay stopped reading before the time ran out", .{}) },
@@ -951,11 +938,22 @@ test "a write to a relay that stops reading gives up at the deadline" {
     const r = try relay.dial(gpa, io, url);
 
     // Far more than the socket buffers on both ends hold.
-    const text = try gpa.alloc(u8, 8 * 1024 * 1024);
-    defer gpa.free(text);
-    @memset(text, 'x');
+    const content = try gpa.alloc(u8, 8 * 1024 * 1024);
+    defer gpa.free(content);
+    @memset(content, 'x');
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x21} ** 32);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ev = try nostr.event.create(arena.allocator(), signer, kp, 1_700_000_000, 1, &.{}, content, null);
+    const Publish = struct {
+        fn now(rr: *relay.Relay, e: Event) anyerror!void {
+            return rr.publish(e);
+        }
+    };
     const started = Io.Timestamp.now(io, .awake).toMilliseconds();
-    try testing.expectError(error.Timeout, sendText(gpa, r, text, deadlineIn(io, 300)));
+    try testing.expectError(error.Timeout, writeBy(io, deadlineIn(io, 300), Publish.now, .{ r, ev }));
     const took = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
     try testing.expect(took < 3_000);
     // Past its deadline, so it is shut down before the close frame.
