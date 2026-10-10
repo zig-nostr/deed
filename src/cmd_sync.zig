@@ -325,26 +325,41 @@ const IdsOnly = struct {
     }
 };
 
+fn publishEach(r: *relay.Relay, events: []const Event, sent: *usize) anyerror!void {
+    for (events) |ev| {
+        try r.publish(ev);
+        sent.* += 1;
+    }
+}
+
 /// Offers `events` to `r` and waits for each one's OK, printing the accepted
 /// ones. All are sent before any answer is read, so a batch costs one round
-/// trip rather than one an event.
+/// trip rather than one an event. The sending is bounded by the deadline as
+/// the reading is: a relay that stops reading fills the socket, and a write
+/// into a full socket would otherwise wait for room forever.
 fn publish(ctx: *Ctx, r: *relay.Relay, url: []const u8, events: []const Event) !void {
     if (events.len == 0) return;
     const gpa = ctx.gpa;
+    var sent: usize = 0;
+    negclient.writeBy(ctx.io, ctx.deadline, publishEach, .{ r, events, &sent }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        error.Timeout => {
+            try ctx.err.print("deed sync: {s}: the relay stopped reading; {d} of {d} events were sent before the time ran out\n", .{ url, sent, events.len });
+            ctx.stats.unreachable_relay = true;
+            ctx.stats.refused += events.len;
+            return;
+        },
+        else => {
+            try ctx.err.print("deed sync: {s}: the connection went away while publishing\n", .{url});
+            ctx.stats.unreachable_relay = true;
+            ctx.stats.refused += events.len;
+            return;
+        },
+    };
     var pending: std.AutoHashMapUnmanaged(Id, usize) = .empty;
     defer pending.deinit(gpa);
-    for (events, 0..) |ev, i| {
-        r.publish(ev) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                try ctx.err.print("deed sync: {s}: the connection went away while publishing\n", .{url});
-                ctx.stats.unreachable_relay = true;
-                ctx.stats.refused += events.len - i + pending.count();
-                return;
-            },
-        };
-        try pending.put(gpa, ev.id, i);
-    }
+    for (events, 0..) |ev, i| try pending.put(gpa, ev.id, i);
     while (pending.count() > 0) {
         var msg = (r.receiveTimeout(.{ .deadline = ctx.deadline }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -404,7 +419,7 @@ fn relayIds(ctx: *Ctx, conn: **relay.Relay, url: []const u8, keep: *Held, keep_b
         .unsupported, .failed => |note| {
             try ctx.noFallbackNote(url, &note);
             if (note.lost) {
-                conn.*.deinit();
+                negclient.release(conn.*, ctx.deadline);
                 conn.* = (try ctx.connect(url)) orelse return null;
             }
         },
@@ -427,9 +442,9 @@ fn relayIds(ctx: *Ctx, conn: **relay.Relay, url: []const u8, keep: *Held, keep_b
 fn betweenRelays(ctx: *Ctx, from_url: []const u8, to_url: []const u8) !void {
     const gpa = ctx.gpa;
     var from = (try ctx.connect(from_url)) orelse return;
-    defer from.deinit();
+    defer negclient.release(from, ctx.deadline);
     var to = (try ctx.connect(to_url)) orelse return;
-    defer to.deinit();
+    defer negclient.release(to, ctx.deadline);
 
     var kept: Held = .{ .gpa = gpa };
     defer kept.deinit();
@@ -534,7 +549,7 @@ fn withStore(ctx: *Ctx, url: []const u8, path: []const u8, direction: Direction)
     defer store.deinit();
 
     var r = (try ctx.connect(url)) orelse return cli.exit_fail;
-    defer r.deinit();
+    defer negclient.release(r, ctx.deadline);
 
     var storage = nip77.Storage.fromStore(gpa, &store, ctx.filter) catch |e| {
         try ctx.err.print("deed sync: the store could not be read: {s}\n", .{@errorName(e)});
@@ -559,7 +574,7 @@ fn withStore(ctx: *Ctx, url: []const u8, path: []const u8, direction: Direction)
         .unsupported, .failed => |note| {
             try ctx.noFallbackNote(url, &note);
             if (note.lost) {
-                r.deinit();
+                negclient.release(r, ctx.deadline);
                 r = (try ctx.connect(url)) orelse return cli.exit_fail;
             }
         },
@@ -911,4 +926,65 @@ test "an unreachable relay fails the run" {
     var eb: [1024]u8 = undefined;
     const r = try runSync(da.allocator(), &.{ url, url, "--timeout", "3000" }, &ob, &eb);
     try testing.expectEqual(cli.exit_fail, r.code);
+}
+
+const PublishDone = struct {
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(ctx: *Ctx, r: *relay.Relay, url: []const u8, evs: []const Event, self: *PublishDone) void {
+        publish(ctx, r, url, evs) catch {};
+        self.done.store(true, .release);
+    }
+};
+
+test "a relay that stops reading cannot hold a sync past its deadline" {
+    const io = testing.io;
+    const gpa = std.heap.page_allocator;
+    var deaf: testrelay.Relay = undefined;
+    try deaf.start(io, .deaf);
+    defer deaf.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, deaf.port());
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x21} ** 32);
+    // Far more than the socket buffers on both ends hold.
+    const big = try a.alloc(u8, 16 * 1024);
+    @memset(big, 'x');
+    var evs: [250]Event = undefined;
+    for (&evs, 0..) |*e, k| e.* = try nostr.event.create(a, signer, kp, 1_700_000_000 + @as(i64, @intCast(k)), 1, &.{}, big, null);
+
+    var ob: [64]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&ob);
+    var eb: [4096]u8 = undefined;
+    var ew: std.Io.Writer = .fixed(&eb);
+    var ctx: Ctx = .{
+        .gpa = gpa,
+        .io = io,
+        .out = &ow,
+        .err = &ew,
+        .filter = .{},
+        .quiet = true,
+        .deadline = negclient.deadlineIn(io, 500),
+        .signer = signer,
+    };
+    var outcome: [1]dial.Outcome = undefined;
+    dial.all(gpa, io, &.{url}, 2000, &outcome);
+    const r = outcome[0].connected;
+    var flag: PublishDone = .{};
+    var fut = try io.concurrent(PublishDone.run, .{ &ctx, r, url, &evs, &flag });
+    var waited: usize = 0;
+    while (!flag.done.load(.acquire) and waited < 3000) : (waited += 50) try io.sleep(.fromMilliseconds(50), .awake);
+    const finished = flag.done.load(.acquire);
+    // Unblocks the write when it did not give up by itself, so the test ends.
+    r.shutdown(io);
+    fut.await(io);
+    r.deinit();
+    try testing.expect(finished);
+    try testing.expect(ctx.stats.refused == evs.len);
+    try testing.expect(std.mem.indexOf(u8, ew.buffered(), "stopped reading") != null);
 }

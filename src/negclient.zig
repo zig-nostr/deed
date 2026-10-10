@@ -137,10 +137,79 @@ pub const Options = struct {
     max_rounds: u32 = 10_000,
 };
 
-/// Sends one text frame on `r`. The library keeps its own sender private,
-/// and has no NEG-* sender, so this builds the frame the way it does: masked,
-/// under the connection's write lock, written whole.
-pub fn sendText(gpa: std.mem.Allocator, r: *relay.Relay, text: []const u8) !void {
+/// What a write gets back when the deadline came first.
+pub const WriteError = error{Timeout};
+
+const Wrote = union(enum) {
+    done: anyerror!void,
+    timer: Io.Cancelable!void,
+};
+
+fn msUntil(io: Io, deadline: Io.Clock.Timestamp) i64 {
+    const left = Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.toMilliseconds();
+    return @max(left, 0);
+}
+
+/// Runs `func(args)`, a write to a relay, in a task of its own beside a timer
+/// for `deadline`, and cancels it when the timer goes first. A relay that has
+/// stopped reading fills the socket, and a write into a full socket waits for
+/// room that never comes, so only a read bounded by the deadline is not
+/// enough: the write would hold the caller forever.
+///
+/// Returns `error.Timeout` when the write was cancelled. The connection is
+/// then unusable, since a frame may have been cut in half: close it with
+/// `release`.
+pub fn writeBy(io: Io, deadline: Io.Clock.Timestamp, comptime func: anytype, args: anytype) anyerror!void {
+    var buf: [2]Wrote = undefined;
+    var sel = Io.Select(Wrote).init(io, &buf);
+    sel.concurrent(.done, func, args) catch {
+        // No concurrency to spare. Written here instead, which is only as
+        // bounded as the relay is willing to read.
+        return @call(.auto, func, args);
+    };
+    sel.concurrent(.timer, Io.sleep, .{ io, .fromMilliseconds(msUntil(io, deadline)), .awake }) catch {
+        // Nothing to time it with: the write is waited for whole.
+        const a = sel.await() catch |e| {
+            sel.cancelDiscard();
+            return e;
+        };
+        sel.cancelDiscard();
+        return a.done;
+    };
+    const first = sel.await() catch |e| {
+        sel.cancelDiscard();
+        return e;
+    };
+    switch (first) {
+        .done => |res| {
+            sel.cancelDiscard();
+            return res;
+        },
+        .timer => {
+            // The write may have finished just as the timer did.
+            var wrote = false;
+            while (sel.cancel()) |a| switch (a) {
+                .done => |res| wrote = if (res) true else |_| false,
+                .timer => {},
+            };
+            if (!wrote) return error.Timeout;
+        },
+    }
+}
+
+/// Closes `r` and frees it. A connection whose run is past its deadline, or
+/// whose socket has no room, is shut down first: the close frame `deinit`
+/// writes would otherwise wait on a relay that stopped reading, behind
+/// whatever a cancelled write left unsent.
+pub fn release(r: *relay.Relay, deadline: Io.Clock.Timestamp) void {
+    const io = r.io;
+    if (msUntil(io, deadline) == 0 or !r.conn.stream.writableBy(deadlineIn(io, 0))) r.shutdown(io);
+    r.deinit();
+}
+
+/// Builds the frame the way the library's own sender does: masked, under the
+/// connection's write lock, written whole. The library has no NEG-* sender.
+fn sendTextNow(gpa: std.mem.Allocator, r: *relay.Relay, text: []const u8) anyerror!void {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(gpa);
     var mask: [4]u8 = undefined;
@@ -151,10 +220,23 @@ pub fn sendText(gpa: std.mem.Allocator, r: *relay.Relay, text: []const u8) !void
     try r.conn.stream.writeAll(frame.items);
 }
 
-fn sendNegClose(gpa: std.mem.Allocator, r: *relay.Relay) void {
+/// Sends one text frame on `r`, giving up at `deadline`.
+pub fn sendText(gpa: std.mem.Allocator, r: *relay.Relay, text: []const u8, deadline: Io.Clock.Timestamp) anyerror!void {
+    return writeBy(r.io, deadline, sendTextNow, .{ gpa, r, text });
+}
+
+fn subscribeNow(r: *relay.Relay, sub_id: []const u8, filters: []const Filter) anyerror!void {
+    return r.subscribe(sub_id, filters);
+}
+
+fn unsubscribeNow(r: *relay.Relay, sub_id: []const u8) anyerror!void {
+    return r.unsubscribe(sub_id);
+}
+
+fn sendNegClose(gpa: std.mem.Allocator, r: *relay.Relay, deadline: Io.Clock.Timestamp) void {
     const text = message.encodeNegClose(gpa, neg_sub_id) catch return;
     defer gpa.free(text);
-    sendText(gpa, r, text) catch {};
+    sendText(gpa, r, text, deadline) catch {};
 }
 
 /// Whether a NOTICE reads as a relay turning down a command it does not know.
@@ -200,8 +282,10 @@ pub fn reconcile(
         defer gpa.free(first_hex);
         const open = try message.encodeNegOpen(gpa, neg_sub_id, filter, first_hex);
         defer gpa.free(open);
-        sendText(gpa, r, open) catch |e| switch (e) {
+        sendText(gpa, r, open, opts.deadline) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            error.Timeout => return .{ .failed = .of(false, "the relay stopped reading before the time ran out", .{}) },
             else => return .{ .unsupported = .of(true, "the relay could not be written to: {s}", .{@errorName(e)}) },
         };
     }
@@ -221,7 +305,7 @@ pub fn reconcile(
         var msg = (r.receiveTimeout(.{ .deadline = wait_until }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Timeout => {
-                sendNegClose(gpa, r);
+                sendNegClose(gpa, r, opts.deadline);
                 if (engaged) return .{ .failed = .of(false, "the time ran out partway through", .{}) };
                 if (notice.len > 0) return .{ .unsupported = .of(false, "no answer to NEG-OPEN; the relay said: {s}", .{notice.text()}) };
                 return .{ .unsupported = .of(false, "no answer to NEG-OPEN", .{}) };
@@ -243,7 +327,7 @@ pub fn reconcile(
                 const bytes = nip77.fromHex(gpa, m.hex) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
-                        sendNegClose(gpa, r);
+                        sendNegClose(gpa, r, opts.deadline);
                         return .{ .failed = .of(false, "the relay's reply is not hex", .{}) };
                     },
                 };
@@ -251,7 +335,7 @@ pub fn reconcile(
                 var step = initiator.reconcile(gpa, bytes) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
-                        sendNegClose(gpa, r);
+                        sendNegClose(gpa, r, opts.deadline);
                         return .{ .failed = .of(false, "the relay's reply could not be read: {s}", .{@errorName(e)}) };
                     },
                 };
@@ -260,7 +344,7 @@ pub fn reconcile(
                 for (step.need) |id| try need.put(gpa, id, {});
 
                 const next = step.message orelse {
-                    sendNegClose(gpa, r);
+                    sendNegClose(gpa, r, opts.deadline);
                     const have_out = try gpa.dupe(Id, have.keys());
                     errdefer gpa.free(have_out);
                     const need_out = try gpa.dupe(Id, need.keys());
@@ -270,8 +354,10 @@ pub fn reconcile(
                 defer gpa.free(next_hex);
                 const text = try message.encodeNegMsg(gpa, neg_sub_id, next_hex);
                 defer gpa.free(text);
-                sendText(gpa, r, text) catch |e| switch (e) {
+                sendText(gpa, r, text, opts.deadline) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
+                    error.Canceled => return error.Canceled,
+                    error.Timeout => return .{ .failed = .of(false, "the relay stopped reading before the time ran out", .{}) },
                     else => return .{ .failed = .of(true, "the relay could not be written to: {s}", .{@errorName(e)}) },
                 };
             },
@@ -463,8 +549,13 @@ pub fn fetchIds(
         wanted.clearRetainingCapacity();
         for (batch) |id| try wanted.put(gpa, id, false);
         const f: Filter = .{ .ids = batch, .limit = @intCast(batch.len) };
-        r.subscribe(req_sub_id, &.{f}) catch |e| switch (e) {
+        writeBy(r.io, opts.deadline, subscribeNow, .{ r, req_sub_id, @as([]const Filter, &.{f}) }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            error.Timeout => {
+                result.timed_out = true;
+                return result;
+            },
             else => {
                 result.lost = true;
                 return result;
@@ -472,7 +563,14 @@ pub fn fetchIds(
         };
         try drain(gpa, r, .{ .ids = &wanted }, opts.verify, signer, sink, opts.deadline, &result);
         if (result.lost or result.timed_out) return result;
-        r.unsubscribe(req_sub_id) catch {};
+        writeBy(r.io, opts.deadline, unsubscribeNow, .{ r, req_sub_id }) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            error.Timeout => {
+                result.timed_out = true;
+                return result;
+            },
+            else => {},
+        };
     }
     return result;
 }
@@ -490,15 +588,23 @@ pub fn collect(
     opts: ReadOptions,
 ) !ReadResult {
     var result: ReadResult = .{};
-    r.subscribe(req_sub_id, &.{filter}) catch |e| switch (e) {
+    writeBy(r.io, opts.deadline, subscribeNow, .{ r, req_sub_id, @as([]const Filter, &.{filter}) }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        error.Timeout => {
+            result.timed_out = true;
+            return result;
+        },
         else => {
             result.lost = true;
             return result;
         },
     };
     try drain(gpa, r, .{ .filter = filter }, opts.verify, signer, sink, opts.deadline, &result);
-    if (!result.lost) r.unsubscribe(req_sub_id) catch {};
+    if (!result.lost and !result.timed_out) writeBy(r.io, opts.deadline, unsubscribeNow, .{ r, req_sub_id }) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        else => {},
+    };
     return result;
 }
 
@@ -832,4 +938,26 @@ test "a notice that is not a refusal is not taken as one" {
 test "a reason a relay wrote cannot carry terminal controls" {
     const n: Note = .of(false, "NOTICE: {s}", .{"a\x1b[2Jb\n"});
     try testing.expectEqualStrings("NOTICE: a?[2Jb?", n.text());
+}
+
+test "a write to a relay that stops reading gives up at the deadline" {
+    const io = testing.io;
+    const gpa = std.heap.page_allocator;
+    var deaf: testrelay.Relay = undefined;
+    try deaf.start(io, .deaf);
+    defer deaf.stop(io);
+    var url_buf: [40]u8 = undefined;
+    const url = try testrelay.url(&url_buf, deaf.port());
+    const r = try relay.dial(gpa, io, url);
+
+    // Far more than the socket buffers on both ends hold.
+    const text = try gpa.alloc(u8, 8 * 1024 * 1024);
+    defer gpa.free(text);
+    @memset(text, 'x');
+    const started = Io.Timestamp.now(io, .awake).toMilliseconds();
+    try testing.expectError(error.Timeout, sendText(gpa, r, text, deadlineIn(io, 300)));
+    const took = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try testing.expect(took < 3_000);
+    // Past its deadline, so it is shut down before the close frame.
+    release(r, deadlineIn(io, 0));
 }
