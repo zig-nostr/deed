@@ -473,14 +473,10 @@ fn importEvents(gpa: std.mem.Allocator, io: std.Io, st: *Store, reader: *std.Io.
 
 // -- delete -------------------------------------------------------------------
 
-/// Whether the library can drop one event by id in place.
-const can_remove = @hasDecl(Store, "remove");
-
 /// Removes the event in place, in one write transaction: the record, its
 /// index entries, and nothing else the store holds. Another process writing
 /// to the store at the same time waits for it rather than losing its writes.
 fn deleteEvent(gpa: std.mem.Allocator, io: std.Io, path: []const u8, id: [32]u8, err: *std.Io.Writer) !u8 {
-    if (comptime !can_remove) return copyWithout(gpa, io, path, id, err);
     var st = (try storepath.open(gpa, io, "store", path, .existing, err)) orelse return cli.exit_fail;
     defer st.deinit();
     const removed = st.remove(gpa, id) catch |e| return storeFailed(err, "delete", e);
@@ -490,86 +486,6 @@ fn deleteEvent(gpa: std.mem.Allocator, io: std.Io, path: []const u8, id: [32]u8,
         try err.print("deed store delete: no event {s} in the store\n", .{text});
         return cli.exit_fail;
     }
-    try err.writeAll("deed store: removed 1\n");
-    return cli.exit_ok;
-}
-
-/// For a library without `Store.remove`, which can drop an event by id only
-/// on behalf of its author's signed deletion: the store's events are copied
-/// without this one into a sibling file, and that file is moved over the
-/// original. Only events are copied, so this is used only where nothing
-/// better exists.
-fn copyWithout(gpa: std.mem.Allocator, io: std.Io, path: []const u8, id: [32]u8, err: *std.Io.Writer) !u8 {
-    const full = try fullPath(gpa, path);
-    defer gpa.free(full);
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.deed-tmp", .{full});
-    defer gpa.free(tmp);
-    const tmp_lock = try std.fmt.allocPrint(gpa, "{s}-lock", .{tmp});
-    defer gpa.free(tmp_lock);
-    const cwd = std.Io.Dir.cwd();
-
-    {
-        var src = (try storepath.open(gpa, io, "store", path, .existing, err)) orelse return cli.exit_fail;
-        defer src.deinit();
-        const present = src.hasEvent(id) catch |e| return storeFailed(err, "delete", e);
-        if (!present) {
-            const text = try hex.encode(gpa, &id);
-            defer gpa.free(text);
-            try err.print("deed store delete: no event {s} in the store\n", .{text});
-            return cli.exit_fail;
-        }
-        const total = src.eventCount() catch |e| return storeFailed(err, "delete", e);
-
-        cwd.deleteFile(io, tmp) catch {};
-        cwd.deleteFile(io, tmp_lock) catch {};
-        const z = try gpa.dupeZ(u8, tmp);
-        defer gpa.free(z);
-        var dst = Store.open(z, .{}) catch |e| return storeFailed(err, "delete", e);
-        var dst_open = true;
-        defer if (dst_open) dst.deinit();
-        errdefer {
-            dst.deinit();
-            dst_open = false;
-            cwd.deleteFile(io, tmp) catch {};
-            cwd.deleteFile(io, tmp_lock) catch {};
-        }
-
-        var pager = Pager.init(gpa, &src, .{});
-        defer pager.deinit();
-        var results: [page_size]nostr.store.IngestResult = undefined;
-        var copy: std.ArrayList(event.Event) = .empty;
-        defer copy.deinit(gpa);
-        while (pager.next() catch |e| return storeFailed(err, "delete", e)) |page| {
-            copy.clearRetainingCapacity();
-            for (page) |ev| {
-                if (!std.mem.eql(u8, &ev.id, &id)) try copy.append(gpa, ev);
-            }
-            var from: usize = 0;
-            while (from < copy.items.len) {
-                const to = @min(from + results.len, copy.items.len);
-                dst.ingestBatch(gpa, copy.items[from..to], .{}, results[0 .. to - from]) catch |e| return storeFailed(err, "delete", e);
-                from = to;
-            }
-        }
-        const copied = dst.eventCount() catch |e| return storeFailed(err, "delete", e);
-        if (copied != total - 1) {
-            try err.print("deed store delete: the copy holds {d} events, expected {d}; the store was left as it was\n", .{ copied, total - 1 });
-            dst.deinit();
-            dst_open = false;
-            cwd.deleteFile(io, tmp) catch {};
-            cwd.deleteFile(io, tmp_lock) catch {};
-            return cli.exit_fail;
-        }
-    }
-    // Both stores are closed before the move: Windows will not replace a file
-    // that is open.
-    cwd.rename(tmp, cwd, full, io) catch |e| {
-        try err.print("deed store delete: could not replace the store: {s}\n", .{@errorName(e)});
-        cwd.deleteFile(io, tmp) catch {};
-        cwd.deleteFile(io, tmp_lock) catch {};
-        return cli.exit_fail;
-    };
-    cwd.deleteFile(io, tmp_lock) catch {};
     try err.writeAll("deed store: removed 1\n");
     return cli.exit_ok;
 }
@@ -884,9 +800,6 @@ test "delete removes one event and keeps the others" {
 }
 
 test "delete keeps what the store holds besides events" {
-    // Only a library that removes in place can keep it; the copy it falls
-    // back to without one holds events alone.
-    if (!can_remove) return error.SkipZigTest;
     var d: Dir = undefined;
     try d.init();
     defer d.deinit();
