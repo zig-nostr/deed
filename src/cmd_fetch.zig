@@ -130,7 +130,6 @@ pub fn run(
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
-        .poll_ms = 100,
         .store = if (store) |*st| st else null,
     });
 
