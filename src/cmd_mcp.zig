@@ -48,7 +48,7 @@ pub const usage =
     \\deed mcp: serve deed's tools to MCP clients over stdio
     \\
     \\Usage:
-    \\  deed mcp [--store <path>] [--allow-publish [--sec <key>]]
+    \\  deed mcp [--store <path>] [--allow-local] [--allow-publish [--sec <key>]]
     \\
     \\Speaks the Model Context Protocol (JSON-RPC 2.0, one message per line)
     \\on stdin and stdout, for an MCP client to start as a subprocess. Logs go
@@ -65,6 +65,8 @@ pub const usage =
     \\                         signing key, from --sec or $NOSTR_SECRET_KEY
     \\                         (nsec1..., 64 hex characters or ncryptsec1...)
     \\      --sec <key>        the key to sign with
+    \\      --allow-local      let relay_info reach loopback and private
+    \\                         addresses, for a relay on this machine or LAN
     \\
     \\Without --allow-publish the publishing tools are not listed and cannot be
     \\called. The key is never accepted as a tool argument and never returned.
@@ -133,6 +135,8 @@ pub const Config = struct {
     /// The key that signs what the publishing tools publish. Null leaves
     /// those tools out.
     secret: ?nostr.keys.SecretKey = null,
+    /// relay_info may reach loopback and private addresses.
+    allow_local: bool = false,
 };
 
 const Handler = *const fn (s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) anyerror!bool;
@@ -214,7 +218,7 @@ const tools = [_]Tool{
     },
     .{
         .name = "relay_info",
-        .description = "Fetch relays' NIP-11 information documents.",
+        .description = "Fetch relays' NIP-11 information documents. Relays are ws:// or wss:// URLs on public addresses.",
         .schema =
         \\{"type":"object","properties":{"relays":
         ++ relays_schema ++
@@ -307,6 +311,8 @@ pub fn run(
         }
         if (std.mem.eql(u8, a, "--allow-publish")) {
             allow_publish = true;
+        } else if (std.mem.eql(u8, a, "--allow-local")) {
+            cfg.allow_local = true;
         } else if (cli.isOneOf(a, &.{ "--store", "--sec" })) {
             i += 1;
             if (i >= args.len) {
@@ -621,6 +627,71 @@ fn isWsUrl(s: []const u8) bool {
     return true;
 }
 
+/// The host of a ws:// or wss:// URL, without brackets, port or a trailing
+/// dot. Null when there is none, or when the URL carries a user name.
+fn relayHost(url: []const u8) ?[]const u8 {
+    const after = (std.mem.indexOf(u8, url, "://") orelse return null) + 3;
+    const rest = url[after..];
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return null;
+    var host = authority;
+    if (std.mem.startsWith(u8, authority, "[")) {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+        host = authority[1..close];
+    } else if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+    }
+    host = std.mem.trimEnd(u8, host, ".");
+    return if (host.len == 0) null else host;
+}
+
+/// True for a host name, or an address, that is not this machine, a private
+/// network, or link-local. A number written any way but four plain decimal
+/// parts is not public either: a resolver reads "127.1" and "2130706433" as
+/// loopback.
+fn publicHost(host: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, host, ':') != null) {
+        const ip6 = Io.net.Ip6Address.parse(host, 0) catch return false;
+        return publicIp6(ip6.bytes);
+    }
+    for ([_][]const u8{ "localhost", ".localhost", ".local", ".internal", ".home.arpa" }) |name| {
+        if (name[0] == '.') {
+            if (std.ascii.endsWithIgnoreCase(host, name)) return false;
+        } else if (std.ascii.eqlIgnoreCase(host, name)) return false;
+    }
+    const last = host[if (std.mem.lastIndexOfScalar(u8, host, '.')) |dot| dot + 1 else 0..];
+    const numeric = std.ascii.startsWithIgnoreCase(host, "0x") or
+        for (last) |c| {
+            if (!std.ascii.isDigit(c)) break false;
+        } else true;
+    if (!numeric) return true;
+    const ip4 = Io.net.Ip4Address.parse(host, 0) catch return false;
+    return publicIp4(ip4.bytes);
+}
+
+fn publicIp4(b: [4]u8) bool {
+    return !(b[0] == 0 or b[0] == 10 or b[0] == 127 or b[0] >= 224 or
+        (b[0] == 100 and b[1] & 0xc0 == 64) or
+        (b[0] == 169 and b[1] == 254) or
+        (b[0] == 172 and b[1] & 0xf0 == 16) or
+        (b[0] == 192 and b[1] == 0 and b[2] == 0) or
+        (b[0] == 192 and b[1] == 168) or
+        (b[0] == 198 and b[1] & 0xfe == 18));
+}
+
+fn publicIp6(b: [16]u8) bool {
+    // ::/96 holds :: and ::1 and the old IPv4-compatible form.
+    if (std.mem.allEqual(u8, b[0..12], 0)) return false;
+    // ::ffff:0:0/96 (IPv4-mapped) and 64:ff9b::/96 (NAT64) carry an IPv4
+    // address, which decides.
+    const mapped = std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
+    const nat64 = std.mem.eql(u8, b[0..12], &[_]u8{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
+    if (mapped or nat64) return publicIp4(b[12..16].*);
+    // Unique local fc00::/7, link-local and site-local fe80::/9, multicast.
+    if (b[0] & 0xfe == 0xfc or b[0] == 0xff or (b[0] == 0xfe and b[1] & 0x80 == 0x80)) return false;
+    return true;
+}
+
 /// The strings of an array argument, or null when it is absent. A wrong shape
 /// is `error.BadArgument`.
 fn stringList(a: Allocator, args: Json, name: []const u8) !?[]const []const u8 {
@@ -801,10 +872,15 @@ fn toolCount(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !
 }
 
 fn toolRelayInfo(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
-    const list = (stringList(a, args, "relays") catch return fail(out, "relays must be an array of strings")) orelse
-        return fail(out, "relays is required");
-    if (list.len == 0 or list.len > max_tool_relays) return failf(out, "name between 1 and {d} relays", .{max_tool_relays});
-    for (list) |r| if (!plain(r) or std.mem.indexOfScalar(u8, r, ' ') != null) return failf(out, "'{s}' is not a relay", .{r[0..@min(r.len, 100)]});
+    // The verb turns ws:// into http:// and wss:// into https:// itself, so
+    // the caller never names an HTTP URL, and with it an arbitrary endpoint.
+    const list = (try relayList(a, args, out, true)) orelse return false;
+    for (list) |r| {
+        const host = relayHost(r) orelse return failf(out, "'{s}' is not a ws:// or wss:// relay URL", .{r[0..@min(r.len, 100)]});
+        if (!s.cfg.allow_local and !publicHost(host)) {
+            return failf(out, "'{s}' is a local or private address; start the server with --allow-local to ask one", .{r[0..@min(r.len, 100)]});
+        }
+    }
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ "--timeout", try num(a, @divTrunc(timeoutMs(args) + 999, 1000)) });
     try argv.appendSlice(a, list);
@@ -1376,4 +1452,82 @@ test "a filter or event nested past the limit is refused, not a crash" {
         try testing.expect(has(r, "nested too deeply"));
     }
     try testing.expect(has(replyFor(got, 4, &b).?, "\"result\":{}"));
+}
+
+test "relay_info takes ws:// and wss:// relays only, and no local or private address" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const refused = [_][]const u8{
+        "http://127.0.0.1:1",
+        "https://relay.example",
+        "relay.example",
+        "ws://127.0.0.1:1",
+        "wss://localhost",
+        "wss://LOCALHOST.:443/",
+        "wss://app.localhost",
+        "wss://10.1.2.3",
+        "wss://172.16.0.1",
+        "wss://192.168.1.1",
+        "wss://169.254.169.254",
+        "wss://100.64.0.1",
+        "wss://0.0.0.0",
+        "wss://user@127.0.0.1",
+        "wss://2130706433",
+        "wss://127.1",
+        "wss://0x7f000001",
+        "wss://[::1]",
+        "wss://[fd00::1]:8080",
+        "wss://[fe80::1]",
+        "wss://[::ffff:127.0.0.1]",
+        "wss://printer.local",
+    };
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(gpa);
+    for (refused, 1..) |r, id| {
+        const args = try std.fmt.allocPrint(gpa, "{{\"relays\":[\"{s}\"],\"timeout_ms\":300}}", .{r});
+        defer gpa.free(args);
+        const l = try callLine(gpa, @intCast(id), "relay_info", args);
+        defer gpa.free(l);
+        try all.appendSlice(gpa, l);
+    }
+    const got = try converse(gpa, .{}, all.items);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    for (refused, 1..) |r, id| {
+        const reply = replyFor(got, @intCast(id), &b).?;
+        testing.expect(has(reply, "\"isError\":true") and
+            (has(reply, "is not a ws:// or wss:// relay URL") or has(reply, "local or private address"))) catch |e| {
+            std.debug.print("not refused: {s}: {s}\n", .{ r, reply });
+            return e;
+        };
+    }
+}
+
+test "relay_info reaches a local relay when the server allows it" {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const http = @import("http.zig");
+    var srv: http.TestServer = undefined;
+    try srv.start(io, &.{.{ .path = "/", .body = "{\"name\":\"local relay\"}" }}, 1);
+    defer srv.stop(io);
+    const args = try std.fmt.allocPrint(gpa, "{{\"relays\":[\"ws://127.0.0.1:{d}\"],\"timeout_ms\":3000}}", .{srv.port()});
+    defer gpa.free(args);
+    const l = try callLine(gpa, 1, "relay_info", args);
+    defer gpa.free(l);
+    const got = try converse(gpa, .{ .allow_local = true }, l);
+    defer gpa.free(got);
+    try testing.expect(has(got, "\"isError\":false"));
+    try testing.expect(has(got, "local relay"));
+}
+
+test "public hosts and addresses pass the relay_info check" {
+    for ([_][]const u8{ "relay.example", "nos.lol", "1.2.3.4", "8.8.8.8", "2001:db8::1", "1relay.example" }) |h| {
+        try testing.expect(publicHost(h));
+    }
+    try testing.expectEqualStrings("relay.example", relayHost("wss://relay.example:443/path").?);
+    try testing.expectEqualStrings("::1", relayHost("wss://[::1]:80").?);
+    try testing.expect(relayHost("wss://u@relay.example") == null);
 }
