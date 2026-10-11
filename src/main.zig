@@ -8,7 +8,7 @@ const cli = @import("cli.zig");
 const console = @import("console.zig");
 const verbs = @import("verbs.zig");
 
-pub const version = "0.4.1";
+pub const version = "0.5.0";
 
 pub fn main(init: std.process.Init) !void {
     // A general-purpose allocator, not `page_allocator`: that one maps pages
