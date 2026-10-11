@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const nip98 = nostr.nip98;
@@ -43,8 +44,9 @@ pub const usage =
     \\           so no payload tag is added for it
     \\
     \\Options:
-    \\  --sec <key>   the secret key to sign with (nsec1..., hex or ncryptsec1...).
-    \\                Falls back to $NOSTR_SECRET_KEY. Not passed on to curl.
+    \\  --sec <key>   the secret key to sign with (nsec1..., hex or ncryptsec1...),
+    \\                or a remote signer as bunker://... Falls back to
+    \\                $NOSTR_SECRET_KEY. Not passed on to curl.
     \\
     \\The header carries the time it was signed, and servers accept it for a
     \\minute or so. It reaches curl on stdin, so it is not in the process
@@ -301,24 +303,6 @@ fn getEnv(name: [*:0]const u8) ?[]const u8 {
     return if (span.len == 0) null else span;
 }
 
-/// The secret key from the flag or `$NOSTR_SECRET_KEY`, or null after saying
-/// why there is none. A key nobody chose is never invented.
-pub fn readSecret(
-    gpa: std.mem.Allocator,
-    verb: []const u8,
-    flag: ?[]const u8,
-    err: *std.Io.Writer,
-) !?keys.SecretKey {
-    const raw = flag orelse getEnv("NOSTR_SECRET_KEY") orelse {
-        try err.print("deed {s}: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n", .{verb});
-        return null;
-    };
-    return keyinput.secretKey(gpa, raw) catch {
-        try err.print("deed {s}: not a secret key (want nsec1... or 64 hex characters)\n", .{verb});
-        return null;
-    };
-}
-
 pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -352,13 +336,14 @@ pub fn run(
     };
     defer parsed.deinit(gpa);
 
-    const sk = (try readSecret(gpa, "curl", parsed.sec, err)) orelse return cli.exit_usage;
-    var signer = try keys.Signer.initRandomized(io);
+    var signer = (signing.fromFlag(gpa, io, "curl", parsed.sec, err) catch |e| switch (e) {
+        error.BadKey => return cli.exit_fail,
+        else => return e,
+    }) orelse return cli.exit_usage;
     defer signer.deinit();
-    const keypair = try signer.keyPairFromSecretKey(sk);
 
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
-    const auth = try nip98.authHeader(gpa, signer, keypair, now, parsed.url, parsed.method, parsed.body, null);
+    const auth = signer.httpAuthHeader(gpa, now, parsed.url, parsed.method, parsed.body) catch |e| return signing.report("curl", e, err);
     defer gpa.free(auth);
     // The header line curl reads with `-H @...`. It is data for curl's
     // stdin or a private file, never an argument.

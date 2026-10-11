@@ -22,6 +22,7 @@ const http = @import("http.zig");
 const keyinput = @import("keyinput.zig");
 const post = @import("cmd_post.zig");
 const relayset = @import("relayset.zig");
+const signing = @import("signing.zig");
 
 const Io = std.Io;
 const event = nostr.event;
@@ -259,19 +260,21 @@ pub fn run(
 
     switch (c) {
         .info, .members, .admins => {
-            const auth_opts = auth.resolve(gpa, auth_flags, "group", err) catch |e| switch (e) {
+            const auth_opts = auth.resolve(gpa, io, auth_flags, "group", err) catch |e| switch (e) {
                 error.Usage => return cli.exit_usage,
                 error.BadKey => return cli.exit_fail,
                 else => |other| return other,
             };
+            defer if (auth_opts) |o| o.deinit(gpa);
             return readState(gpa, io, c, group, opts, auth_opts, out, err);
         },
         .chat => if (opts.send == null) {
-            const auth_opts = auth.resolve(gpa, auth_flags, "group", err) catch |e| switch (e) {
+            const auth_opts = auth.resolve(gpa, io, auth_flags, "group", err) catch |e| switch (e) {
                 error.Usage => return cli.exit_usage,
                 error.BadKey => return cli.exit_fail,
                 else => |other| return other,
             };
+            defer if (auth_opts) |o| o.deinit(gpa);
             return readChat(gpa, io, group, opts, auth_opts, out, err);
         },
         else => {},
@@ -281,20 +284,19 @@ pub fn run(
     if (extra != null) opts.pubkey = extra;
     const kind_and_tags = (try buildWrite(arena, io, c, group, opts, roles.items, gpa, err)) orelse return cli.exit_usage;
 
-    const sk = (post.readSecret(gpa, "group", auth_flags.sec, err) catch |e| switch (e) {
+    var signer = (signing.fromFlag(gpa, io, "group", auth_flags.sec, err) catch |e| switch (e) {
         error.BadKey => return cli.exit_fail,
         else => return e,
     }) orelse return cli.exit_usage;
-    var signer = try nostr.keys.Signer.initRandomized(io);
     defer signer.deinit();
-    const keypair = try signer.keyPairFromSecretKey(sk);
+    // The same signer answers the relay's challenge, lent rather than owned.
     const auth_opts: ?auth.Options = if (auth_flags.auth or auth_flags.force_pre_auth)
-        .{ .keypair = keypair, .force_pre_auth = auth_flags.force_pre_auth }
+        .{ .keypair = signer.keyPair(), .remote = if (signer.isRemote()) &signer else null, .force_pre_auth = auth_flags.force_pre_auth }
     else
         null;
 
     const now = Io.Timestamp.now(io, .real).toSeconds();
-    const ev = try event.create(arena, signer, keypair, now, kind_and_tags.kind, kind_and_tags.tags, kind_and_tags.content, null);
+    const ev = signer.sign(arena, now, kind_and_tags.kind, kind_and_tags.tags, kind_and_tags.content) catch |e| return signing.report("group", e, err);
     const accepted = try publishOne(gpa, io, group.relay, ev, auth_opts, opts.timeout_ms, err);
     if (!accepted) return cli.exit_fail;
     const wire = try event.toJson(arena, ev);

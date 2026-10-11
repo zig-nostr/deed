@@ -121,11 +121,12 @@ pub fn run(
         try err.writeAll("deed fetch: needs a code to fetch\n");
         return cli.exit_usage;
     };
-    const auth_opts = auth.resolve(gpa, auth_flags, "fetch", err) catch |e| switch (e) {
+    const auth_opts = auth.resolve(gpa, io, auth_flags, "fetch", err) catch |e| switch (e) {
         error.Usage => return cli.exit_usage,
         error.BadKey => return cli.exit_fail,
         else => |other| return other,
     };
+    defer if (auth_opts) |o| o.deinit(gpa);
 
     var ids: [1][32]u8 = undefined;
     var authors: [1][32]u8 = undefined;

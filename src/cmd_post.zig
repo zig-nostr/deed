@@ -15,6 +15,7 @@ const cli = @import("cli.zig");
 const dial = @import("dial.zig");
 const keyinput = @import("keyinput.zig");
 const outbox = @import("outbox.zig");
+const signing = @import("signing.zig");
 const publish = @import("cmd_publish.zig");
 const relayset = @import("relayset.zig");
 
@@ -50,7 +51,8 @@ pub const usage =
     \\  echo "hello" | deed post --sec nsec1... wss://relay.example
     \\
     \\Options:
-    \\      --sec <key>         secret key, as nsec1... or 64 hex characters.
+    \\      --sec <key>         secret key, as nsec1..., ncryptsec1... or 64 hex
+    \\                          characters, or a remote signer as bunker://...
     \\                          Falls back to $NOSTR_SECRET_KEY.
     \\      --reply <code>      reply to an event (nevent, note or 64 hex
     \\                          characters). The parent is fetched from the relays
@@ -155,10 +157,11 @@ pub fn run(
         return cli.exit_usage;
     }
 
-    const sk = (readSecret(gpa, "post", opts.sec, err) catch |e| switch (e) {
+    var signer = (signing.fromFlag(gpa, io, "post", opts.sec, err) catch |e| switch (e) {
         error.BadKey => return cli.exit_fail,
         else => return e,
     }) orelse return cli.exit_usage;
+    defer signer.deinit();
 
     var content_owned: ?[]u8 = null;
     defer if (content_owned) |c| gpa.free(c);
@@ -191,16 +194,12 @@ pub fn run(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var signer = try nostr.keys.Signer.initRandomized(io);
-    defer signer.deinit();
-    const keypair = try signer.keyPairFromSecretKey(sk);
-
     // No relay named: the relays the author writes to. A dry run that fetches
     // nothing needs no relay at all.
     var followed: ?outbox.Urls = null;
     defer if (followed) |*f| f.deinit();
     if (urls.items.len == 0 and (!opts.dry_run or opts.reply != null or opts.comment != null)) {
-        followed = (try outbox.followWriteRelays(gpa, io, "post", keypair.public_key, bootstrap.items, null, opts.timeout_ms, err)) orelse return cli.exit_usage;
+        followed = (try outbox.followWriteRelays(gpa, io, "post", signer.publicKey(), bootstrap.items, null, opts.timeout_ms, err)) orelse return cli.exit_usage;
         const take = @min(followed.?.urls.len, dial.max_relays);
         try urls.appendSlice(gpa, followed.?.urls[0..take]);
     }
@@ -214,20 +213,22 @@ pub fn run(
         tags = (try commentTagsFor(gpa, io, arena, code, urls.items, bootstrap.items, opts.timeout_ms, err)) orelse return cli.exit_fail;
     }
 
-    const now = std.Io.Timestamp.now(io, .real).toSeconds();
-    const ev = try event.create(arena, signer, keypair, now, kind, tags, content, null);
-    const wire = try event.toJson(arena, ev);
-
-    if (opts.dry_run) {
-        try out.print("{s}\n", .{wire});
-        return cli.exit_ok;
-    }
-
+    // Confirmed before it is signed, so a remote signer is not asked to sign
+    // a note that is then thrown away.
     if (tty) |*t| {
         if (!try t.confirm(content, urls.items.len)) {
             try err.writeAll("deed post: not published, not confirmed\n");
             return cli.exit_fail;
         }
+    }
+
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const ev = signer.sign(arena, now, kind, tags, content) catch |e| return signing.report("post", e, err);
+    const wire = try event.toJson(arena, ev);
+
+    if (opts.dry_run) {
+        try out.print("{s}\n", .{wire});
+        return cli.exit_ok;
     }
 
     const accepted = try publishEvent(gpa, io, urls.items, ev, opts.timeout_ms, "post", err);
@@ -247,23 +248,6 @@ fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     const span = std.mem.span(value);
     return if (span.len == 0) null else span;
-}
-
-/// The secret key from the flag or `$NOSTR_SECRET_KEY`, or null after saying
-/// why there is none (a usage error). A key that is there and cannot be read
-/// fails with `error.BadKey` after one line saying why. A key nobody chose is
-/// never invented.
-pub fn readSecret(
-    gpa: std.mem.Allocator,
-    verb: []const u8,
-    flag: ?[]const u8,
-    err: *std.Io.Writer,
-) !?nostr.keys.SecretKey {
-    const raw = flag orelse getEnv("NOSTR_SECRET_KEY") orelse {
-        try err.print("deed {s}: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n", .{verb});
-        return null;
-    };
-    return try keyinput.secretKeyForVerb(gpa, verb, raw, err);
 }
 
 // ---------------------------------------------------------------------------

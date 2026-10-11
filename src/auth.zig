@@ -12,17 +12,32 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const keyinput = @import("keyinput.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const nip42 = nostr.nip42;
 
 /// What a run that may authenticate needs.
 pub const Options = struct {
-    keypair: keys.KeyPair,
+    /// The key answers are signed with, when it is held here.
+    keypair: ?keys.KeyPair = null,
+    /// The remote signer that signs them otherwise.
+    remote: ?*signing.Signer = null,
+    /// `deinit` ends the remote signer's session and frees it: set when
+    /// `resolve` opened it, and not when a verb lends its own.
+    owns_remote: bool = false,
     /// Wait for the relay's challenge, and answer it, before asking anything.
     /// For relays that send no `auth-required:` refusal and quietly answer an
     /// unauthenticated reader with less.
     force_pre_auth: bool = false,
+
+    pub fn deinit(self: Options, gpa: std.mem.Allocator) void {
+        if (!self.owns_remote) return;
+        if (self.remote) |r| {
+            r.deinit();
+            gpa.destroy(r);
+        }
+    }
 };
 
 /// The flags as they were given, before the key is read.
@@ -60,8 +75,10 @@ pub const usage_lines = "\n" ++
     \\                       and try once more
     \\      --force-pre-auth wait for the challenge and answer it before
     \\                       asking anything (implies --auth)
-    \\      --sec <key>      the key to authenticate with, as nsec1... or 64
-    \\                       hex characters. Falls back to $NOSTR_SECRET_KEY
+    \\      --sec <key>      the key to authenticate with, as nsec1...,
+    \\                       ncryptsec1... or 64 hex characters, or a remote
+    \\                       signer as bunker://... Falls back to
+    \\                       $NOSTR_SECRET_KEY
     \\
 ;
 
@@ -73,8 +90,10 @@ pub const ResolveError = error{
 };
 
 /// Turns the flags into options, reading the key. Null when `--auth` was not
-/// given. Says what is wrong on `err` before failing.
-pub fn resolve(gpa: std.mem.Allocator, flags: Flags, verb: []const u8, err: *std.Io.Writer) !?Options {
+/// given. Says what is wrong on `err` before failing. A `bunker://` URI
+/// connects to the remote signer here, so a signer that cannot be reached
+/// ends the run before any relay is asked; the caller deinits the options.
+pub fn resolve(gpa: std.mem.Allocator, io: std.Io, flags: Flags, verb: []const u8, err: *std.Io.Writer) !?Options {
     if (!flags.auth and !flags.force_pre_auth) {
         if (flags.sec != null) {
             try err.print("deed {s}: --sec is for --auth, which was not given\n", .{verb});
@@ -86,6 +105,12 @@ pub fn resolve(gpa: std.mem.Allocator, flags: Flags, verb: []const u8, err: *std
         try err.print("deed {s}: --auth needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n", .{verb});
         return ResolveError.Usage;
     };
+    if (keyinput.isBunkerUri(raw)) {
+        const remote = try gpa.create(signing.Signer);
+        errdefer gpa.destroy(remote);
+        remote.* = (try signing.open(gpa, io, verb, raw, err)) orelse return ResolveError.BadKey;
+        return .{ .remote = remote, .owns_remote = true, .force_pre_auth = flags.force_pre_auth };
+    }
     const sk = keyinput.secretKeyForVerb(gpa, verb, raw, err) catch |e| switch (e) {
         error.BadKey => return ResolveError.BadKey,
         else => |other| return other,
@@ -135,7 +160,18 @@ pub fn answer(gpa: std.mem.Allocator, io: std.Io, opts: Options, url: []const u8
     defer signer.deinit();
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
     const a = arena.allocator();
-    const ev = try nip42.authEvent(a, signer, opts.keypair, try a.dupe(u8, url), try a.dupe(u8, challenge), now, null);
+    const relay_url = try a.dupe(u8, url);
+    const text = try a.dupe(u8, challenge);
+    if (opts.remote) |remote| {
+        // The tags `nip42.authEvent` builds, signed by the remote signer.
+        const tags = try a.alloc(nostr.event.Tag, 2);
+        tags[0] = try a.dupe([]const u8, &.{ "relay", relay_url });
+        tags[1] = try a.dupe([]const u8, &.{ "challenge", text });
+        const ev = try remote.sign(a, now, nip42.kind, tags, "");
+        return .{ .id = ev.id, .event = ev, .arena = arena };
+    }
+    const kp = opts.keypair orelse return error.NoKey;
+    const ev = try nip42.authEvent(a, signer, kp, relay_url, text, now, null);
     return .{ .id = ev.id, .event = ev, .arena = arena };
 }
 
@@ -170,12 +206,12 @@ test "the flags are taken, and a key is needed only when --auth is given" {
     try std.testing.expectEqual(@as(usize, 2), i);
     i += 1;
     try std.testing.expect(f.take(&args, &i) == .not_mine);
-    const opts = (try resolve(gpa, f, "req", &err)).?;
+    const opts = (try resolve(gpa, std.testing.io, f, "req", &err)).?;
     try std.testing.expect(!opts.force_pre_auth);
 
-    try std.testing.expectEqual(@as(?Options, null), try resolve(gpa, .{}, "req", &err));
-    try std.testing.expectError(ResolveError.Usage, resolve(gpa, .{ .sec = "11" ** 32 }, "req", &err));
-    try std.testing.expectError(ResolveError.BadKey, resolve(gpa, .{ .auth = true, .sec = "nope" }, "req", &err));
+    try std.testing.expectEqual(@as(?Options, null), try resolve(gpa, std.testing.io, .{}, "req", &err));
+    try std.testing.expectError(ResolveError.Usage, resolve(gpa, std.testing.io, .{ .sec = "11" ** 32 }, "req", &err));
+    try std.testing.expectError(ResolveError.BadKey, resolve(gpa, std.testing.io, .{ .auth = true, .sec = "nope" }, "req", &err));
 
     var g: Flags = .{};
     const short = [_][]const u8{"--sec"};

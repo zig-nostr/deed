@@ -8,6 +8,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const nip44 = nostr.nip44;
@@ -46,7 +47,8 @@ pub const encrypt_usage =
     \\
     \\Options:
     \\  --to <pubkey>   recipient, as npub1… or 64 hex characters
-    \\  --sec <key>     your secret key, as nsec1… or 64 hex characters.
+    \\  --sec <key>     your secret key, as nsec1…, ncryptsec1… or 64 hex
+    \\                  characters, or a remote signer as bunker://…
     \\                  Falls back to $NOSTR_SECRET_KEY.
     \\  --nip04         use legacy NIP-04 (payload ends in ?iv=…) instead of
     \\                  NIP-44. It has no authentication; use it only to talk
@@ -68,7 +70,8 @@ pub const decrypt_usage =
     \\
     \\Options:
     \\  --from <pubkey> sender, as npub1… or 64 hex characters
-    \\  --sec <key>     your secret key, as nsec1… or 64 hex characters.
+    \\  --sec <key>     your secret key, as nsec1…, ncryptsec1… or 64 hex
+    \\                  characters, or a remote signer as bunker://…
     \\                  Falls back to $NOSTR_SECRET_KEY.
     \\  --nip04         the payload is legacy NIP-04. A wrong key or an altered
     \\                  payload is only noticed when the padding turns out
@@ -149,13 +152,6 @@ pub fn run(
         return cli.exit_usage;
     };
 
-    const sk = keyinput.secretKey(gpa, sec_text) catch {
-        try err.print(
-            "deed {s}: not a secret key (want nsec1… or 64 hex characters)\n",
-            .{dir.verb()},
-        );
-        return cli.exit_fail;
-    };
     const peer = keyinput.publicKey(gpa, peer_text) catch {
         try err.print(
             "deed {s}: {s} is not a public key (want npub1… or 64 hex characters)\n",
@@ -164,26 +160,8 @@ pub fn run(
         return cli.exit_fail;
     };
 
-    var signer = try keys.Signer.initRandomized(io);
+    var signer = (try signing.open(gpa, io, dir.verb(), sec_text, err)) orelse return cli.exit_fail;
     defer signer.deinit();
-
-    // Derived once and reused: the conversation key depends only on the pair,
-    // so a thousand messages cost one ECDH rather than a thousand. The *nonce*
-    // is the part that must never be reused, and it is drawn fresh inside the
-    // loop below.
-    var conversation_key: [32]u8 = undefined;
-    defer std.crypto.secureZero(u8, &conversation_key);
-    if (legacy) {
-        conversation_key = nip04Key(signer, sk, peer) catch |e| {
-            try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
-            return cli.exit_fail;
-        };
-    } else {
-        conversation_key = nip44.conversationKey(signer, sk, peer) catch |e| {
-            try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
-            return cli.exit_fail;
-        };
-    }
 
     const stdin_buf = try gpa.alloc(u8, max_record_bytes);
     defer gpa.free(stdin_buf);
@@ -192,6 +170,42 @@ pub fn run(
     // records an earlier reader on the same descriptor already consumed.
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
     var input = cli.Input.init(positionals.items, &stdin_reader.interface);
+    return cryptAll(gpa, io, dir, legacy, &signer, peer, &input, out, err);
+}
+
+/// Encrypts or decrypts every record of `input` and prints one result per
+/// line. Returns the exit code.
+fn cryptAll(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: Direction,
+    legacy: bool,
+    signer: *signing.Signer,
+    peer: keys.PublicKey,
+    input: *cli.Input,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    // Derived once and reused: the conversation key depends only on the pair,
+    // so a thousand messages cost one ECDH rather than a thousand. The *nonce*
+    // is the part that must never be reused, and it is drawn fresh inside the
+    // loop below. A remote signer holds the key, so it does this itself, once
+    // per message.
+    var conversation_key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &conversation_key);
+    if (signer.keyPair()) |kp| {
+        if (legacy) {
+            conversation_key = nip04Key(signer.ctx, kp.secret_key, peer) catch |e| {
+                try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
+                return cli.exit_fail;
+            };
+        } else {
+            conversation_key = nip44.conversationKey(signer.ctx, kp.secret_key, peer) catch |e| {
+                try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
+                return cli.exit_fail;
+            };
+        }
+    }
 
     var failures: usize = 0;
     while (try input.next()) |record| {
@@ -206,7 +220,16 @@ pub fn run(
                 continue;
             },
         };
-        const result = switch (dir) {
+        const result = if (signer.isRemote()) remote: {
+            const method: signing.Method = switch (dir) {
+                .encrypt => if (legacy) .nip04_encrypt else .nip44_encrypt,
+                .decrypt => if (legacy) .nip04_decrypt else .nip44_decrypt,
+            };
+            // A signer that refused or went quiet will do the same for the
+            // next message, so the run ends here.
+            break :remote signer.crypt(gpa, io, method, peer, text) catch |e|
+                return signing.report(dir.verb(), e, err);
+        } else switch (dir) {
             .encrypt => blk: {
                 if (legacy) {
                     var iv: [16]u8 = undefined;
@@ -226,7 +249,10 @@ pub fn run(
             failures += 1;
             continue;
         };
-        defer gpa.free(result);
+        defer {
+            std.crypto.secureZero(u8, result);
+            gpa.free(result);
+        }
         try out.print("{s}\n", .{result});
     }
 

@@ -9,10 +9,13 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const event = nostr.event;
 const nip59 = nostr.nip59;
+const nip44 = nostr.nip44;
+const hex = nostr.hex;
 
 /// A wrap is a few kilobytes and a message at most 65535 bytes of NIP-44
 /// plaintext inside two layers of base64, so nothing legitimate nears this.
@@ -35,7 +38,10 @@ pub const usage =
     \\Options:
     \\  --to <pubkey>   recipient, as npub1… or 64 hex characters. dm takes it
     \\                  more than once.
-    \\  --sec <key>     your secret key, as nsec1… or 64 hex characters.
+    \\  --sec <key>     your secret key, as nsec1…, ncryptsec1… or 64 hex
+    \\                  characters, or a remote signer as bunker://… (it
+    \\                  signs and encrypts the seal; the wrap is signed by a
+    \\                  one-time key made here, as always).
     \\                  Falls back to $NOSTR_SECRET_KEY.
     \\  --json          unwrap: print {"sender":…,"rumor":…} instead of the
     \\                  rumor alone
@@ -164,14 +170,6 @@ fn runWith(
         );
         return cli.exit_usage;
     };
-    const sk = keyinput.secretKey(gpa, sec_text) catch {
-        try err.print(
-            "deed gift {s}: not a secret key (want nsec1… or 64 hex characters)\n",
-            .{name},
-        );
-        return cli.exit_fail;
-    };
-
     var recipients: std.ArrayList(keys.PublicKey) = .empty;
     defer recipients.deinit(gpa);
     for (tos.items) |t| {
@@ -185,12 +183,13 @@ fn runWith(
         try recipients.append(gpa, pk);
     }
 
-    var signer = try keys.Signer.initRandomized(io);
-    defer signer.deinit();
-    const me = signer.keyPairFromSecretKey(sk) catch {
-        try err.print("deed gift {s}: that secret key is out of range\n", .{name});
-        return cli.exit_fail;
+    const verb: []const u8 = switch (sub) {
+        .wrap => "gift wrap",
+        .unwrap => "gift unwrap",
+        .dm => "gift dm",
     };
+    var signer = (try signing.open(gpa, io, verb, sec_text, err)) orelse return cli.exit_fail;
+    defer signer.deinit();
 
     var input = cli.Input.init(positionals.items, stdin);
     var failures: usize = 0;
@@ -208,12 +207,14 @@ fn runWith(
         };
         if (text.len == 0) continue;
         const ok = switch (sub) {
-            .wrap => doWrap(gpa, io, signer, me, recipients.items[0], text, out, err),
-            .unwrap => doUnwrap(gpa, signer, sk, text, as_json, out, err),
-            .dm => doDm(gpa, io, signer, me, recipients.items, text, out, err),
+            .wrap => doWrap(gpa, io, &signer, recipients.items[0], text, out, err),
+            .unwrap => doUnwrap(gpa, io, &signer, text, as_json, out, err),
+            .dm => doDm(gpa, io, &signer, recipients.items, text, out, err),
         } catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            else => blk: {
+            error.OutOfMemory, error.Canceled => return e,
+            // A signer that refused or went quiet will do the same for the
+            // next record, so the run ends here.
+            else => if (signing.describe(e) != null) return signing.report(verb, e, err) else blk: {
                 try err.print("deed gift {s}: {s}\n", .{ name, reason(e) });
                 break :blk false;
             },
@@ -233,8 +234,7 @@ const RumorInput = struct {
 fn doWrap(
     gpa: std.mem.Allocator,
     io: std.Io,
-    signer: keys.Signer,
-    me: keys.KeyPair,
+    signer: *signing.Signer,
     to: keys.PublicKey,
     text: []const u8,
     out: *std.Io.Writer,
@@ -249,11 +249,10 @@ fn doWrap(
         return false;
     };
     const created_at = input.created_at orelse std.Io.Timestamp.now(io, .real).toSeconds();
-    const rumor = try nip59.Rumor.init(a, me.public_key, created_at, input.kind, input.tags, input.content);
+    const rumor = try nip59.Rumor.init(a, signer.publicKey(), created_at, input.kind, input.tags, input.content);
 
-    var sealed = try nip59.seal(gpa, io, signer, me, to, rumor);
-    defer sealed.deinit();
-    var wrapped = try nip59.wrap(gpa, io, signer, sealed.event, to, &.{});
+    const sealed = try seal(a, io, signer, to, rumor);
+    var wrapped = try nip59.wrap(gpa, io, signer.ctx, sealed, to, &.{});
     defer wrapped.deinit();
     try printEvent(gpa, out, wrapped.event);
     return true;
@@ -261,8 +260,8 @@ fn doWrap(
 
 fn doUnwrap(
     gpa: std.mem.Allocator,
-    signer: keys.Signer,
-    sk: keys.SecretKey,
+    io: std.Io,
+    signer: *signing.Signer,
     text: []const u8,
     as_json: bool,
     out: *std.Io.Writer,
@@ -273,7 +272,10 @@ fn doUnwrap(
         return false;
     };
     defer parsed.deinit();
-    var opened = try nip59.unwrap(gpa, signer, sk, parsed.value);
+    var opened = if (signer.keyPair()) |kp|
+        try nip59.unwrap(gpa, signer.ctx, kp.secret_key, parsed.value)
+    else
+        try unwrapRemote(gpa, io, signer, parsed.value);
     defer opened.deinit();
 
     const rumor_json = try nip59.rumorToJson(gpa, opened.rumor);
@@ -292,19 +294,133 @@ fn doUnwrap(
 fn doDm(
     gpa: std.mem.Allocator,
     io: std.Io,
-    signer: keys.Signer,
-    me: keys.KeyPair,
+    signer: *signing.Signer,
     to: []const keys.PublicKey,
     text: []const u8,
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !bool {
     _ = err;
-    var dm = try nip59.privateDirectMessage(gpa, io, signer, me, to, text, null, null);
-    defer dm.deinit();
-    for (dm.wraps) |w| try printEvent(gpa, out, w);
+    if (signer.keyPair()) |me| {
+        var dm = try nip59.privateDirectMessage(gpa, io, signer.ctx, me, to, text, null, null);
+        defer dm.deinit();
+        for (dm.wraps) |w| try printEvent(gpa, out, w);
+        return true;
+    }
+
+    // The same message `privateDirectMessage` builds, with each seal made by
+    // the remote signer: a kind 14 rumor with one `p` tag per distinct
+    // recipient, wrapped to each of them and to the sender.
+    if (to.len == 0) return error.NoRecipients;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const me = signer.publicKey();
+
+    var targets: std.ArrayList(keys.PublicKey) = .empty;
+    var tags: std.ArrayList(event.Tag) = .empty;
+    for (to) |pk| {
+        if (contains(targets.items, pk)) continue;
+        try targets.append(a, pk);
+        const fields = try a.alloc([]const u8, 2);
+        fields[0] = "p";
+        fields[1] = try hex.encode(a, &pk);
+        try tags.append(a, fields);
+    }
+    if (!contains(targets.items, me)) try targets.append(a, me);
+
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const rumor = try nip59.Rumor.init(a, me, now, 14, tags.items, text);
+    for (targets.items) |pk| {
+        const sealed = try seal(a, io, signer, pk, rumor);
+        var wrapped = try nip59.wrap(gpa, io, signer.ctx, sealed, pk, &.{});
+        defer wrapped.deinit();
+        try printEvent(gpa, out, wrapped.event);
+    }
     return true;
 }
+
+fn contains(list: []const keys.PublicKey, pk: keys.PublicKey) bool {
+    for (list) |x| if (std.mem.eql(u8, &x, &pk)) return true;
+    return false;
+}
+
+/// The kind 13 seal of `rumor` to `to`, signed by the user, allocated from
+/// `a`. A local key goes through `nip59.seal`; a remote signer encrypts the
+/// rumor and signs the seal itself, so the user's key never leaves it.
+fn seal(a: std.mem.Allocator, io: std.Io, signer: *signing.Signer, to: keys.PublicKey, rumor: nip59.Rumor) !event.Event {
+    if (signer.keyPair()) |me| {
+        const sealed = try nip59.seal(a, io, signer.ctx, me, to, rumor);
+        return sealed.event;
+    }
+    const rumor_json = try nip59.rumorToJson(a, rumor);
+    const ciphertext = try signer.crypt(a, io, .nip44_encrypt, to, rumor_json);
+    return signer.sign(a, try randomPastTimestamp(io), 13, &.{}, ciphertext);
+}
+
+/// Up to two days before now, never now itself, as NIP-59 asks of a seal.
+fn randomPastTimestamp(io: std.Io) !i64 {
+    var buf: [8]u8 = undefined;
+    io.randomSecure(&buf) catch return error.RandomFailed;
+    const r = std.mem.readInt(u64, &buf, .little);
+    const two_days: u64 = 2 * 24 * 60 * 60;
+    const offset: i64 = 1 + @as(i64, @intCast(r % two_days));
+    return std.Io.Timestamp.now(io, .real).toSeconds() - offset;
+}
+
+/// What `nip59.unwrap` checks, in its order, with both decrypts done by the
+/// remote signer.
+fn unwrapRemote(gpa: std.mem.Allocator, io: std.Io, signer: *signing.Signer, wrap: event.Event) !nip59.Unwrapped {
+    if (wrap.kind != 1059 and wrap.kind != 21059) return error.WrongKind;
+    if (!try event.verify(gpa, signer.ctx, wrap)) return error.InvalidWrapSignature;
+
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer {
+        arena.deinit();
+        gpa.destroy(arena);
+    }
+    const a = arena.allocator();
+
+    const seal_json = try signer.crypt(a, io, .nip44_decrypt, wrap.pubkey, wrap.content);
+    const seal_value = std.json.parseFromSliceLeaky(std.json.Value, a, seal_json, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.InvalidSeal,
+    };
+    const sealed = event.fromValueLeaky(a, seal_value) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.InvalidSeal,
+    };
+    if (sealed.kind != 13) return error.WrongKind;
+    if (sealed.tags.len != 0) return error.InvalidSeal;
+    if (!try event.verify(a, signer.ctx, sealed)) return error.InvalidSealSignature;
+
+    const rumor_json = try signer.crypt(a, io, .nip44_decrypt, sealed.pubkey, sealed.content);
+    const wire = std.json.parseFromSliceLeaky(WireRumor, a, rumor_json, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.InvalidRumor,
+    };
+    const rumor: nip59.Rumor = .{
+        .id = hex.decodeFixed(32, wire.id) catch return error.InvalidRumor,
+        .pubkey = hex.decodeFixed(32, wire.pubkey) catch return error.InvalidRumor,
+        .created_at = wire.created_at,
+        .kind = wire.kind,
+        .tags = wire.tags,
+        .content = wire.content,
+    };
+    if (!try rumor.idMatches(a)) return error.RumorIdMismatch;
+    if (!std.mem.eql(u8, &rumor.pubkey, &sealed.pubkey)) return error.SenderMismatch;
+    return .{ .arena = arena, .rumor = rumor, .sender = sealed.pubkey };
+}
+
+const WireRumor = struct {
+    id: []const u8,
+    pubkey: []const u8,
+    created_at: i64,
+    kind: u16,
+    tags: []const []const []const u8,
+    content: []const u8,
+};
 
 fn printEvent(gpa: std.mem.Allocator, out: *std.Io.Writer, ev: event.Event) !void {
     const json = try event.toJson(gpa, ev);
@@ -353,10 +469,14 @@ const c_sec = "1111111111111111111111111111111111111111111111111111111111111111"
 const Ran = struct { code: u8, out: []const u8, err: []const u8 };
 
 fn runGift(arena: std.mem.Allocator, args: []const []const u8, stdin_text: []const u8) !Ran {
+    return runGiftWith(testing.allocator, arena, args, stdin_text);
+}
+
+fn runGiftWith(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: []const []const u8, stdin_text: []const u8) !Ran {
     var out: std.Io.Writer.Allocating = .init(arena);
     var err: std.Io.Writer.Allocating = .init(arena);
     var reader: std.Io.Reader = .fixed(stdin_text);
-    const code = try runWith(testing.allocator, testing.io, args, &reader, &out.writer, &err.writer);
+    const code = try runWith(gpa, testing.io, args, &reader, &out.writer, &err.writer);
     return .{ .code = code, .out = out.written(), .err = err.written() };
 }
 
@@ -471,3 +591,37 @@ test "wrap refuses missing or repeated flags" {
 const nak_wrap =
     \\{"kind":1059,"id":"ac33c696c5c3113cca78ccb69b618daf31c19179549a23ac737a4480c9687a5e","pubkey":"0b060aaffb2765be6ef02c578522a5af0289a5101baef2fa15c7c47eed451e83","created_at":1791557850,"tags":[["p","9c9fe0a462f5e8d9655244ac4c7c0866d9c044a387884559124e011f3754c5ab"]],"content":"Aq1U9qozrK/nG0HNKPnDvLm7/an4cZig+buAD0rAmmwUC7Mq66fVTqVbxUaVWjVggtqnif3zXfd8hklGYlUUNJ3TxS5XFOLh+09uNhcR+tNdAC2rRahWR2kFMEtVtVnnfFgm6ZqFhNBF62eVVM42oRyGZgFKMBZYaRLrbWMPZTMiFW8u6EOHkUbRJwnzCdFeFdu95+oldQc5hPnqkx9cyNR56igdVCMg1VitRGZHVotoRhMHqsAZ+t8cqavDy98tNBwYg2LxPeQSJCTL4ck+JqW6NnBCoh2imOW9TBRYnvYNzGvvPAiQmxMhAXVJg9GZS/1Ci5edYybqzowqT0ta5pjWTAClswlSqBfdz9omajCWZEu0laIGp65M/mMSXkJ27HMkCvXyfyLnSAL8Nldb7d3dVE8TInHgqKScZdoEcELMrusR40siNC3A/NHR4WGsTBrB2uZ/MjdZqtBjKpgV7HkqwwqNgECFY0S1e8VV3Jie4HsFQ1UbDF698vt2FaGMPOyQlSUjzwOa9HLAiBcu2Cb2CoU9FcC5SqcaDjAZQxLhUytby/Z5Yl0XaOkiWaYTjPz+PB7dwbDGPaRqXuxtPaHre1qslH0LG3kFps3bswtidAmA+FXUUVZh/tJYOw8c7FnVUda4apl5iIWQe+BDj34lDtfCnMaWdaOKZgcoRjyc2kA6PljK1IS0XLb+OgTABUR3s2mSSySeFU7dZq9Qmz8h7+RJ2mxnmmTAcF/D1xiyYo6kWY9dMLTSlQ4gaNKonFM0y+dCIPeARL8uI4pQslHNLWcMh4QJIlxE7KJGgoGVY/q1XeSkJUfZU2kTheVJCK5/FiQocIBqI3ReueS0lG7soheFTVuO7UlfVFSI885K1pHCwUYk+wDEC24J8L4AE3scG44Pah0g63H/yf+mhXOfoTPgogjOeXdwr6JDjZioDopzYLopZMe6EYBVeMnULEQzqLsPKC0J49YCWl9uyQvnMMiuRAXGIXE+c+M7D8DAbFU+m0RJ656SVh3XtHwiqJQdMaTfYn3BjWfjxGfRwBkUglT4q9cCfBKyIwAzCB+bWnET/hOHyJ/s0pqBms+J2NEvXaXt0AVxN+FIadRgeC1MFhj1Fi0I9b81GwpLPaKW3VBliGakS3zi933nCcIatvlbYX1LZoXdWGUIyOwrLF8smCmu9yS4+5AbMU//d4AYK+x37TaOgCl4ry92yYmM3CZNMzSQ+fhhYnUOT4ZqRX3huNcm21g+qYmPqIqdMls9AVf99YCxOHgN0+vTQ8UG5At8","sig":"c9803af581610ad4b8f9136d44a91571f628f14a11c49a83e9d208f2fa4462481cc661cdf4ee0d568bfbead79602f1468b640433be4d89a7e5599fc440bd14dc"}
 ;
+
+test "a dm made through a remote signer opens for the recipient, from the user" {
+    const testrelay = @import("testrelay.zig");
+    const signertest = @import("signertest.zig");
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the remote signer leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rig: signertest.Rig = undefined;
+    try rig.init(gpa, testing.io, .serve);
+    defer rig.deinit();
+    const user_hex = std.fmt.bytesToHex(rig.user.public_key, .lower);
+
+    const sent = try runGiftWith(gpa, arena, &.{ "dm", "--to", b_pub, "--sec", rig.uri(), "see you at six" }, "");
+    try testing.expectEqual(@as(u8, 0), sent.code);
+    const first_end = std.mem.indexOfScalar(u8, sent.out, '\n').?;
+    const to_b = sent.out[0..first_end];
+    const to_self = std.mem.trimEnd(u8, sent.out[first_end + 1 ..], "\n");
+    try testing.expect(has(to_self, "\"kind\":1059"));
+
+    const opened = try runGiftWith(gpa, arena, &.{ "unwrap", "--sec", b_sec }, to_b);
+    try testing.expectEqual(@as(u8, 0), opened.code);
+    try testing.expect(has(opened.out, "\"kind\":14"));
+    try testing.expect(has(opened.out, "see you at six"));
+    try testing.expect(has(opened.err, try std.fmt.allocPrint(arena, "sender: {s}", .{&user_hex})));
+
+    // The copy to self opens through the remote signer too.
+    const mine = try runGiftWith(gpa, arena, &.{ "unwrap", "--sec", rig.uri() }, to_self);
+    try testing.expectEqual(@as(u8, 0), mine.code);
+    try testing.expect(has(mine.out, "see you at six"));
+}

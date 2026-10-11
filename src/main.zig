@@ -250,6 +250,8 @@ test {
     _ = @import("verbs.zig");
     _ = @import("filterflags.zig");
     _ = @import("auth.zig");
+    _ = @import("signing.zig");
+    _ = @import("signertest.zig");
     _ = @import("cmd_admin.zig");
     _ = @import("cmd_blossom.zig");
     _ = @import("cmd_bunker.zig");

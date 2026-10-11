@@ -204,7 +204,7 @@ deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
 - deed contacts only relays the user named, with an argument, `-r` / `--relay` or `DEED_RELAYS`. It has no built-in list. `fetch`, `post`, `profile`, `spell` and `req --outbox` follow a person to their own write relays, but they find the relay list through those named relays, so set `DEED_RELAYS` or pass `-r` first. A note or event id with no hints has no author to follow and still needs a relay named.
 - `req --outbox` cannot be combined with `--stream`, `--paginate` or `--local`. `req` reads stdin only for a lone `-`.
 - `deed serve` refuses a browser page unless `--allow-origin` names its origin. The MCP server lists publishing tools only with `--allow-publish`, and a call that needs the key reads it from `--sec` or `NOSTR_SECRET_KEY`, never from the tool's arguments.
-- Using a bunker:// URI as a key is not finished; do not rely on it. <!-- TODO remote signer -->
+- A `bunker://` URI works in place of a secret key in the verbs that sign or encrypt as the user, except `key`, `bunker`, `nsite deploy` and `mcp`, which need the key itself. Each request waits up to 60 seconds for the signer to answer, and the person may need to approve it on their signer.
 - `deed post` and `deed profile set` need a relay URL; without one they do nothing useful. `deed profile set` is not a way to start a profile from scratch: an unreadable profile is never overwritten.
 - `deed event -` reads drafts; `deed event -c ... wss://relay` also publishes. Check which you mean.
 

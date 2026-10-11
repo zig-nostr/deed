@@ -66,7 +66,9 @@ deed reaches relays and keeps what it finds. Every verb that does not need a soc
 
 ## Authentication
 
-Keys come from `--sec` or from `$NOSTR_SECRET_KEY`. A key on a command line lands in your shell history and in the process table, so the variable is the better habit. Wherever a verb reads a secret key it takes `nsec1…`, 64 hex characters or an `ncryptsec1…`. An ncryptsec asks for its password on the terminal with echo off, or reads it from `$NOSTR_PASSWORD`; a password is never taken from an argument. <!-- TODO remote signer -->
+Keys come from `--sec` or from `$NOSTR_SECRET_KEY`. A key on a command line lands in your shell history and in the process table, so the variable is the better habit. Wherever a verb reads a secret key it takes `nsec1…`, 64 hex characters or an `ncryptsec1…`. An ncryptsec asks for its password on the terminal with echo off, or reads it from `$NOSTR_PASSWORD`; a password is never taken from an argument.
+
+A remote signer works there too: give a `bunker://` URI in place of the key, and every verb that signs or encrypts as you (`event`, `post`, `profile set`, `group`, `encrypt`, `decrypt`, `gift`, `curl`, `admin`, `blossom`, and the answers `--auth` gives a relay that asks who you are) asks the signer over NIP-46 instead. Each request waits up to 60 seconds for an answer, since someone may be approving it on another device. When the signer asks for approval at a link, the link is shown on stderr if it is a plain https URL, and not shown otherwise. deed makes a fresh client key for each run, so a signer that asks before trusting a new client asks every time; set `DEED_BUNKER_CLIENT_KEYS` to a file path to keep one client key per signer there (the file is created readable only by you). The verbs that need the key itself (`key public`, `key encrypt`, `bunker`, `nsite deploy`, `mcp`) refuse a `bunker://` URI.
 
 ```sh
 deed key encrypt "$NOSTR_SECRET_KEY" > me.ncryptsec                # asks for a password
@@ -297,7 +299,7 @@ deed blossom upload photo.jpg -s cdn.example.com                 # a blob, by it
 
 ## What is missing
 
-The use of a remote signer (`bunker://`) wherever a key is accepted is not finished <!-- TODO remote signer -->. deed has no daemon and no config file, so the relays you want on every run go in `DEED_RELAYS`.
+deed has no daemon and no config file, so the relays you want on every run go in `DEED_RELAYS`.
 
 ## How the verbs fit together
 

@@ -550,11 +550,12 @@ pub fn runWith(
         return cli.exit_ok;
     }
 
-    const auth_opts = auth.resolve(gpa, req.auth, "req", err) catch |e| switch (e) {
+    const auth_opts = auth.resolve(gpa, io, req.auth, "req", err) catch |e| switch (e) {
         error.Usage => return cli.exit_usage,
         error.BadKey => return cli.exit_fail,
         else => |other| return other,
     };
+    defer if (auth_opts) |o| o.deinit(gpa);
 
     var store: ?nostr.store.Store = null;
     defer if (store) |*st| st.deinit();

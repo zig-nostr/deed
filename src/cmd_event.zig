@@ -17,6 +17,7 @@ const keyinput = @import("keyinput.zig");
 const kinds = @import("kinds.zig");
 const cmd_publish = @import("cmd_publish.zig");
 const parallel = @import("parallel.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const event = nostr.event;
@@ -50,7 +51,8 @@ pub const usage =
     \\             [--envelope] [--nevent] [--confirm]
     \\
     \\Options:
-    \\  --sec <key>          secret key, as nsec1… or 64 hex characters.
+    \\  --sec <key>          secret key, as nsec1…, ncryptsec1… or 64 hex
+    \\                       characters, or a remote signer as bunker://…
     \\                       Falls back to $NOSTR_SECRET_KEY.
     \\  -c, --content <text> event content (default: empty). `@path` reads the
     \\                       content from that file; `@@text` is a literal
@@ -294,14 +296,8 @@ pub fn run(
         try err.writeAll("deed event: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n");
         return cli.exit_usage;
     };
-    const sk = keyinput.secretKey(gpa, raw_sec) catch {
-        try err.writeAll("deed event: not a secret key (want nsec1… or 64 hex characters)\n");
-        return cli.exit_fail;
-    };
-
-    var signer = try keys.Signer.initRandomized(io);
+    var signer = (try signing.open(gpa, io, "event", raw_sec, err)) orelse return cli.exit_fail;
     defer signer.deinit();
-    const keypair = try signer.keyPairFromSecretKey(sk);
 
     // With relays, events are held until every draft is signed, then offered
     // together. Without, they are printed as they are made.
@@ -310,9 +306,9 @@ pub fn run(
 
     var failures: usize = 0;
     if (!read_stdin) {
-        emit(gpa, io, signer, keypair, Draft{}, ov, &sink) catch |e| switch (e) {
+        emit(gpa, io, &signer, Draft{}, ov, &sink) catch |e| switch (e) {
             error.PowTimeout, error.PowFailed => return reportPow(err, e, ov),
-            else => return e,
+            else => return signing.report("event", e, err),
         };
     } else {
         const stdin_buf = try gpa.alloc(u8, max_record_bytes);
@@ -326,9 +322,10 @@ pub fn run(
         // Without --pow, drafts are signed in chunks on every core. With it,
         // each event is already mined on `--pow-threads` threads, so another
         // layer of workers would only oversubscribe the cores: that path signs
-        // one event at a time, as it always did.
-        if (ov.pow == 0) {
-            failures += try signStream(gpa, io, signer, keypair, ov, &sink, &input, err);
+        // one event at a time, as it always did. So does a remote signer:
+        // every signature is a round trip to it, and it answers one at a time.
+        if (ov.pow == 0 and signer.keyPair() != null) {
+            failures += try signStream(gpa, io, signer.ctx, signer.keyPair().?, ov, &sink, &input, err);
         } else while (try input.next()) |record| {
             const json = switch (record) {
                 // Trimmed here rather than in `Input`: surrounding space around
@@ -355,13 +352,13 @@ pub fn run(
                 failures += 1;
                 continue;
             };
-            emit(gpa, io, signer, keypair, draft, ov, &sink) catch |e| switch (e) {
+            emit(gpa, io, &signer, draft, ov, &sink) catch |e| switch (e) {
                 error.PowTimeout, error.PowFailed => {
                     _ = try reportPow(err, e, ov);
                     failures += 1;
                     continue;
                 },
-                else => return e,
+                else => return signing.report("event", e, err),
             };
         }
     }
@@ -583,8 +580,7 @@ fn signDraft(
 fn emit(
     gpa: std.mem.Allocator,
     io: std.Io,
-    signer: keys.Signer,
-    keypair: keys.KeyPair,
+    signer: *signing.Signer,
     draft: Draft,
     ov: Overrides,
     sink: *Sink,
@@ -609,7 +605,10 @@ fn emit(
         &.{};
 
     if (ov.pow == 0) {
-        const json = try signDraft(a, io, signer, keypair, draft, ov);
+        const json = if (signer.keyPair()) |kp|
+            try signDraft(a, io, signer.ctx, kp, draft, ov)
+        else
+            try event.toJson(a, try signer.sign(a, created_at, kind, tags, content));
         try sink.add(json);
         return;
     }
@@ -618,7 +617,7 @@ fn emit(
     // over the id. `toJson` copies everything out of the mining arena, so the
     // deferred deinit is safe.
     var mined = nip13.mine(gpa, io, .{
-        .pubkey = keypair.public_key,
+        .pubkey = signer.publicKey(),
         .created_at = created_at,
         .kind = kind,
         .tags = tags,
@@ -634,8 +633,11 @@ fn emit(
     };
     defer mined.deinit();
 
-    var ev = mined.event;
-    ev.sig = signer.signId(ev.id, keypair, null) catch return error.PowFailed;
+    // A remote signer is sent the mined fields, which hash to the same id.
+    const ev = signer.signMined(a, mined.event) catch |e| {
+        if (e == error.Canceled or e == error.OutOfMemory or signing.describe(e) != null) return e;
+        return error.PowFailed;
+    };
     const json = try event.toJson(a, ev);
     try sink.add(json);
 }
