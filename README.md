@@ -22,7 +22,7 @@ Each checks the download against the SHA-256 published beside it, and if the dig
 
 `--version <tag>` installs a particular release, `--prefix <dir>` puts it somewhere else, and `--archive <file>` installs from an archive you already have, which still wants its `.sha256` beside it. `--help` lists them. On Windows they are `-Version`, `-Prefix`, `-Archive` and `-Help` when you run the script as a file, and `$env:DEED_VERSION`, `$env:DEED_PREFIX` and `$env:DEED_ARCHIVE` for the piped line.
 
-On Windows on ARM the installer puts the x86_64 build in place, which Windows 11 runs under emulation. The Windows binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept. deed reads a leading `~` in a `--store` path from `HOME`, which Windows does not usually set, so give a full path there.
+On Windows on ARM the installer puts the native ARM64 build in place, or the x86_64 build, which Windows 11 runs under emulation, for an older release that has no ARM64 build. The Windows binary is not code-signed, so Windows may show a warning the first time it runs. A store made with `--store` takes 1 GiB of disk on Windows from the first run, because LMDB sizes the file to its whole map up front there; on macOS and Linux it grows with what is kept. deed reads a leading `~` in a `--store` path from `HOME`, which Windows does not usually set, so give a full path there.
 
 ## What it does
 

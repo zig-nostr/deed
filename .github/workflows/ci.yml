@@ -240,12 +240,15 @@ jobs:
   # The Windows installer, end to end against the newest published release,
   # under both PowerShells: pwsh, and Windows PowerShell 5.1, which is the one
   # every Windows machine has and the one whose syntax the script keeps to.
+  # On the arm runner the installer picks the ARM64 build, or the x86_64 one
+  # when the release has no ARM64 build.
   install-windows:
     strategy:
       fail-fast: false
       matrix:
+        runner: [windows-latest, windows-11-arm]
         shell: [pwsh, powershell]
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     defaults:
       run:
