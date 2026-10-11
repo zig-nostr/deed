@@ -608,8 +608,27 @@ fn timeoutMs(args: Json) i64 {
     return clamped(args, "timeout_ms", default_timeout_ms, min_timeout_ms, max_timeout_ms);
 }
 
+/// `n` as an argument for a verb. Never negative: a verb would read "-1" as
+/// an option, so every number a tool passes on is checked here as well as by
+/// the tool.
 fn num(a: Allocator, n: i64) ![]const u8 {
+    if (n < 0) return error.BadArgument;
     return std.fmt.allocPrint(a, "{d}", .{n});
+}
+
+const kind_range_message = "kind must be a number from 0 to 65535";
+
+/// The `kind` argument when it is a number, checked against the range of
+/// kinds. Null when absent or not a number; `error.BadArgument` when out of
+/// range.
+fn kindArg(args: Json) !?u16 {
+    const n = intArg(args, "kind") orelse {
+        // A float that is not a whole number is not a kind either.
+        if (field(args, "kind")) |v| if (v == .float) return error.BadArgument;
+        return null;
+    };
+    if (n < 0 or n > 65535) return error.BadArgument;
+    return @intCast(n);
 }
 
 /// Text that is safe to hand a verb as a positional argument: not empty, not
@@ -812,7 +831,8 @@ fn toolEncode(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) 
         if (!plain(v)) return fail(out, "pubkey must be 64 hex characters");
         try argv.appendSlice(a, &.{ "--pubkey", v });
     }
-    if (intArg(args, "kind")) |k| try argv.appendSlice(a, &.{ "--kind", try num(a, k) });
+    const event_kind = kindArg(args) catch return fail(out, kind_range_message);
+    if (event_kind) |k| try argv.appendSlice(a, &.{ "--kind", try num(a, k) });
     return present(a, try capture(s, a, encodeRunner, argv.items), out);
 }
 
@@ -901,7 +921,10 @@ fn toolRelays(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) 
 fn toolKind(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
     var argv: std.ArrayList([]const u8) = .empty;
     if (field(args, "kind")) |k| switch (k) {
-        .integer => |n| try argv.append(a, try num(a, n)),
+        .integer, .float => {
+            const n = (kindArg(args) catch return fail(out, kind_range_message)) orelse return fail(out, kind_range_message);
+            try argv.append(a, try num(a, n));
+        },
         .string => |t| {
             if (!plain(t)) return fail(out, "kind must be a number or a name");
             try argv.append(a, t);
@@ -1530,4 +1553,28 @@ test "public hosts and addresses pass the relay_info check" {
     try testing.expectEqualStrings("relay.example", relayHost("wss://relay.example:443/path").?);
     try testing.expectEqualStrings("::1", relayHost("wss://[::1]:80").?);
     try testing.expect(relayHost("wss://u@relay.example") == null);
+}
+
+test "a negative or out of range number is refused before it reaches a verb" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const l1 = try callLine(gpa, 1, "kind", "{\"kind\":-1}");
+    defer gpa.free(l1);
+    const l2 = try callLine(gpa, 2, "kind", "{\"kind\":70000}");
+    defer gpa.free(l2);
+    const l3 = try callLine(gpa, 3, "encode", "{\"type\":\"naddr\",\"value\":\"x\",\"pubkey\":\"" ++ "11" ** 32 ++ "\",\"kind\":-30023}");
+    defer gpa.free(l3);
+    const l4 = try callLine(gpa, 4, "kind", "{\"kind\":-1.0}");
+    defer gpa.free(l4);
+    const all = try std.mem.concat(gpa, u8, &.{ l1, l2, l3, l4 });
+    defer gpa.free(all);
+    const got = try converse(gpa, .{}, all);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    for ([_]u32{ 1, 2, 3, 4 }) |id| {
+        const r = replyFor(got, id, &b).?;
+        try testing.expect(has(r, "\"isError\":true"));
+        try testing.expect(has(r, "kind must be a number from 0 to 65535"));
+    }
 }
