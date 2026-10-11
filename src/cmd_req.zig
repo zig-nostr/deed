@@ -39,7 +39,7 @@ pub const usage =
     \\  -h <name>            an `h` tag value, repeatable
     \\  -T, --tag <x=value>  a tag value under any one-letter name, repeatable
     \\      --search <text>  a NIP-50 search, for relays that support it
-    \\  -l, --limit <n>      how many events to ask each relay for
+    \\  -l, --limit <n>      how many events to print; each relay may be asked for up to this many per filter
     \\  -s, --since <time>   events at or after: unix seconds, 2h, 3d, 2026-10-01
     \\  -u, --until <time>   events at or before: the same forms as --since
     \\      --bare           print the filter alone, without the REQ envelope
@@ -601,12 +601,18 @@ pub fn runWith(
         return pages(gpa, io, req, auth_opts, filters.items, store_ptr, out, err);
     }
 
-    const outcome = try relayset.query(gpa, io, req.relays, filters.items, out, err, .{
+    // A split filter asks each relay for up to the limit once per piece, so
+    // the merged answer is cut back to the limit before it is printed.
+    const cut: ?u32 = if (!req.stream and unsplit.len == 1 and filters.items.len > 1) unsplit[0].limit else null;
+    var held: std.Io.Writer.Allocating = .init(gpa);
+    defer held.deinit();
+    const outcome = try relayset.query(gpa, io, req.relays, filters.items, if (cut != null) &held.writer else out, err, .{
         .until_eose = !req.stream,
         .deadline_ms = req.timeout_ms,
         .store = store_ptr,
         .auth = auth_opts,
     });
+    if (cut) |lim| try printNewest(gpa, held.written(), lim, out);
 
     // Reaching no relay at all is a failed run. Reaching some is not: the
     // events that arrived are real, and every relay that did not answer was
@@ -617,6 +623,30 @@ pub fn runWith(
         return cli.exit_fail;
     }
     return cli.exit_ok;
+}
+
+/// Prints the newest `limit` of the event lines in `text`, newest first.
+/// Lines that are not events are printed as they are, before the events.
+fn printNewest(gpa: std.mem.Allocator, text: []const u8, limit: u32, out: *std.Io.Writer) !void {
+    const Line = struct { at: i64, id: [32]u8, text: []const u8 };
+    var lines: std.ArrayList(Line) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (nostr.event.fromJson(gpa, line)) |parsed| {
+            var p = parsed;
+            defer p.deinit();
+            try lines.append(gpa, .{ .at = p.value.created_at, .id = p.value.id, .text = line });
+        } else |_| try out.print("{s}\n", .{line});
+    }
+    std.mem.sort(Line, lines.items, {}, struct {
+        fn less(_: void, a: Line, b: Line) bool {
+            if (a.at != b.at) return a.at > b.at;
+            return std.mem.lessThan(u8, &a.id, &b.id);
+        }
+    }.less);
+    for (lines.items[0..@min(lines.items.len, limit)]) |l| try out.print("{s}\n", .{l.text});
 }
 
 fn newestFirst(_: void, a: nostr.event.Event, b: nostr.event.Event) bool {
@@ -1131,6 +1161,34 @@ fn runReqStdin(args: []const []const u8, stdin: []const u8, out_buf: []u8, err_b
     var reader: std.Io.Reader = .fixed(stdin);
     const code = try runWith(std.testing.allocator, std.testing.io, args, &reader, &out, &err);
     return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
+}
+
+test "printNewest keeps the newest events up to the limit" {
+    const a = std.testing.allocator;
+    var signer = try nostr.keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const ar = arena_state.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    for ([_]i64{ 5, 9, 1, 7 }) |t| {
+        const ev = try nostr.event.create(ar, signer, kp, t, 1, &.{}, "x", null);
+        try text.print(ar, "{s}\n", .{try nostr.event.toJson(ar, ev)});
+    }
+    var ob: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&ob);
+    try printNewest(a, text.items, 2, &out);
+    var it = std.mem.splitScalar(u8, out.buffered(), '\n');
+    var got: [2]i64 = undefined;
+    for (&got) |*g| {
+        var p = try nostr.event.fromJson(a, it.next().?);
+        defer p.deinit();
+        g.* = p.value.created_at;
+    }
+    try std.testing.expectEqual([2]i64{ 9, 7 }, got);
+    try std.testing.expectEqualStrings("", it.next().?);
+    try std.testing.expect(it.next() == null);
 }
 
 test "--local with a split filter is cut to the limit and printed newest first" {
