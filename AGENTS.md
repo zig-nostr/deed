@@ -16,6 +16,7 @@ zig fmt --check .                                # CI fails on unformatted code
 zig build -Doptimize=ReleaseSafe -Dstrip=true    # the release build
 python3 bench/run.py zig-out/bin/deed            # benchmarks, see BENCHMARKS.md
 zig build test -Dtarget=x86_64-windows-gnu       # compile the tests for Windows; the run step then fails, the host cannot run them
+zig build test-bin -Dtarget=aarch64-windows-gnu  # build the tests into zig-out/bin/deed-test.exe to run on another machine
 ```
 
 Use the Zig version in `.zigversion`. Building only the executable for Windows is not enough to catch a break there: code the executable never reaches, the test relay for one, only gets analysed when the test binary is built, which is what the Windows line above does. The `nostr` dependency is pinned by URL and hash in `build.zig.zon`; move it with `zig fetch --save=nostr <tarball url>` and check the diff is only the url and hash lines.

@@ -927,6 +927,20 @@ test "a reason a relay wrote cannot carry terminal controls" {
     try testing.expectEqualStrings("NOTICE: a?[2Jb?", n.text());
 }
 
+test "a write that never finishes gives up at the deadline" {
+    const io = testing.io;
+    // Stands in for a write into a full socket: it waits until cancelled.
+    const Stuck = struct {
+        fn write(i: Io) anyerror!void {
+            try i.sleep(.fromSeconds(60), .awake);
+        }
+    };
+    const started = Io.Timestamp.now(io, .awake).toMilliseconds();
+    try testing.expectError(error.Timeout, writeBy(io, deadlineIn(io, 300), Stuck.write, .{io}));
+    const took = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try testing.expect(took < 3_000);
+}
+
 test "a write to a relay that stops reading gives up at the deadline" {
     const io = testing.io;
     const gpa = std.heap.page_allocator;
@@ -948,8 +962,12 @@ test "a write to a relay that stops reading gives up at the deadline" {
     defer arena.deinit();
     const ev = try nostr.event.create(arena.allocator(), signer, kp, 1_700_000_000, 1, &.{}, content, null);
     const Publish = struct {
+        // Windows takes a large send on a loopback socket without waiting for
+        // the peer to read, so one event may not block there. Writing on, with
+        // a bound so a socket that never fills still ends, reaches a write
+        // that waits for room that does not come.
         fn now(rr: *relay.Relay, e: Event) anyerror!void {
-            return rr.publish(e);
+            for (0..256) |_| try rr.publish(e);
         }
     };
     const started = Io.Timestamp.now(io, .awake).toMilliseconds();

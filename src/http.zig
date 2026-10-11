@@ -995,6 +995,7 @@ pub const TestServer = struct {
             while (it.next()) |h| {
                 if (std.ascii.eqlIgnoreCase(h.name, "authorization")) has_auth = true;
             }
+            try drainBody(&req);
 
             var extra: [1]Header = undefined;
             var n: usize = 0;
@@ -1014,7 +1015,22 @@ pub const TestServer = struct {
             try req.respond(content, .{ .status = route.status, .keep_alive = false, .extra_headers = extra[0..n] });
             return;
         }
+        try drainBody(&req);
         try req.respond("not found", .{ .status = .not_found, .keep_alive = false });
+    }
+
+    /// Reads the request body to its end before the answer goes out. A socket
+    /// closed with bytes it never read resets the connection, and Windows
+    /// then drops whatever of the response the client had not read yet. This
+    /// invalidates the strings in the request head.
+    fn drainBody(req: *http.Server.Request) !void {
+        // Only a body with a known end. Without one std hands back either its
+        // shared `Reader.ending`, which is read-only memory that a discard
+        // writes to, or the raw stream, which ends only when the client
+        // closes, and the client is waiting for the answer.
+        if (req.head.content_length == null and req.head.transfer_encoding != .chunked) return;
+        var buf: [1024]u8 = undefined;
+        _ = try req.readerExpectNone(&buf).discardRemaining();
     }
 };
 

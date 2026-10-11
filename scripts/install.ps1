@@ -11,17 +11,17 @@
 #
 # Options, when the script runs as a file:
 #
-#   .\install.ps1 -Version v0.5.0 -Prefix C:\tools\deed
+#   .\install.ps1 -Version v0.5.1 -Prefix C:\tools\deed
 #
 # A piped run has no command line to put them on, so it reads the same options
 # from the environment:
 #
-#   $env:DEED_VERSION = 'v0.5.0'
+#   $env:DEED_VERSION = 'v0.5.1'
 #   irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1 | iex
 #
 # or takes them when the download is run as a script block:
 #
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1))) -Version v0.5.0
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1))) -Version v0.5.1
 #
 # An option given on the command line wins over the environment.
 #
@@ -108,23 +108,30 @@ Nothing needs administrator rights.
         return 0
     }
 
-    # Which build this machine wants.
-    #
-    # There is no ARM build for Windows. Windows 11 on ARM runs x86_64 programs
-    # under its own emulation, and the x86_64 build is the one every release is
-    # checked on, so ARM64 machines get that.
+    # Which build this machine wants. An ARM64 machine gets the ARM64 build
+    # when the release has one; see Install-Deed for the releases that do not.
     function Get-Platform {
         if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) {
             Fail 'this script installs the Windows build. On macOS and Linux, run: curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash'
         }
-        # A 32-bit PowerShell on a 64-bit Windows reports x86 here and the real
-        # architecture in PROCESSOR_ARCHITEW6432.
-        $arch = $env:PROCESSOR_ARCHITEW6432
+        # The machine's own architecture, not the process's. An x64 PowerShell
+        # running under emulation on a Windows on ARM machine reports AMD64 in
+        # its environment, so the value Windows keeps in the registry is read
+        # first. The environment is the fallback: a 32-bit PowerShell on a
+        # 64-bit Windows reports x86 there and the real architecture in
+        # PROCESSOR_ARCHITEW6432.
+        $arch = $null
+        try {
+            $arch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+        } catch {
+            $arch = $null
+        }
+        if (-not $arch) { $arch = $env:PROCESSOR_ARCHITEW6432 }
         if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
         switch ($arch) {
             'AMD64' { return 'windows-x86_64' }
-            'ARM64' { return 'windows-x86_64' }
-            default { Fail "no deed build for '$arch'. The published Windows build is x86_64, which also runs on ARM64." }
+            'ARM64' { return 'windows-aarch64' }
+            default { Fail "no deed build for '$arch'. The published Windows builds are x86_64 and ARM64." }
         }
     }
 
@@ -271,7 +278,22 @@ Nothing needs administrator rights.
             try {
                 Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
             } catch {
-                Fail "download failed. There may be no $platform build for $tag."
+                # Older releases carry no ARM64 build. Windows on ARM runs the
+                # x86_64 one under emulation, so a release without the ARM64
+                # zip still installs. Only a 404 means that: any other failure
+                # is reported, not papered over with a different build.
+                if ($platform -ne 'windows-aarch64' -or (Get-Status $_) -ne 404) {
+                    Fail "download failed. $tag may not exist, or has no Windows build."
+                }
+                $platform = 'windows-x86_64'
+                $name = "deed-$($tag.Substring(1))-$platform.zip"
+                $url = "https://github.com/$repo/releases/download/$tag/$name"
+                Say "$tag has no ARM64 build. Downloading $name, which Windows on ARM runs under emulation..."
+                try {
+                    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+                } catch {
+                    Fail "download failed. $tag may not exist, or has no Windows build."
+                }
             }
 
             # Required, not best effort. A verification step that any transient

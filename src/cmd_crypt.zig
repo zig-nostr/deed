@@ -237,11 +237,11 @@ fn cryptAll(
             .encrypt => blk: {
                 if (legacy) {
                     var iv: [16]u8 = undefined;
-                    io.randomSecure(&iv) catch return error.RandomFailed;
+                    io.randomSecure(&iv) catch |e| return if (e == error.Canceled) error.Canceled else error.RandomFailed;
                     break :blk nip04.encryptWithIv(gpa, conversation_key, iv, text);
                 }
                 var nonce: [32]u8 = undefined;
-                io.randomSecure(&nonce) catch return error.RandomFailed;
+                io.randomSecure(&nonce) catch |e| return if (e == error.Canceled) error.Canceled else error.RandomFailed;
                 break :blk nip44.encryptWithConversationKey(gpa, conversation_key, text, nonce);
             },
             .decrypt => if (legacy)

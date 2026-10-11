@@ -362,7 +362,7 @@ fn seal(a: std.mem.Allocator, io: std.Io, signer: *signing.Signer, to: keys.Publ
 /// Up to two days before now, never now itself, as NIP-59 asks of a seal.
 fn randomPastTimestamp(io: std.Io) !i64 {
     var buf: [8]u8 = undefined;
-    io.randomSecure(&buf) catch return error.RandomFailed;
+    io.randomSecure(&buf) catch |e| return if (e == error.Canceled) error.Canceled else error.RandomFailed;
     const r = std.mem.readInt(u64, &buf, .little);
     const two_days: u64 = 2 * 24 * 60 * 60;
     const offset: i64 = 1 + @as(i64, @intCast(r % two_days));

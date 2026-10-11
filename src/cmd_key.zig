@@ -541,7 +541,8 @@ fn mnemonic(
     defer std.crypto.secureZero(u8, &entropy);
     // 12 words carry 128 bits, and every 3 more words carry 32 more.
     const n = (words / 3) * 4;
-    io.randomSecure(entropy[0..n]) catch {
+    io.randomSecure(entropy[0..n]) catch |e| {
+        if (e == error.Canceled) return e;
         try err.writeAll("deed key mnemonic: could not draw randomness from the system\n");
         return cli.exit_fail;
     };

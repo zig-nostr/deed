@@ -1,6 +1,12 @@
-**deed** is a command line for nostr, built in Zig. It runs on macOS and Linux, on both Intel and ARM, and on Windows. The Linux binaries are statically linked, so there is no glibc version to satisfy. The macOS binaries are **ad-hoc signed, not notarized**, which means a download that came through a browser needs `xattr -dr com.apple.quarantine` before it will run. The Windows builds are zips holding `deed.exe`, which is not code-signed.
+**deed** is a command line for nostr, built in Zig. It runs on macOS, Linux and Windows, on both Intel and ARM. The Linux binaries are statically linked, so there is no glibc version to satisfy. The macOS binaries are **ad-hoc signed, not notarized**, which means a download that came through a browser needs `xattr -dr com.apple.quarantine` before it will run. The Windows builds are zips holding `deed.exe`, which is not code-signed.
 
 Every artifact below is published with a `.sha256` beside it, so the download can be checked against a digest that was written by the same job that built it.
+
+### What's new in v0.5.1
+
+**A native build for Windows on ARM.** Releases now carry a zip for aarch64 Windows, run on a Windows ARM machine before the release is published, and the PowerShell installer puts it in place on an ARM64 machine. It used to crash at startup: a stripped build for that target looked for every thread-local variable in the wrong place, because of a linker bug fixed upstream in llvm/llvm-project#200060. That target is now built without stripping, which costs about 250 KB, since its debug information goes to a separate `.pdb` that is not shipped. For an older release without the ARM64 zip, the installer still installs the x86_64 build, which Windows on ARM runs under emulation.
+
+deed is built on nostr 0.16.0. A command that is cancelled while it waits for randomness now reports the cancel, where it used to report a random-number failure.
 
 ### What's new in v0.5.0
 
