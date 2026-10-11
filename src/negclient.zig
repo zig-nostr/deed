@@ -21,7 +21,6 @@
 //! over, because a relay can send anything.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const nostr = @import("nostr");
 
 const Io = std.Io;
@@ -943,10 +942,6 @@ test "a write that never finishes gives up at the deadline" {
 }
 
 test "a write to a relay that stops reading gives up at the deadline" {
-    // Windows completes a large send on a loopback socket without waiting for
-    // the peer to read, so the write cannot block there. The deadline is
-    // covered everywhere by the test above, which uses no socket.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     const gpa = std.heap.page_allocator;
     var deaf: testrelay.Relay = undefined;
@@ -967,8 +962,12 @@ test "a write to a relay that stops reading gives up at the deadline" {
     defer arena.deinit();
     const ev = try nostr.event.create(arena.allocator(), signer, kp, 1_700_000_000, 1, &.{}, content, null);
     const Publish = struct {
+        // Windows takes a large send on a loopback socket without waiting for
+        // the peer to read, so one event may not block there. Writing on, with
+        // a bound so a socket that never fills still ends, reaches a write
+        // that waits for room that does not come.
         fn now(rr: *relay.Relay, e: Event) anyerror!void {
-            return rr.publish(e);
+            for (0..256) |_| try rr.publish(e);
         }
     };
     const started = Io.Timestamp.now(io, .awake).toMilliseconds();
