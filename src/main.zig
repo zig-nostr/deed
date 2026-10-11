@@ -241,6 +241,7 @@ test {
     _ = @import("cmd_fetch.zig");
     _ = @import("cmd_publish.zig");
     _ = @import("cmd_req.zig");
+    _ = @import("cmd_spell.zig");
     _ = @import("relayset.zig");
     _ = @import("storepath.zig");
     _ = @import("dial.zig");

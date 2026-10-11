@@ -84,6 +84,7 @@ pub const table = [_]Verb{
     fromModule("post", @import("cmd_post.zig")),
     fromModule("profile", @import("cmd_profile.zig")),
     fromModule("store", @import("cmd_store.zig")),
+    fromModule("spell", @import("cmd_spell.zig")),
 };
 
 const name_width = 10;
