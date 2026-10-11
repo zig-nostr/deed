@@ -90,6 +90,9 @@ pub const table = [_]Verb{
     fromModule("nsite", @import("cmd_nsite.zig")),
     fromModule("nip", @import("cmd_nip.zig")),
     fromModule("group", @import("cmd_group.zig")),
+    fromModule("podcast", @import("cmd_podcast.zig")),
+    fromModule("validate", @import("cmd_validate.zig")),
+    fromModule("dekey", @import("cmd_dekey.zig")),
 };
 
 const name_width = 10;

@@ -269,6 +269,9 @@ test {
     _ = @import("cmd_nsite.zig");
     _ = @import("cmd_nip.zig");
     _ = @import("cmd_group.zig");
+    _ = @import("cmd_podcast.zig");
+    _ = @import("cmd_validate.zig");
+    _ = @import("cmd_dekey.zig");
     _ = @import("cmd_sync.zig");
     _ = @import("kinds.zig");
     _ = @import("outbox.zig");
