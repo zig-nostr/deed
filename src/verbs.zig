@@ -203,8 +203,6 @@ test "the usage lists exactly the ready verbs" {
 test "every ready verb's usage states its exit codes" {
     for (table) |v| {
         if (!v.ready) continue;
-        // nsite is covered by its own change, which adds the line to its usage.
-        if (std.mem.eql(u8, v.name, "nsite")) continue;
         std.testing.expect(std.mem.indexOf(u8, v.usage, "Exits:") != null) catch |e| {
             std.debug.print("deed {s}: the usage has no 'Exits:' line\n", .{v.name});
             return e;

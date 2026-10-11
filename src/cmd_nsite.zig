@@ -87,6 +87,10 @@ pub const usage =
     \\                        published manifest is the same, or cannot be read, or
     \\                        no relay finished answering
     \\      --include-hidden  deploy: publish dot-files and dot-directories too
+    \\      --allow-local     download, deploy: let the servers asked for blobs resolve
+    \\                        to loopback, private or link-local addresses (refused
+    \\                        by default, so a manifest cannot aim deed at your
+    \\                        own network)
     \\      --sites           list: the person's sites rather than one site's files
     \\  -r, --relay <url>     a relay (repeatable; a bare ws:// or wss:// argument
     \\                        works too)
@@ -101,8 +105,8 @@ pub const usage =
     \\download of paths that differ only in case (or, on Windows, that Windows
     \\cannot create).
     \\
-    \\Exit status is 0 when everything asked for was done, 1 when something
-    \\failed, and 2 when the command line was not understood.
+    \\Exits: 0 when everything asked for was done; 1 when something failed;
+    \\2 when the command line was not understood.
     \\
 ;
 
@@ -263,6 +267,7 @@ const Opts = struct {
     source: ?[]const u8 = null,
     force: bool = false,
     include_hidden: bool = false,
+    allow_local: bool = false,
     sites: bool = false,
     timeout_ms: i64 = 10_000,
 
@@ -317,6 +322,8 @@ pub fn run(
             opts.force = true;
         } else if (std.mem.eql(u8, a, "--include-hidden")) {
             opts.include_hidden = true;
+        } else if (std.mem.eql(u8, a, "--allow-local")) {
+            opts.allow_local = true;
         } else if (std.mem.eql(u8, a, "--sites")) {
             opts.sites = true;
         } else if (cli.isOneOf(a, &.{ "-s", "--server", "-r", "--relay", "--sec", "--name", "--title", "--description", "--source", "--timeout" })) {
@@ -783,7 +790,7 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
         if (!same) changed_files += 1;
         var sent = false;
         for (servers, 0..) |srv, j| {
-            if (same and try blobPresent(gpa, io, srv, f.sha)) {
+            if (same and try blobPresent(gpa, io, srv, f.sha, !opts.allow_local)) {
                 held[i * servers.len + j] = true;
                 continue;
             }
@@ -886,12 +893,13 @@ fn sameServers(arena: std.mem.Allocator, published: []const []const u8, now: []c
 
 /// Whether `srv` holds the blob: a HEAD for it (BUD-06 names the route). Any
 /// other answer, or none, counts as not holding it.
-fn blobPresent(gpa: std.mem.Allocator, io: Io, srv: []const u8, sha: [32]u8) !bool {
+fn blobPresent(gpa: std.mem.Allocator, io: Io, srv: []const u8, sha: [32]u8, deny_private: bool) !bool {
     const sha_hex = std.fmt.bytesToHex(sha, .lower);
     const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ srv, &sha_hex });
     defer gpa.free(url);
     var r = http.fetch(gpa, io, url, .{
         .method = .HEAD,
+        .deny_private = deny_private,
         .timeout_ms = blob_timeout_ms,
         .max_bytes = std.math.maxInt(usize),
     }) catch return false;
@@ -977,7 +985,7 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
     for (m.paths) |p| {
         const rel = p.path[1..];
         const dest = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, rel });
-        const got = fetchBlob(gpa, io, arena, servers.items, p.sha, dest, max_site_bytes - total, err) catch |e| {
+        const got = fetchBlob(gpa, io, arena, servers.items, p.sha, dest, max_site_bytes - total, !opts.allow_local, err) catch |e| {
             try err.print("deed nsite download: {s}: {s}\n", .{ p.path, @errorName(e) });
             code = cli.exit_fail;
             continue;
@@ -1054,6 +1062,7 @@ fn fetchBlob(
     sha: [32]u8,
     dest: []const u8,
     room: u64,
+    deny_private: bool,
     err: *Io.Writer,
 ) !?u64 {
     const sha_hex = std.fmt.bytesToHex(sha, .lower);
@@ -1078,10 +1087,15 @@ fn fetchBlob(
 
         const cap: usize = @intCast(@min(max_file_bytes, room));
         const status = http.fetchTo(gpa, io, url, .{
+            .deny_private = deny_private,
             .timeout_ms = blob_timeout_ms,
             .max_bytes = cap,
         }, &hashed.writer) catch |e| {
-            try err.print("deed nsite download: {s}: {s}\n", .{ srv, http.describe(e) });
+            if (e == error.PrivateAddress) {
+                try err.print("deed nsite download: {s}: resolves to a private address (use --allow-local)\n", .{url});
+            } else {
+                try err.print("deed nsite download: {s}: {s}\n", .{ srv, http.describe(e) });
+            }
             continue;
         };
         if (status < 200 or status >= 300) {
@@ -1342,11 +1356,20 @@ const Ran = struct {
     }
 };
 
-fn runArgs(gpa: std.mem.Allocator, io: Io, args: []const []const u8) !Ran {
+fn runStrict(gpa: std.mem.Allocator, io: Io, args: []const []const u8) !Ran {
     var r: Ran = .{ .code = 0, .out = .init(testing.allocator), .err = .init(testing.allocator) };
     errdefer r.deinit();
     r.code = try run(gpa, io, args, &r.out.writer, &r.err.writer);
     return r;
+}
+
+/// As `runArgs`, with `--allow-local` added: the test servers are on loopback.
+fn runArgs(gpa: std.mem.Allocator, io: Io, args: []const []const u8) !Ran {
+    if (args.len == 0) return runStrict(gpa, io, args);
+    var buf: [32][]const u8 = undefined;
+    @memcpy(buf[0..args.len], args);
+    buf[args.len] = "--allow-local";
+    return runStrict(gpa, io, buf[0 .. args.len + 1]);
 }
 
 const Tmp = struct {
@@ -1825,6 +1848,46 @@ test "download refuses a manifest whose paths collide, and writes nothing" {
     try testing.expectEqual(cli.exit_fail, r.code);
     try testing.expect(std.mem.indexOf(u8, r.err.written(), "differ only in case") != null);
     try testing.expectError(error.FileNotFound, tmp.tmp.dir.access(io, "got", .{}));
+}
+
+test "download refuses a server on a private address unless --allow-local" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    const sha = "186ea5fd14e88fd1ac49351759e7ab906fa94892002b60bf7f5a428f28ca1c99";
+    const tags = [_]event.Tag{
+        &.{ "path", "/index.html", sha },
+        &.{ "server", "http://127.0.0.1:1" },
+    };
+    const ev = try event.create(a, signer, kp, 1_700_000_000, kind_root, &tags, "", null);
+    var relay: SiteRelay = .{};
+    try relay.start(io, 1);
+    defer relay.stop(io);
+    const json = try event.toJson(a, ev);
+    @memcpy(relay.stored[0..json.len], json);
+    relay.stored_len = json.len;
+    var rbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const npub = try nostr.nip19.encodeNpub(a, kp.public_key);
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    const dest = try tmp.path(a, "got");
+    var r = try runStrict(gpa, io, &.{ "download", npub, dest, relay_url });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_fail, r.code);
+    try testing.expect(std.mem.indexOf(u8, r.err.written(), "resolves to a private address (use --allow-local)") != null);
+    try testing.expect(std.mem.indexOf(u8, r.err.written(), "http://127.0.0.1:1/") != null);
 }
 
 /// The sha256 of `text`, in hex.
