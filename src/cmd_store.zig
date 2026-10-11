@@ -36,7 +36,8 @@ pub const usage =
     \\         and the size of the file on disk. --json prints one object.
     \\export   Every stored event that matches, newest first, one JSON event
     \\         per line on stdout. Takes the filter options of `deed req`:
-    \\         -k, -a, -i, -e, -p, -t, -l, -s and -u.
+    \\         -k, -a, -i, -e, -p, -d, -h, -t, -T, --search, -l, -s and -u. As in
+    \\         `deed req`, -h <value> is the h tag; a bare -h at the end is help.
     \\import   Reads one JSON event per line on stdin and stores them. Each
     \\         event is verified first; a line that is not an event, or whose
     \\         id or signature is wrong, is reported on stderr with its line
@@ -90,7 +91,8 @@ pub fn run(
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) {
+        // `-h <value>` is the h tag filter; alone at the end it asks for help.
+        if (cli.isOneOf(a, &.{ "help", "--help" }) or (std.mem.eql(u8, a, "-h") and i + 1 >= args.len)) {
             try out.writeAll(usage);
             return cli.exit_ok;
         }
@@ -867,4 +869,16 @@ test "a missing store is named and not created" {
     defer freeRun(r);
     try testing.expectEqual(cli.exit_fail, r.code);
     try testing.expect(std.mem.indexOf(u8, r.err, "there is no store at ") != null);
+}
+
+test "export takes -h <value> as the h tag and a bare -h as help" {
+    const help = try runStore(&.{ "export", "-h" });
+    defer freeRun(help);
+    try testing.expectEqual(cli.exit_ok, help.code);
+    try testing.expectEqualStrings(usage, help.out);
+
+    const tag = try runStore(&.{ "export", "--store", "/nonexistent/dir/s.mdb", "-h", "group" });
+    defer freeRun(tag);
+    try testing.expectEqual(cli.exit_fail, tag.code);
+    try testing.expectEqualStrings("", tag.out);
 }

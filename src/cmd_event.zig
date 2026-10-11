@@ -66,7 +66,8 @@ pub const usage =
     \\  -e <id>              add an e tag: a hex id, note1... or nevent1...
     \\  -p <pubkey>          add a p tag: hex, npub1... or nprofile1...
     \\  -d <d>               add a d tag
-    \\  -h <h>               add an h tag
+    \\  -h <h>               add an h tag. --help shows this; -h <value> adds an h
+    \\                       tag, and a bare -h as the last argument shows this too
     \\  -a <address>         add an a tag: kind:pubkey:d, an naddr1..., or a bare
     \\                       pubkey (taken as <kind>:<pubkey>:<-d value>)
     \\  --created-at <n>     unix seconds (default: now)
@@ -168,7 +169,9 @@ pub fn run(
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (cli.isOneOf(a, &.{ "help", "--help" })) {
+        // `-h` is the h tag, so it asks for help only as the last argument,
+        // where it has no value to take.
+        if (cli.isOneOf(a, &.{ "help", "--help" }) or (std.mem.eql(u8, a, "-h") and i + 1 >= args.len)) {
             try out.writeAll(usage);
             return cli.exit_ok;
         }
@@ -1326,4 +1329,18 @@ test "a small stream signs on the calling thread and matches the sequential byte
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "a bare -h at the end shows the usage, while -h <value> is the h tag" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+
+    const help = try runEvent(arena, &.{"-h"});
+    try std.testing.expectEqual(cli.exit_ok, help.code);
+    try std.testing.expectEqualStrings(usage, help.out);
+
+    const tag = try runEvent(arena, &.{ "--sec", test_sec, "-h", "group" });
+    try std.testing.expectEqual(cli.exit_ok, tag.code);
+    try std.testing.expect(has(tag.out, "[\"h\",\"group\"]"));
 }
