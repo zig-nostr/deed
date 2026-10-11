@@ -79,7 +79,34 @@ pub const usage =
 
 /// The protocol versions this server speaks, newest first. A client that asks
 /// for one of them gets it; any other request is answered with the newest.
-const protocol_versions = [_][]const u8{ "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05" };
+const protocol_versions = [_][]const u8{ "2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05" };
+
+/// The newest revision that is legacy: it opens with `initialize`. This is
+/// what an `initialize` that names no known version is answered with, since
+/// 2026-07-28 and later have no handshake (Versioning and Compatibility,
+/// "Backward Compatibility with Initialization-Based Versions").
+const newest_legacy_version = "2025-11-25";
+
+/// The first revision with per-request metadata and no handshake.
+const modern_version = "2026-07-28";
+
+/// `_meta` keys reserved by the revision (Base Protocol, "General fields",
+/// "_meta", "Per-request protocol fields").
+const meta_version = "io.modelcontextprotocol/protocolVersion";
+const meta_caps = "io.modelcontextprotocol/clientCapabilities";
+const meta_server_info = "io.modelcontextprotocol/serverInfo";
+
+/// Error code for an unsupported version (Base Protocol, "Error Codes":
+/// `UnsupportedProtocolVersion`). -32020 to -32099 belong to the spec.
+const err_unsupported_version = -32022;
+
+/// How long a client may keep a tools/list or server/discover result
+/// (Caching utility: `ttlMs`, `cacheScope`). The tool set is fixed for the
+/// life of the process and depends on how it was started, so it is private.
+const instructions_json = "\"Nostr tools: decode and encode NIP-19 codes, verify events, ask relays, look up relay lists and kinds. " ++
+    "Relays are named by the caller; there is no built-in list.\"";
+
+const cache_fields = ",\"ttlMs\":3600000,\"cacheScope\":\"private\"";
 
 /// The most a tool's result text holds before it is cut.
 const max_result_bytes = 256 * 1024;
@@ -360,6 +387,10 @@ const Server = struct {
     io: Io,
     cfg: Config,
     err: *Io.Writer,
+    /// Set per request: it carried 2026-07-28 or later metadata, so the
+    /// result gets `resultType` and `serverInfo`. The protocol keeps no
+    /// state between requests (Base Protocol, "Statelessness").
+    modern: bool = false,
 };
 
 /// Answers the requests on `in` until it ends. One reply is written and
@@ -417,7 +448,54 @@ fn handleLine(s: *Server, text: []const u8, out: *Io.Writer) !void {
     const method = method_v.string;
     const params: Json = obj.get("params") orelse .null;
 
-    if (std.mem.eql(u8, method, "initialize")) {
+    // A request that carries per-request metadata speaks the revision with no
+    // handshake (Versioning and Compatibility, "Protocol Version
+    // Negotiation"); one without it is served the legacy way, so a dual-era
+    // server answers `initialize` clients as before ("Backward Compatibility
+    // with Initialization-Based Versions"). The two are told apart per
+    // request, never per connection.
+    s.modern = false;
+    var requested: ?[]const u8 = null;
+    if (params == .object) if (params.object.get("_meta")) |meta| if (meta == .object) {
+        if (meta.object.get(meta_version)) |pv| {
+            if (pv != .string) return replyError(out, id_v, -32602, "Invalid params: " ++ meta_version ++ " must be a string");
+            requested = pv.string;
+        }
+    };
+    if (std.mem.eql(u8, method, "server/discover") and requested == null) {
+        // Base Protocol, "Per-request protocol fields": a request missing a
+        // required field is malformed.
+        return replyError(out, id_v, -32602, "Invalid params: _meta must carry " ++ meta_version ++ " and " ++ meta_caps);
+    }
+    if (requested) |rv| {
+        var known = false;
+        for (protocol_versions) |v| known = known or std.mem.eql(u8, v, rv);
+        if (!known) return unsupportedVersion(a, id_v, rv, out);
+        if (std.mem.eql(u8, rv, modern_version)) {
+            const meta = params.object.get("_meta").?.object;
+            const caps = meta.get(meta_caps) orelse
+                return replyError(out, id_v, -32602, "Invalid params: _meta must carry " ++ meta_caps);
+            if (caps != .object) return replyError(out, id_v, -32602, "Invalid params: " ++ meta_caps ++ " must be an object");
+            s.modern = true;
+        }
+    }
+
+    if (s.modern) {
+        // Removed by this revision: `initialize`, `notifications/initialized`
+        // and `ping` (Key Changes, major changes 2 and 5). They fall through
+        // to "Method not found" below.
+        if (std.mem.eql(u8, method, "server/discover")) {
+            return discover(s, a, id_v, out);
+        } else if (std.mem.eql(u8, method, "tools/list")) {
+            return toolsList(s, a, id_v, out);
+        } else if (std.mem.eql(u8, method, "tools/call")) {
+            return toolsCall(s, a, id_v, params, out);
+        }
+    } else if (std.mem.eql(u8, method, "server/discover")) {
+        // Legacy versions named in _meta have no such method, but a client
+        // probing with one is still told what this server speaks.
+        return discover(s, a, id_v, out);
+    } else if (std.mem.eql(u8, method, "initialize")) {
         return initialize(s, a, id_v, params, out);
     } else if (std.mem.eql(u8, method, "ping")) {
         return replyResult(out, id_v, "{}");
@@ -433,9 +511,9 @@ fn handleLine(s: *Server, text: []const u8, out: *Io.Writer) !void {
 
 fn initialize(s: *Server, a: Allocator, id: Json, params: Json, out: *Io.Writer) !void {
     _ = s;
-    var version: []const u8 = protocol_versions[0];
+    var version: []const u8 = newest_legacy_version;
     if (params == .object) if (params.object.get("protocolVersion")) |pv| if (pv == .string) {
-        for (protocol_versions) |v| {
+        for (protocol_versions[1..]) |v| {
             if (std.mem.eql(u8, v, pv.string)) version = v;
         }
     };
@@ -443,10 +521,54 @@ fn initialize(s: *Server, a: Allocator, id: Json, params: Json, out: *Io.Writer)
     try w.writer.print(
         "{{\"protocolVersion\":\"{s}\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}}," ++
             "\"serverInfo\":{{\"name\":\"deed\",\"title\":\"deed\",\"version\":\"{s}\"}}," ++
-            "\"instructions\":\"Nostr tools: decode and encode NIP-19 codes, verify events, ask relays, look up relay lists and kinds. " ++
-            "Relays are named by the caller; there is no built-in list.\"}}",
+            "\"instructions\":" ++ instructions_json ++ "}}",
         .{ version, @import("main.zig").version },
     );
+    try replyResult(out, id, w.written());
+}
+
+/// UnsupportedProtocolVersionError (Versioning and Compatibility, "Protocol
+/// Version Negotiation"): the versions this server speaks, and the one asked.
+fn unsupportedVersion(a: Allocator, id: Json, requested: []const u8, out: *Io.Writer) !void {
+    _ = a;
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeId(out, id);
+    try out.writeAll(",\"error\":{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":{\"supported\":[");
+    for (protocol_versions, 0..) |v, i| {
+        if (i != 0) try out.writeByte(',');
+        try std.json.Stringify.value(v, .{}, out);
+    }
+    try out.writeAll("],\"requested\":");
+    try std.json.Stringify.value(requested[0..@min(requested.len, 64)], .{}, out);
+    try out.writeAll("}}}\n");
+    try out.flush();
+}
+
+/// `server/discover` (Discovery): supported versions, capabilities, identity.
+fn discover(s: *Server, a: Allocator, id: Json, out: *Io.Writer) !void {
+    var w: Io.Writer.Allocating = .init(a);
+    try w.writer.writeAll("{\"supportedVersions\":[");
+    for (protocol_versions, 0..) |v, i| {
+        if (i != 0) try w.writer.writeByte(',');
+        try std.json.Stringify.value(v, .{}, &w.writer);
+    }
+    try w.writer.writeAll("],\"capabilities\":{\"tools\":{\"listChanged\":false}},\"instructions\":" ++ instructions_json ++ cache_fields ++ "}");
+    try replyOk(s, a, out, id, w.written());
+}
+
+/// The legacy and the modern answer share one reply path: the modern one adds
+/// `resultType` ("Base Protocol", "ResultType") and the server's identity
+/// ("Per-response protocol fields").
+fn replyOk(s: *Server, a: Allocator, out: *Io.Writer, id: Json, result: []const u8) !void {
+    if (!s.modern) return replyResult(out, id, result);
+    std.debug.assert(result.len >= 2 and result[0] == '{' and result[result.len - 1] == '}');
+    var w: Io.Writer.Allocating = .init(a);
+    try w.writer.writeAll("{\"resultType\":\"complete\"");
+    if (result.len > 2) {
+        try w.writer.writeByte(',');
+        try w.writer.writeAll(result[1 .. result.len - 1]);
+    }
+    try w.writer.print(",\"_meta\":{{\"" ++ meta_server_info ++ "\":{{\"name\":\"deed\",\"version\":\"{s}\"}}}}}}", .{@import("main.zig").version});
     try replyResult(out, id, w.written());
 }
 
@@ -472,8 +594,9 @@ fn toolsList(s: *Server, a: Allocator, id: Json, out: *Io.Writer) !void {
             if (t.open_world) "true" else "false",
         });
     }
-    try ww.writeAll("]}");
-    try replyResult(out, id, w.written());
+    // Caching: tools/list results carry a freshness hint in this revision.
+    try ww.writeAll(if (s.modern) "]" ++ cache_fields ++ "}" else "]}");
+    try replyOk(s, a, out, id, w.written());
 }
 
 fn toolsCall(s: *Server, a: Allocator, id: Json, params: Json, out: *Io.Writer) !void {
@@ -512,7 +635,7 @@ fn toolsCall(s: *Server, a: Allocator, id: Json, params: Json, out: *Io.Writer) 
     try w.writer.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.value(cap(a, text.written(), max_result_bytes), .{}, &w.writer);
     try w.writer.print("}}],\"isError\":{s}}}", .{if (ok) "false" else "true"});
-    try replyResult(out, id, w.written());
+    try replyOk(s, a, out, id, w.written());
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,7 +1304,7 @@ test "an unknown version is answered with the newest this server speaks" {
     const got = try converse(gpa, .{}, "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}\n");
     defer gpa.free(got);
     try testing.expect(has(got, "\"id\":\"a\""));
-    try testing.expect(has(got, "\"protocolVersion\":\"" ++ protocol_versions[0] ++ "\""));
+    try testing.expect(has(got, "\"protocolVersion\":\"" ++ newest_legacy_version ++ "\""));
 }
 
 test "malformed JSON-RPC gets the standard errors and the server carries on" {
@@ -1696,4 +1819,95 @@ test "req stops at its limit when a relay ignores it, without waiting for the de
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "flood "));
     try testing.expect(has(got, "stopped at the limit of 3 events"));
     try testing.expect(took < 4000);
+}
+
+/// `_meta` for a 2026-07-28 request.
+const modern_meta = "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"," ++
+    "\"io.modelcontextprotocol/clientInfo\":{\"name\":\"t\",\"version\":\"0\"},\"io.modelcontextprotocol/clientCapabilities\":{}}";
+
+test "2026-07-28: discover, list and call need no handshake" {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    const ev = try cmd_post.signedJson(gpa, io, [_]u8{0x33} ** 32, 1, &.{}, "from the relay", 1_700_000_000);
+    defer gpa.free(ev);
+    var script = cmd_post.Script{ .serve = ev };
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, cmd_post.Script.handle, &script);
+    defer relay.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, relay.port());
+
+    const call = try std.fmt.allocPrint(gpa, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"req\",{s}," ++
+        "\"arguments\":{{\"filter\":{{\"kinds\":[1]}},\"relays\":[\"{s}\"],\"limit\":5,\"timeout_ms\":5000}}}}}}\n", .{ modern_meta, url });
+    defer gpa.free(call);
+    const decode = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"kind\"," ++ modern_meta ++ ",\"arguments\":{\"kind\":1}}}\n";
+    const reqs = try std.mem.concat(gpa, u8, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{" ++ modern_meta ++ "}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{" ++ modern_meta ++ "}}\n",
+        call,
+        decode,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\",\"params\":{" ++ modern_meta ++ "}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"initialize\",\"params\":{" ++ modern_meta ++ "}}\n",
+    });
+    defer gpa.free(reqs);
+    const got = try converse(gpa, .{}, reqs);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+
+    const d = replyFor(got, 1, &b).?;
+    try testing.expect(has(d, "\"resultType\":\"complete\""));
+    try testing.expect(has(d, "\"supportedVersions\":[\"2026-07-28\",\"2025-11-25\""));
+    try testing.expect(has(d, "\"capabilities\":{\"tools\""));
+    try testing.expect(has(d, "\"io.modelcontextprotocol/serverInfo\":{\"name\":\"deed\""));
+    try testing.expect(has(d, "\"ttlMs\":"));
+    try testing.expect(has(d, "\"cacheScope\":\"private\""));
+
+    const l = replyFor(got, 2, &b).?;
+    try testing.expect(has(l, "\"resultType\":\"complete\""));
+    try testing.expect(has(l, "\"name\":\"decode\""));
+    try testing.expect(has(l, "\"ttlMs\":"));
+
+    const r = replyFor(got, 3, &b).?;
+    try testing.expect(has(r, "\"resultType\":\"complete\""));
+    try testing.expect(has(r, "\"isError\":false"));
+    try testing.expect(has(r, "from the relay"));
+    try testing.expect(has(replyFor(got, 4, &b).?, "\"resultType\":\"complete\""));
+
+    // ping and initialize no longer exist in this revision.
+    try testing.expect(has(replyFor(got, 5, &b).?, "-32601"));
+    try testing.expect(has(replyFor(got, 6, &b).?, "-32601"));
+}
+
+test "2026-07-28: a bad version or missing metadata is refused with the spec's errors" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const got = try converse(gpa, .{}, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"1900-01-01\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"server/discover\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}\n");
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    const u = replyFor(got, 1, &b).?;
+    try testing.expect(has(u, "\"code\":-32022"));
+    try testing.expect(has(u, "\"supported\":[\"2026-07-28\""));
+    try testing.expect(has(u, "\"requested\":\"1900-01-01\""));
+    try testing.expect(has(replyFor(got, 2, &b).?, "-32602"));
+    try testing.expect(has(replyFor(got, 3, &b).?, "-32602"));
+}
+
+test "the handshake still works beside 2026-07-28, and initialize never selects it" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const got = try converse(gpa, .{}, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n");
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    try testing.expect(has(replyFor(got, 1, &b).?, "\"protocolVersion\":\"2025-11-25\""));
+    const l = replyFor(got, 2, &b).?;
+    try testing.expect(has(l, "\"name\":\"decode\""));
+    try testing.expect(!has(l, "resultType"));
 }
