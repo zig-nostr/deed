@@ -185,6 +185,7 @@ macOS, Linux and Windows, on x86_64 and aarch64. Linux release builds are static
 - Windows needs an allocator to split the command line into arguments, so `main` uses `Args.Iterator.initAllocator`, which is free elsewhere.
 - A Windows console decodes text with its own code page. `console.zig` switches it to UTF-8 for the length of the run, the output page only when stdout is the console and the input page only when stdin is, so the deeds in a pipeline do not switch it back under each other. It puts the pages back before exit and on Ctrl-C. It does nothing on other systems.
 - The test relay shrinks a socket's receive window. On Windows std's sockets are AFD handles Winsock does not know, so it sends the option as the same AFD request std uses for its own socket options, and that is best effort.
+- On aarch64 Windows `build.zig` ignores `-Dstrip`. With Zig 0.16 a stripped build for that target crashes at its first thread-local access, because the linker misreads the offset in the relocation for the upper bits of a thread-local address (llvm/llvm-project#200060). The debug information sits in a `.pdb` beside the `.exe` there, so the binary only carries the stack trace code it would otherwise drop.
 
 Building only the executable for a target does not analyse code the executable never reaches. `zig build test -Dtarget=x86_64-windows-gnu` builds the test binary too, which is the check that finds a break in the test relay. The host cannot run the result, so the command ends with an error saying so once the compile has succeeded.
 
@@ -198,7 +199,7 @@ Two details matter when adding a test that dials. Use `testrelay.DialAllocator` 
 
 `bench/` is not a test suite. `bench/run.py` measures size, startup, memory, signing and verifying throughput, store speed, and relays over loopback against a build, using `bench/relay.py` as the relay. [`BENCHMARKS.md`](BENCHMARKS.md) has the numbers and how to reproduce them.
 
-CI (`.github/workflows/ci.yml`) builds, tests and checks formatting on Linux and macOS, builds and tests on Windows, checks that the installer scripts are pure ASCII and parse, and installs the latest release and runs it, with install.sh on Linux and macOS and with install.ps1 on Windows under both pwsh and Windows PowerShell 5.1. The release workflow (`release.yml`) builds every target from the tag, publishes each as a draft with a SHA-256 beside it, downloads the artifacts back and runs them on matching runners, and lifts the draft only after every check passes.
+CI (`.github/workflows/ci.yml`) builds, tests and checks formatting on Linux and macOS, builds and tests on Windows, builds the aarch64 Windows binary and test binary on Linux and runs both on a Windows ARM runner (the Zig compiler for that target crashes there), checks that the installer scripts are pure ASCII and parse, and installs the latest release and runs it, with install.sh on Linux and macOS and with install.ps1 on Windows under both pwsh and Windows PowerShell 5.1. The release workflow (`release.yml`) builds every target from the tag, publishes each as a draft with a SHA-256 beside it, downloads the artifacts back and runs them on matching runners, and lifts the draft only after every check passes.
 
 ## Where to start reading
 
