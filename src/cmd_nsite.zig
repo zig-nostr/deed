@@ -12,6 +12,7 @@
 //! be only so large, and a whole site only so large.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const blossom = @import("cmd_blossom.zig");
@@ -46,11 +47,19 @@ pub const usage =
     \\
     \\deploy   Hashes every regular file under <dir>, uploads the ones the
     \\         published manifest does not already name to each --server, and
-    \\         publishes the new manifest. A file whose hash matches the
-    \\         published one is not uploaded again, and when nothing at all
-    \\         changed nothing is published. If any file cannot be uploaded to
-    \\         any server, nothing is published. Prints the manifest event if at
-    \\         least one relay accepted it. Symbolic links are skipped.
+    \\         publishes the new manifest. A file the published manifest already
+    \\         names is not uploaded again, but each --server is asked (HEAD) whether
+    \\         it holds the file, and gets it if not. When the files, the servers
+    \\         and the title, description and source are all the same as the
+    \\         published manifest, nothing is published. The manifest names only
+    \\         the servers that hold every file; if a file reached no server, or
+    \\         no server holds every file, nothing is published. If the published
+    \\         manifest cannot be read, or no relay finished answering, deploy
+    \\         stops, because it could not tell what it would replace; --force goes
+    \\         on. Prints the manifest event if at least one relay accepted it.
+    \\         Symbolic links are skipped, and so are dot-files and
+    \\         dot-directories (.git, .env, .DS_Store): a published file cannot be
+    \\         taken back. --include-hidden publishes them.
     \\download Fetches the manifest and downloads each file from the servers the
     \\         manifest names (and any given with --server), in order, into
     \\         <dir>, which must not exist or be empty. A file is written only
@@ -63,7 +72,8 @@ pub const usage =
     \\
     \\Options:
     \\  -s, --server <url>    a Blossom server (domain or URL); repeat it. deploy
-    \\                        needs at least one and uploads to all of them;
+    \\                        needs at least one and uploads to all of them, and
+    \\                        names those that took every file;
     \\                        download adds them after the manifest's own
     \\      --sec <key>       deploy: the key that signs, as nsec1..., ncryptsec1...
     \\                        or 64 hex characters. Falls back to $NOSTR_SECRET_KEY
@@ -74,7 +84,9 @@ pub const usage =
     \\                        deploy: a description for the site
     \\      --source <url>    deploy: where the source lives
     \\      --force           deploy: upload every file and publish even if the
-    \\                        published manifest is the same
+    \\                        published manifest is the same, or cannot be read, or
+    \\                        no relay finished answering
+    \\      --include-hidden  deploy: publish dot-files and dot-directories too
     \\      --sites           list: the person's sites rather than one site's files
     \\  -r, --relay <url>     a relay (repeatable; a bare ws:// or wss:// argument
     \\                        works too)
@@ -85,7 +97,9 @@ pub const usage =
     \\
     \\Limits: a manifest may name 10000 files, a file may be 100 MiB, and a site
     \\1 GiB. A manifest with a path that is not a plain absolute path (a ..
-    \\segment, a backslash, a control character) is refused.
+    \\segment, a backslash, a control character) is refused, and so is a
+    \\download of paths that differ only in case (or, on Windows, that Windows
+    \\cannot create).
     \\
     \\Exit status is 0 when everything asked for was done, 1 when something
     \\failed, and 2 when the command line was not understood.
@@ -116,6 +130,9 @@ const Manifest = struct {
     /// Sorted by path.
     paths: []const PathHash,
     servers: []const []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    source: ?[]const u8 = null,
     created_at: i64,
 };
 
@@ -149,6 +166,7 @@ fn lessPath(_: void, a: PathHash, b: PathHash) bool {
 fn parseManifest(a: std.mem.Allocator, ev: event.Event, bad_path: *[]const u8) ManifestError!Manifest {
     var paths: std.ArrayList(PathHash) = .empty;
     var servers: std.ArrayList([]const u8) = .empty;
+    var meta: Manifest = .{ .paths = &.{}, .servers = &.{}, .created_at = ev.created_at };
     for (ev.tags) |tag| {
         if (tag.len >= 3 and std.mem.eql(u8, tag[0], "path")) {
             const sha = hex.decodeFixed(32, tag[2]) catch continue;
@@ -166,10 +184,18 @@ fn parseManifest(a: std.mem.Allocator, ev: event.Event, bad_path: *[]const u8) M
             try paths.append(a, .{ .path = try a.dupe(u8, tag[1]), .sha = sha });
         } else if (tag.len >= 2 and std.mem.eql(u8, tag[0], "server")) {
             try servers.append(a, try a.dupe(u8, tag[1]));
+        } else if (tag.len >= 2 and std.mem.eql(u8, tag[0], "title") and meta.title == null) {
+            meta.title = try a.dupe(u8, tag[1]);
+        } else if (tag.len >= 2 and std.mem.eql(u8, tag[0], "description") and meta.description == null) {
+            meta.description = try a.dupe(u8, tag[1]);
+        } else if (tag.len >= 2 and std.mem.eql(u8, tag[0], "source") and meta.source == null) {
+            meta.source = try a.dupe(u8, tag[1]);
         }
     }
     std.mem.sort(PathHash, paths.items, {}, lessPath);
-    return .{ .paths = paths.items, .servers = servers.items, .created_at = ev.created_at };
+    meta.paths = paths.items;
+    meta.servers = servers.items;
+    return meta;
 }
 
 fn isLowerHex(s: []const u8) bool {
@@ -236,6 +262,7 @@ const Opts = struct {
     description: ?[]const u8 = null,
     source: ?[]const u8 = null,
     force: bool = false,
+    include_hidden: bool = false,
     sites: bool = false,
     timeout_ms: i64 = 10_000,
 
@@ -288,6 +315,8 @@ pub fn run(
         }
         if (std.mem.eql(u8, a, "--force")) {
             opts.force = true;
+        } else if (std.mem.eql(u8, a, "--include-hidden")) {
+            opts.include_hidden = true;
         } else if (std.mem.eql(u8, a, "--sites")) {
             opts.sites = true;
         } else if (cli.isOneOf(a, &.{ "-s", "--server", "-r", "--relay", "--sec", "--name", "--title", "--description", "--source", "--timeout" })) {
@@ -393,12 +422,20 @@ fn newerThan(a: event.Event, b: event.Event) bool {
     return std.mem.order(u8, &a.id, &b.id) == .lt;
 }
 
+/// What a fetch found, and how many relays finished answering: none that did
+/// means "no site" cannot be told from "nobody said".
+const Fetched = struct {
+    parsed: ?event.Parsed,
+    /// Relays that sent everything they had before the deadline.
+    complete: usize,
+};
+
 /// The newest event any relay returns for `f`. Every event was verified and
 /// matched against the filter on the way.
-fn fetchNewest(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, f: nostr.filter.Filter, timeout_ms: i64, err: *Io.Writer) !?event.Parsed {
+fn fetchNewest(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, f: nostr.filter.Filter, timeout_ms: i64, err: *Io.Writer) !Fetched {
     var buf: Io.Writer.Allocating = .init(gpa);
     defer buf.deinit();
-    _ = try relayset.query(gpa, io, urls, &.{f}, &buf.writer, err, .{
+    const outcome = try relayset.query(gpa, io, urls, &.{f}, &buf.writer, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
     });
@@ -414,10 +451,10 @@ fn fetchNewest(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, f: nost
             } else p.deinit();
         } else best = p;
     }
-    return best;
+    return .{ .parsed = best, .complete = outcome.complete };
 }
 
-fn fetchSite(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, pk: [32]u8, name: ?[]const u8, timeout_ms: i64, err: *Io.Writer) !?event.Parsed {
+fn fetchSite(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, pk: [32]u8, name: ?[]const u8, timeout_ms: i64, err: *Io.Writer) !Fetched {
     const kinds = [1]u16{if (name == null) kind_root else kind_named};
     const authors = [1][32]u8{pk};
     var values: [1][]const u8 = undefined;
@@ -449,7 +486,7 @@ fn list(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, ou
 
     if (opts.sites) return listSites(gpa, io, relays.urls, pk, opts.timeout_ms, out, err);
 
-    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)) orelse {
+    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)).parsed orelse {
         try err.writeAll("deed nsite list: no site found\n");
         return cli.exit_fail;
     };
@@ -585,7 +622,7 @@ fn hashFile(io: Io, path: []const u8) !struct { sha: [32]u8, size: u64 } {
 
 /// Every regular file under `dir`, hashed. Null after saying why on `err` when
 /// the directory cannot be read or holds something a site cannot carry.
-fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u8, err: *Io.Writer) !?[]LocalFile {
+fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u8, include_hidden: bool, err: *Io.Writer) !?[]LocalFile {
     var root = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |e| {
         try err.print("deed nsite deploy: cannot read {s}: {s}\n", .{ dir, @errorName(e) });
         return null;
@@ -600,6 +637,14 @@ fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u
         try err.print("deed nsite deploy: cannot read {s}: {s}\n", .{ dir, @errorName(e) });
         return null;
     }) |entry| {
+        if (!include_hidden) {
+            if (hiddenAt(entry.path)) |top| {
+                // Said once, for the dot-file or dot-directory itself, and not
+                // again for everything inside it.
+                if (top) try err.print("deed nsite deploy: skipping the hidden {s} {s} (--include-hidden publishes it)\n", .{ if (entry.kind == .directory) "directory" else "file", entry.path });
+                continue;
+            }
+        }
         switch (entry.kind) {
             .directory => continue,
             .sym_link => {
@@ -643,6 +688,16 @@ fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u
     return files.items;
 }
 
+/// Null when no segment of `rel` starts with a dot; otherwise whether the last
+/// segment is the one that does.
+fn hiddenAt(rel: []const u8) ?bool {
+    var it = std.mem.splitAny(u8, rel, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len > 0 and seg[0] == '.') return it.peek() == null;
+    }
+    return null;
+}
+
 fn secretKey(gpa: std.mem.Allocator, flag: ?[]const u8, err: *Io.Writer) !?nostr.keys.SecretKey {
     const raw = flag orelse getEnv("NOSTR_SECRET_KEY") orelse {
         try err.writeAll("deed nsite deploy: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n");
@@ -669,7 +724,7 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
         return cli.exit_usage;
     };
 
-    const files = (try scan(gpa, io, arena, opts.positionals.items[0], err)) orelse return cli.exit_fail;
+    const files = (try scan(gpa, io, arena, opts.positionals.items[0], opts.include_hidden, err)) orelse return cli.exit_fail;
     if (files.len == 0) {
         try err.writeAll("deed nsite deploy: the directory holds no files\n");
         return cli.exit_fail;
@@ -679,57 +734,99 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
     defer relays.deinit();
 
     // What is published now, so what has not changed is not sent again.
+    // It is read even with --force, for the time it was made: a replaceable
+    // event only replaces an older one.
+    var fetched = try fetchSite(gpa, io, relays.urls, kp.public_key, opts.name, opts.timeout_ms, err);
+    defer if (fetched.parsed) |*p| p.deinit();
+    if (fetched.complete == 0) {
+        if (!opts.force) {
+            try err.writeAll("deed nsite deploy: no relay finished answering, so whether a site is already published is not known; try again, or pass --force to publish anyway\n");
+            return cli.exit_fail;
+        }
+        try err.writeAll("deed nsite deploy: no relay finished answering; publishing anyway because of --force\n");
+    }
     var existing: ?Manifest = null;
-    if (!opts.force) {
-        if (try fetchSite(gpa, io, relays.urls, kp.public_key, opts.name, opts.timeout_ms, err)) |found| {
-            var parsed = found;
-            defer parsed.deinit();
-            var bad: []const u8 = "";
-            existing = parseManifest(arena, parsed.value, &bad) catch null;
-        }
-    }
-
-    var changed: std.ArrayList(LocalFile) = .empty;
-    for (files) |f| {
-        var same = false;
-        if (existing) |m| {
-            for (m.paths) |p| {
-                if (std.mem.eql(u8, p.path, f.path)) same = std.mem.eql(u8, &p.sha, &f.sha);
+    var floor: ?i64 = null;
+    if (fetched.parsed) |p| {
+        floor = p.value.created_at;
+        var bad: []const u8 = "";
+        if (parseManifest(arena, p.value, &bad)) |m| {
+            if (!opts.force) existing = m;
+        } else |e| {
+            try reportManifest(err, "deploy", e, bad);
+            if (!opts.force) {
+                try err.writeAll("deed nsite deploy: the published manifest cannot be read, so it is not replaced; pass --force to replace it\n");
+                return cli.exit_fail;
             }
-        }
-        if (!same) try changed.append(arena, f);
-    }
-    if (existing) |m| {
-        if (changed.items.len == 0 and m.paths.len == files.len) {
-            try err.print("deed nsite deploy: nothing changed, so nothing was published ({d} files)\n", .{files.len});
-            return cli.exit_ok;
         }
     }
 
     // The key is handed to the uploader as hex: an ncryptsec has been opened
     // once, and is not asked about again for every file.
     const sec_hex = std.fmt.bytesToHex(sk, .lower);
+
+    // A file is sent to every server named. One the published manifest already
+    // names is only sent where a server does not hold it, which is asked with a
+    // HEAD, because a server added since, or one that lost the blob, would
+    // otherwise be listed in the manifest without having it.
+    const held = try arena.alloc(bool, files.len * servers.len);
+    @memset(held, false);
+    var changed_files: usize = 0;
     var uploaded: usize = 0;
-    var failed = false;
-    for (changed.items) |f| {
-        const sha_hex = std.fmt.bytesToHex(f.sha, .lower);
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &.{ "upload", f.disk });
-        for (servers) |s| try argv.appendSlice(arena, &.{ "-s", s });
-        try argv.appendSlice(arena, &.{ "--sec", &sec_hex });
-        var sink: Io.Writer.Allocating = .init(gpa);
-        defer sink.deinit();
-        _ = try blossom.run(gpa, io, argv.items, &sink.writer, err);
-        if (std.mem.indexOf(u8, sink.written(), &sha_hex) == null) {
-            try err.print("deed nsite deploy: {s} reached no server\n", .{f.path});
-            failed = true;
-            break;
+    for (files, 0..) |f, i| {
+        var same = false;
+        if (existing) |m| {
+            for (m.paths) |p| {
+                if (std.mem.eql(u8, p.path, f.path)) same = std.mem.eql(u8, &p.sha, &f.sha);
+            }
         }
-        uploaded += 1;
+        if (!same) changed_files += 1;
+        var sent = false;
+        for (servers, 0..) |srv, j| {
+            if (same and try blobPresent(gpa, io, srv, f.sha)) {
+                held[i * servers.len + j] = true;
+                continue;
+            }
+            if (try uploadBlob(gpa, io, srv, f, &sec_hex, err)) {
+                held[i * servers.len + j] = true;
+                sent = true;
+            }
+        }
+        if (sent) uploaded += 1;
+        var anywhere = false;
+        for (held[i * servers.len ..][0..servers.len]) |h| anywhere = anywhere or h;
+        if (!anywhere) {
+            try err.print("deed nsite deploy: {s} reached no server\n", .{f.path});
+            try err.writeAll("deed nsite deploy: not every file could be uploaded, so no manifest was published\n");
+            return cli.exit_fail;
+        }
     }
-    if (failed) {
-        try err.writeAll("deed nsite deploy: not every file could be uploaded, so no manifest was published\n");
+
+    // Only a server that holds every file is listed: a manifest that names a
+    // server without a file sends visitors to a 404.
+    var listed: std.ArrayList([]const u8) = .empty;
+    for (servers, 0..) |srv, j| {
+        var all = true;
+        for (0..files.len) |i| all = all and held[i * servers.len + j];
+        if (all) {
+            try listed.append(arena, srv);
+        } else {
+            try err.print("deed nsite deploy: {s} does not hold every file, so the manifest does not name it\n", .{srv});
+        }
+    }
+    if (listed.items.len == 0) {
+        try err.writeAll("deed nsite deploy: no server holds every file, so no manifest was published\n");
         return cli.exit_fail;
+    }
+
+    if (existing) |m| {
+        if (changed_files == 0 and m.paths.len == files.len and
+            sameText(m.title, opts.title) and sameText(m.description, opts.description) and
+            sameText(m.source, opts.source) and try sameServers(arena, m.servers, listed.items))
+        {
+            try err.print("deed nsite deploy: nothing changed, so nothing was published ({d} files)\n", .{files.len});
+            return cli.exit_ok;
+        }
     }
 
     var pairs: std.ArrayList(PathHash) = .empty;
@@ -743,15 +840,14 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
         try tags.append(arena, try arena.dupe([]const u8, &.{ "path", f.path, try arena.dupe(u8, &h) }));
     }
     try tags.append(arena, try arena.dupe([]const u8, &.{ "x", try arena.dupe(u8, &agg), "aggregate" }));
-    for (servers) |s| try tags.append(arena, try tag2(arena, "server", s));
+    for (listed.items) |s| try tags.append(arena, try tag2(arena, "server", s));
     if (opts.title) |t| try tags.append(arena, try tag2(arena, "title", t));
     if (opts.description) |t| try tags.append(arena, try tag2(arena, "description", t));
     if (opts.source) |t| try tags.append(arena, try tag2(arena, "source", t));
 
     var now = Io.Timestamp.now(io, .real).toSeconds();
-    if (existing) |m| {
-        // A replaceable event only replaces an older one.
-        if (now <= m.created_at) now = m.created_at + 1;
+    if (floor) |t| {
+        if (now <= t) now = t + 1;
     }
     const ev = try event.create(arena, signer, kp, now, if (opts.name == null) kind_root else kind_named, tags.items, "", null);
 
@@ -762,6 +858,56 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
     try out.print("{s}\n", .{json});
     try err.print("deed nsite deploy: published {d} files ({d} uploaded, {d} unchanged)\n", .{ files.len, uploaded, files.len - uploaded });
     return cli.exit_ok;
+}
+
+fn sameText(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Whether `published` (as a manifest wrote them) and `now` name the same
+/// servers, in any order.
+fn sameServers(arena: std.mem.Allocator, published: []const []const u8, now: []const []const u8) !bool {
+    var theirs: std.ArrayList([]const u8) = .empty;
+    for (published) |raw| {
+        const n = (try normalizeServer(arena, raw)) orelse continue;
+        var dup = false;
+        for (theirs.items) |t| dup = dup or std.ascii.eqlIgnoreCase(t, n);
+        if (!dup) try theirs.append(arena, n);
+    }
+    if (theirs.items.len != now.len) return false;
+    for (now) |n| {
+        var found = false;
+        for (theirs.items) |t| found = found or std.ascii.eqlIgnoreCase(t, n);
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Whether `srv` holds the blob: a HEAD for it (BUD-06 names the route). Any
+/// other answer, or none, counts as not holding it.
+fn blobPresent(gpa: std.mem.Allocator, io: Io, srv: []const u8, sha: [32]u8) !bool {
+    const sha_hex = std.fmt.bytesToHex(sha, .lower);
+    const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ srv, &sha_hex });
+    defer gpa.free(url);
+    var r = http.fetch(gpa, io, url, .{
+        .method = .HEAD,
+        .timeout_ms = blob_timeout_ms,
+        .max_bytes = std.math.maxInt(usize),
+    }) catch return false;
+    defer r.deinit(gpa);
+    return r.ok();
+}
+
+/// Sends one file to one server, true once the server has confirmed the blob
+/// under its hash.
+fn uploadBlob(gpa: std.mem.Allocator, io: Io, srv: []const u8, f: LocalFile, sec_hex: []const u8, err: *Io.Writer) !bool {
+    const sha_hex = std.fmt.bytesToHex(f.sha, .lower);
+    const argv = [_][]const u8{ "upload", f.disk, "-s", srv, "--sec", sec_hex };
+    var sink: Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    _ = try blossom.run(gpa, io, &argv, &sink.writer, err);
+    return std.mem.indexOf(u8, sink.written(), &sha_hex) != null;
 }
 
 fn tag2(a: std.mem.Allocator, name: []const u8, value: []const u8) !event.Tag {
@@ -797,7 +943,7 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
 
     var relays = (try resolveRelays(gpa, io, opts, pk, err)) orelse return cli.exit_fail;
     defer relays.deinit();
-    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)) orelse {
+    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)).parsed orelse {
         try err.writeAll("deed nsite download: no site found\n");
         return cli.exit_fail;
     };
@@ -809,6 +955,10 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
     };
     if (m.paths.len == 0) {
         try err.writeAll("deed nsite download: the manifest names no files\n");
+        return cli.exit_fail;
+    }
+    if (try diskConflict(arena, m.paths, builtin.os.tag == .windows)) |why| {
+        try err.print("deed nsite download: {s}; nothing was written\n", .{why});
         return cli.exit_fail;
     }
 
@@ -841,6 +991,56 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
         }
     }
     return code;
+}
+
+/// Device names Windows reserves, with or without an extension.
+fn windowsReserved(seg: []const u8) bool {
+    const stem = seg[0 .. std.mem.indexOfScalar(u8, seg, '.') orelse seg.len];
+    const names = [_][]const u8{ "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" };
+    for (names) |n| if (std.ascii.eqlIgnoreCase(stem, n)) return true;
+    if (stem.len == 4 and stem[3] >= '1' and stem[3] <= '9') {
+        if (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) return true;
+    }
+    return false;
+}
+
+/// Why `paths` cannot be written to a disk as they are named, or null. Two
+/// paths that differ only in case would overwrite each other on a disk that
+/// folds case, and a file that is also a directory cannot be both. With
+/// `windows`, a segment Windows cannot create is a reason too.
+fn diskConflict(a: std.mem.Allocator, paths: []const PathHash, windows: bool) !?[]const u8 {
+    var seen: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer seen.deinit(a);
+    var dirs: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer dirs.deinit(a);
+    for (paths) |p| {
+        if (windows) {
+            var it = std.mem.splitScalar(u8, p.path[1..], '/');
+            while (it.next()) |seg| {
+                const last = seg[seg.len - 1];
+                if (last == '.' or last == ' ') return try std.fmt.allocPrint(a, "{s} has a name ending in a dot or a space, which Windows cannot create", .{p.path});
+                if (windowsReserved(seg)) return try std.fmt.allocPrint(a, "{s} is named like a Windows device, which Windows cannot create", .{p.path});
+            }
+        }
+        const folded = try std.ascii.allocLowerString(a, p.path);
+        const gop = try seen.getOrPut(a, folded);
+        if (gop.found_existing) {
+            return try std.fmt.allocPrint(a, "{s} and {s} differ only in case and would overwrite each other on a disk that ignores case", .{ gop.value_ptr.*, p.path });
+        }
+        gop.value_ptr.* = p.path;
+        var i: usize = 1;
+        while (std.mem.indexOfScalarPos(u8, folded, i, '/')) |at| : (i = at + 1) {
+            const d = try dirs.getOrPut(a, folded[0..at]);
+            if (!d.found_existing) d.value_ptr.* = p.path;
+        }
+    }
+    for (paths) |p| {
+        const folded = try std.ascii.allocLowerString(a, p.path);
+        if (dirs.get(folded)) |inside| {
+            return try std.fmt.allocPrint(a, "{s} is both a file and a directory ({s} is inside it)", .{ p.path, inside });
+        }
+    }
+    return null;
 }
 
 /// Gets the blob named `sha` from the first server that has it, and writes it
@@ -962,6 +1162,8 @@ const BlobServer = struct {
     connections: usize,
     blobs: std.StringHashMapUnmanaged([]u8) = .empty,
     heads: usize = 0,
+    /// HEADs for a blob by its hash.
+    blob_heads: usize = 0,
     puts: usize = 0,
     gets: usize = 0,
     auth_seen: usize = 0,
@@ -1056,6 +1258,11 @@ const BlobServer = struct {
                 return req.respond(text, .{ .keep_alive = false });
             }
         }
+        if (path.len == 65 and path[0] == '/' and method == .HEAD) {
+            self.blob_heads += 1;
+            const status: std.http.Status = if (self.blobs.contains(path[1..])) .ok else .not_found;
+            return req.respond("", .{ .status = status, .keep_alive = false });
+        }
         if (path.len == 65 and path[0] == '/' and method == .GET) {
             self.gets += 1;
             if (self.blobs.get(path[1..])) |bytes| {
@@ -1077,6 +1284,8 @@ const SiteRelay = struct {
     stored: [32 * 1024]u8 = undefined,
     stored_len: usize = 0,
     events: std.atomic.Value(usize) = .init(0),
+    /// Reads a REQ and never answers it.
+    mute: bool = false,
     reqs: std.atomic.Value(usize) = .init(0),
     relay: testrelay.Relay = undefined,
 
@@ -1084,6 +1293,7 @@ const SiteRelay = struct {
         const self: *SiteRelay = @ptrCast(@alignCast(ctx.?));
         if (std.mem.startsWith(u8, frame, "[\"REQ\"")) {
             _ = self.reqs.fetchAdd(1, .monotonic);
+            if (self.mute) return;
             if (self.stored_len > 0) {
                 const line = try std.fmt.allocPrint(std.heap.page_allocator, "[\"EVENT\",\"deed\",{s}]", .{self.stored[0..self.stored_len]});
                 defer std.heap.page_allocator.free(line);
@@ -1196,7 +1406,7 @@ test "a site deployed and then downloaded comes back byte for byte" {
     // Uploads: HEAD and PUT per file, for two files and then for one, and then
     // one GET per file for the download.
     var blobs: BlobServer = undefined;
-    try blobs.start(io, 8);
+    try blobs.start(io, 14);
     defer blobs.stop(io);
     var rbuf: [64]u8 = undefined;
     var bbuf: [64]u8 = undefined;
@@ -1224,7 +1434,7 @@ test "a site deployed and then downloaded comes back byte for byte" {
     try testing.expect(has_x and has_server);
 
     // The same site again: nothing is uploaded and nothing is published.
-    var again = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    var again = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--title", "demo", relay_url });
     defer again.deinit();
     try testing.expectEqual(cli.exit_ok, again.code);
     try testing.expectEqualStrings("", again.out.written());
@@ -1234,7 +1444,7 @@ test "a site deployed and then downloaded comes back byte for byte" {
 
     // One file edited: only that one is uploaded, and a new manifest goes out.
     try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello again</h1>" });
-    var third = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    var third = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--title", "demo", relay_url });
     defer third.deinit();
     try testing.expectEqual(cli.exit_ok, third.code);
     try testing.expectEqual(@as(usize, 3), blobs.puts);
@@ -1433,4 +1643,313 @@ test "the command line is checked before anything is sent" {
     var f = try runArgs(gpa, io, &.{ "list", "not-a-key" });
     defer f.deinit();
     try testing.expectEqual(cli.exit_usage, f.code);
+}
+
+test "deploy leaves dot-files and dot-directories out unless asked" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    try tmp.tmp.dir.createDirPath(io, "site/.git");
+    try tmp.tmp.dir.createDirPath(io, "site/css");
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello</h1>" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/.env", .data = "SECRET=1" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/.DS_Store", .data = "junk" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/.git/config", .data = "[core]" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/css/.hidden.css", .data = "x" });
+    const src = try tmp.path(a, "site");
+
+    var relay: SiteRelay = .{};
+    try relay.start(io, 4);
+    defer relay.stop(io);
+    var blobs: BlobServer = undefined;
+    try blobs.start(io, 16);
+    defer blobs.stop(io);
+    var rbuf: [64]u8 = undefined;
+    var bbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const server_url = blobs.base(&bbuf);
+
+    var plain = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    defer plain.deinit();
+    try testing.expectEqual(cli.exit_ok, plain.code);
+    try testing.expectEqual(@as(usize, 1), blobs.puts);
+    try testing.expect(std.mem.indexOf(u8, plain.err.written(), "skipping the hidden directory .git") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.err.written(), "skipping the hidden file .env") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.err.written(), "css/.hidden.css") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.out.written(), ".env") == null);
+
+    var all = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--include-hidden", relay_url });
+    defer all.deinit();
+    try testing.expectEqual(cli.exit_ok, all.code);
+    try testing.expectEqual(@as(usize, 5), blobs.puts);
+    try testing.expect(std.mem.indexOf(u8, all.out.written(), "/.git/config") != null);
+}
+
+test "deploy will not replace a manifest it cannot read, or publish blind" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    try tmp.tmp.dir.createDirPath(io, "site");
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello</h1>" });
+    const src = try tmp.path(a, "site");
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    const sha = "186ea5fd14e88fd1ac49351759e7ab906fa94892002b60bf7f5a428f28ca1c99";
+    const tags = [_]event.Tag{
+        &.{ "path", "/index.html", sha },
+        &.{ "path", "/../escape.txt", sha },
+    };
+    const old = try event.create(a, signer, kp, 1_700_000_000, kind_root, &tags, "", null);
+
+    var relay: SiteRelay = .{};
+    try relay.start(io, 3);
+    defer relay.stop(io);
+    const json = try event.toJson(a, old);
+    @memcpy(relay.stored[0..json.len], json);
+    relay.stored_len = json.len;
+    var blobs: BlobServer = undefined;
+    try blobs.start(io, 4);
+    defer blobs.stop(io);
+    var rbuf: [64]u8 = undefined;
+    var bbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const server_url = blobs.base(&bbuf);
+
+    var refused = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    defer refused.deinit();
+    try testing.expectEqual(cli.exit_fail, refused.code);
+    try testing.expect(std.mem.indexOf(u8, refused.err.written(), "cannot be read") != null);
+    try testing.expectEqual(@as(usize, 0), relay.events.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), blobs.puts);
+
+    var forced = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--force", relay_url });
+    defer forced.deinit();
+    try testing.expectEqual(cli.exit_ok, forced.code);
+    try testing.expectEqual(@as(usize, 1), relay.events.load(.monotonic));
+
+    // A relay that never finishes answering: whether a site exists is not known.
+    var mute: SiteRelay = .{ .mute = true };
+    try mute.start(io, 2);
+    defer mute.stop(io);
+    var mbuf: [64]u8 = undefined;
+    const mute_url = try mute.url(&mbuf);
+    var blind = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--timeout", "400", mute_url });
+    defer blind.deinit();
+    try testing.expectEqual(cli.exit_fail, blind.code);
+    try testing.expect(std.mem.indexOf(u8, blind.err.written(), "finished answering") != null);
+    try testing.expectEqual(@as(usize, 0), mute.events.load(.monotonic));
+}
+
+test "paths that cannot all be written to a disk are caught up front" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const z = [_]u8{0} ** 32;
+    const fine = [_]PathHash{ .{ .path = "/a/b.css", .sha = z }, .{ .path = "/a.html", .sha = z } };
+    try testing.expect((try diskConflict(a, &fine, true)) == null);
+    const cased = [_]PathHash{ .{ .path = "/Index.html", .sha = z }, .{ .path = "/index.html", .sha = z } };
+    try testing.expect((try diskConflict(a, &cased, false)) != null);
+    const both = [_]PathHash{ .{ .path = "/a", .sha = z }, .{ .path = "/a/b", .sha = z } };
+    try testing.expect((try diskConflict(a, &both, false)) != null);
+    const dot = [_]PathHash{.{ .path = "/news./x.html", .sha = z }};
+    try testing.expect((try diskConflict(a, &dot, false)) == null);
+    try testing.expect((try diskConflict(a, &dot, true)) != null);
+    const space = [_]PathHash{.{ .path = "/x.html ", .sha = z }};
+    try testing.expect((try diskConflict(a, &space, true)) != null);
+    for ([_][]const u8{ "/con", "/NUL.txt", "/a/com1.js", "/Lpt9", "/aux.tar.gz" }) |name| {
+        const one = [_]PathHash{.{ .path = name, .sha = z }};
+        try testing.expect((try diskConflict(a, &one, true)) != null);
+        try testing.expect((try diskConflict(a, &one, false)) == null);
+    }
+    const ok = [_]PathHash{ .{ .path = "/console.js", .sha = z }, .{ .path = "/com10", .sha = z } };
+    try testing.expect((try diskConflict(a, &ok, true)) == null);
+}
+
+test "download refuses a manifest whose paths collide, and writes nothing" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    const sha = "186ea5fd14e88fd1ac49351759e7ab906fa94892002b60bf7f5a428f28ca1c99";
+    const other = "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
+    const tags = [_]event.Tag{
+        &.{ "path", "/Index.html", sha },
+        &.{ "path", "/index.html", other },
+        &.{ "server", "http://127.0.0.1:1" },
+    };
+    const ev = try event.create(a, signer, kp, 1_700_000_000, kind_root, &tags, "", null);
+    var relay: SiteRelay = .{};
+    try relay.start(io, 1);
+    defer relay.stop(io);
+    const json = try event.toJson(a, ev);
+    @memcpy(relay.stored[0..json.len], json);
+    relay.stored_len = json.len;
+    var rbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const npub = try nostr.nip19.encodeNpub(a, kp.public_key);
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    const dest = try tmp.path(a, "got");
+    var r = try runArgs(gpa, io, &.{ "download", npub, dest, relay_url });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_fail, r.code);
+    try testing.expect(std.mem.indexOf(u8, r.err.written(), "differ only in case") != null);
+    try testing.expectError(error.FileNotFound, tmp.tmp.dir.access(io, "got", .{}));
+}
+
+/// The sha256 of `text`, in hex.
+fn shaHex(text: []const u8) [64]u8 {
+    var d: [32]u8 = undefined;
+    Sha256.hash(text, &d, .{});
+    return std.fmt.bytesToHex(d, .lower);
+}
+
+fn manifestServers(a: std.mem.Allocator, json: []const u8) !std.ArrayList([]const u8) {
+    var names: std.ArrayList([]const u8) = .empty;
+    var parsed = try event.fromJson(testing.allocator, std.mem.trim(u8, json, "\n"));
+    defer parsed.deinit();
+    for (parsed.value.tags) |t| {
+        if (std.mem.eql(u8, t[0], "server")) try names.append(a, try a.dupe(u8, t[1]));
+    }
+    return names;
+}
+
+test "a redeploy notices a changed title, a new server, and a blob a server lost" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    try tmp.tmp.dir.createDirPath(io, "site");
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello</h1>" });
+    const src = try tmp.path(a, "site");
+
+    var relay: SiteRelay = .{};
+    try relay.start(io, 10);
+    defer relay.stop(io);
+    var one: BlobServer = undefined;
+    try one.start(io, 20);
+    defer one.stop(io);
+    var two: BlobServer = undefined;
+    try two.start(io, 10);
+    defer two.stop(io);
+    var rbuf: [64]u8 = undefined;
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const url_one = one.base(&b1);
+    const url_two = two.base(&b2);
+
+    var first = try runArgs(gpa, io, &.{ "deploy", src, "-s", url_one, "--sec", test_sec, relay_url });
+    defer first.deinit();
+    try testing.expectEqual(cli.exit_ok, first.code);
+    try testing.expectEqual(@as(usize, 1), relay.events.load(.monotonic));
+
+    // Only the title changed: the manifest still has to go out.
+    var titled = try runArgs(gpa, io, &.{ "deploy", src, "-s", url_one, "--sec", test_sec, "--title", "hello", relay_url });
+    defer titled.deinit();
+    try testing.expectEqual(cli.exit_ok, titled.code);
+    try testing.expectEqual(@as(usize, 2), relay.events.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), one.puts);
+
+    // Only a server was added: it gets the unchanged file, and is named.
+    var added = try runArgs(gpa, io, &.{ "deploy", src, "-s", url_one, "-s", url_two, "--sec", test_sec, "--title", "hello", relay_url });
+    defer added.deinit();
+    try testing.expectEqual(cli.exit_ok, added.code);
+    try testing.expectEqual(@as(usize, 3), relay.events.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), two.puts);
+    try testing.expectEqual(@as(usize, 1), one.puts);
+    const listed = try manifestServers(a, added.out.written());
+    try testing.expectEqual(@as(usize, 2), listed.items.len);
+
+    // Nothing changed and both servers hold the file: nothing goes out.
+    var same = try runArgs(gpa, io, &.{ "deploy", src, "-s", url_one, "-s", url_two, "--sec", test_sec, "--title", "hello", relay_url });
+    defer same.deinit();
+    try testing.expect(std.mem.indexOf(u8, same.err.written(), "nothing changed") != null);
+    try testing.expectEqual(@as(usize, 3), relay.events.load(.monotonic));
+
+    // A server lost the blob: it is sent again.
+    const sha = shaHex("<h1>hello</h1>");
+    const lost = two.blobs.fetchRemove(&sha).?;
+    std.heap.page_allocator.free(lost.key);
+    std.heap.page_allocator.free(lost.value);
+    var healed = try runArgs(gpa, io, &.{ "deploy", src, "-s", url_one, "-s", url_two, "--sec", test_sec, "--title", "hello", relay_url });
+    defer healed.deinit();
+    try testing.expectEqual(cli.exit_ok, healed.code);
+    try testing.expectEqual(@as(usize, 2), two.puts);
+}
+
+test "the manifest names only the servers that took every file" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    try tmp.tmp.dir.createDirPath(io, "site");
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello</h1>" });
+    const src = try tmp.path(a, "site");
+
+    var relay: SiteRelay = .{};
+    try relay.start(io, 2);
+    defer relay.stop(io);
+    var blobs: BlobServer = undefined;
+    try blobs.start(io, 2);
+    defer blobs.stop(io);
+    var rbuf: [64]u8 = undefined;
+    var bbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const good = blobs.base(&bbuf);
+
+    // Nothing listens on port 1: one server took the file, the other did not.
+    var r = try runArgs(gpa, io, &.{ "deploy", src, "-s", good, "-s", "http://127.0.0.1:1", "--sec", test_sec, relay_url });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_ok, r.code);
+    const listed = try manifestServers(a, r.out.written());
+    try testing.expectEqual(@as(usize, 1), listed.items.len);
+    try testing.expectEqualStrings(good, listed.items[0]);
+    try testing.expect(std.mem.indexOf(u8, r.err.written(), "does not hold every file") != null);
 }
