@@ -43,6 +43,10 @@ pub const Limits = struct {
     queue_hard: usize = 4 << 20,
     /// Connections open at once.
     max_connections: usize = 1024,
+    /// Sockets that have been accepted and have not yet finished the
+    /// websocket handshake. A socket past this is closed at once, so idle
+    /// ones cannot use up the descriptors.
+    max_pending_handshakes: usize = 64,
     /// Open NIP-77 reconciliations per connection.
     max_neg_sessions: usize = 8,
     /// Stored events one reconciliation may cover.
@@ -90,6 +94,10 @@ pub const Server = struct {
     fanned: std.atomic.Value(u64) = .init(0),
     /// Connections dropped for reading too slowly.
     dropped: std.atomic.Value(u64) = .init(0),
+    /// Sockets accepted and not yet closed, handshake or not, and how many
+    /// of those have not finished the handshake.
+    open_sockets: std.atomic.Value(usize) = .init(0),
+    handshaking: std.atomic.Value(usize) = .init(0),
 
     // Group commit. Verified events from every connection wait in `wq`; one
     // task takes whatever is queued and stores it in one transaction.
@@ -204,11 +212,28 @@ pub const Server = struct {
                     continue;
                 },
             };
+            // Counted here, before a byte is read, so a flood of sockets
+            // that say nothing is turned away without a task or a buffer.
+            const l = self.opts.limits;
+            const open = self.open_sockets.fetchAdd(1, .acq_rel);
+            const waiting = self.handshaking.fetchAdd(1, .acq_rel);
+            if (waiting >= l.max_pending_handshakes or open >= l.max_connections + l.max_pending_handshakes) {
+                self.log("a socket was refused: too many connections or handshakes", .{});
+                self.socketClosed(true);
+                stream.close(self.io);
+                continue;
+            }
             self.group.concurrent(self.io, connMain, .{ self, stream }) catch |e| {
                 self.log("cannot serve a connection: {s}", .{@errorName(e)});
+                self.socketClosed(true);
                 stream.close(self.io);
             };
         }
+    }
+
+    fn socketClosed(self: *Server, handshaking: bool) void {
+        _ = self.open_sockets.fetchSub(1, .acq_rel);
+        if (handshaking) _ = self.handshaking.fetchSub(1, .acq_rel);
     }
 
     fn register(self: *Server, c: *Conn) bool {
@@ -299,6 +324,8 @@ const Conn = struct {
     authed: ?[32]u8 = null,
     /// An AUTH challenge has gone to this client.
     challenge_sent: bool = false,
+    /// Still counted in `Server.handshaking`.
+    in_handshake: bool = true,
     host_buf: [256]u8 = undefined,
     host_len: usize = 0,
 
@@ -423,6 +450,12 @@ const Conn = struct {
         @memcpy(payload[2..][0..n], reason[0..n]);
         if (code != 1000) c.server.log("{s}: closed: {s}", .{ c.peer(), reason });
         try c.sendPayload(.close, payload[0 .. 2 + n]);
+    }
+
+    fn endHandshake(c: *Conn) void {
+        if (!c.in_handshake) return;
+        c.in_handshake = false;
+        _ = c.server.handshaking.fetchSub(1, .acq_rel);
     }
 
     /// Sends the NIP-42 challenge, once.
@@ -577,11 +610,13 @@ fn connMain(server: *Server, stream: Io.net.Stream) Io.Cancelable!void {
     const io = server.io;
     const gpa = server.gpa;
     const c = gpa.create(Conn) catch {
+        server.socketClosed(true);
         stream.close(io);
         return;
     };
     c.* = .{ .server = server, .gpa = gpa, .io = io, .stream = stream, .signer = keys.Signer.init() };
     defer {
+        server.socketClosed(c.in_handshake);
         // The committer holds this connection until its events are answered.
         c.q_mu.lockUncancelable(io);
         while (c.pending > 0) c.idle.waitUncancelable(io, &c.q_mu);
@@ -756,6 +791,7 @@ fn serveConn(c: *Conn, registered: *bool) Io.Cancelable!void {
             return;
         };
     }
+    c.endHandshake();
     c.handshake_done.set(io);
     c.server.log("{s}: connected", .{c.peer()});
 
@@ -2292,4 +2328,24 @@ test "a protected event on a relay that does not require AUTH gets a challenge" 
     try testing.expect(std.mem.indexOf(u8, try cl.text(), "true") != null);
     try cl.send(try message.encodeEvent(arena, ev));
     try testing.expect(std.mem.indexOf(u8, try cl.text(), "true") != null);
+}
+
+test "sockets that say nothing are turned away past the handshake cap" {
+    var ts: TestServer = undefined;
+    try ts.start(.{ .limits = .{ .max_pending_handshakes = 2, .handshake_timeout_ms = 30_000 } });
+    defer ts.stop();
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", ts.server.port());
+    var idle: [2]Io.net.Stream = undefined;
+    for (&idle) |*sock| sock.* = try addr.connect(testing.io, .{ .mode = .stream });
+    defer for (idle) |sock| sock.close(testing.io);
+    // Let the server accept both.
+    while (ts.server.handshaking.load(.acquire) < 2) try testing.io.sleep(.fromMilliseconds(5), .awake);
+
+    const third = try addr.connect(testing.io, .{ .mode = .stream });
+    defer third.close(testing.io);
+    var buf: [64]u8 = undefined;
+    var r = third.reader(testing.io, &buf);
+    // Closed by the server at once, not after the 30 second timeout.
+    try testing.expectError(error.EndOfStream, r.interface.takeByte());
+    try testing.expectEqual(@as(usize, 2), ts.server.handshaking.load(.acquire));
 }
