@@ -254,7 +254,9 @@ fn makeTempDir(gpa: std.mem.Allocator, io: Io) ![]u8 {
     io.random(&rand);
     const dir = try std.fmt.allocPrint(gpa, "{s}{c}deed-serve-{x}", .{ base, std.fs.path.sep, &rand });
     errdefer gpa.free(dir);
-    try Io.Dir.cwd().createDirPath(io, dir);
+    // Only its owner may open it: the store holds whatever is published.
+    const perms: Io.File.Permissions = if (builtin.os.tag == .windows) .default_dir else Io.File.Permissions.fromMode(0o700);
+    try Io.Dir.cwd().createDir(io, dir, perms);
     return dir;
 }
 
@@ -431,4 +433,13 @@ test "the library client subscribes and receives what another connection publish
     defer m.deinit();
     try testing.expectEqualStrings("live", m.value.event.subscription_id);
     try testing.expectEqualStrings("live one", m.value.event.event.content);
+}
+
+test "the temporary store directory is private to its owner" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const dir = try makeTempDir(testing.allocator, testing.io);
+    defer testing.allocator.free(dir);
+    defer Io.Dir.cwd().deleteTree(testing.io, dir) catch {};
+    const st = try Io.Dir.cwd().statFile(testing.io, dir, .{});
+    try testing.expectEqual(@as(u32, 0), @as(u32, @intCast(st.permissions.toMode() & 0o077)));
 }
