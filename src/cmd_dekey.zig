@@ -77,6 +77,10 @@ pub const usage =
     \\Only the announcements and key messages your own key published are read;
     \\a key message from any other author is ignored.
     \\
+    \\Exits: 0 on success, including when this machine does not hold the key yet;
+    \\1 if the key is wrong, a relay refused, or nothing could be reached; 2 if
+    \\the command line was not understood.
+    \\
 ;
 
 /// Events held in memory, parsed from the lines a query printed, and how

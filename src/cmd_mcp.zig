@@ -66,7 +66,8 @@ pub const usage =
     \\                         (nsec1..., 64 hex characters or ncryptsec1...)
     \\      --sec <key>        the key to sign with
     \\      --allow-local      let relay_info reach loopback and private
-    \\                         addresses, for a relay on this machine or LAN
+    \\                         addresses, for a relay on this machine or LAN.
+    \\                         Without it, a name that resolves to one is refused
     \\
     \\Without --allow-publish the publishing tools are not listed and cannot be
     \\called. The key is never accepted as a tool argument and never returned.
@@ -74,6 +75,9 @@ pub const usage =
     \\are capped at 256 KiB with a note saying so.
     \\
     \\  {"mcpServers":{"deed":{"command":"deed","args":["mcp"]}}}
+    \\
+    \\Exits: 0 when the client closes the input; 1 if the signing key is wrong;
+    \\2 if the command line was not understood.
     \\
 ;
 
@@ -1097,6 +1101,8 @@ fn toolRelayInfo(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocatin
     }
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ "--timeout", try num(a, @divTrunc(timeoutMs(args) + 999, 1000)) });
+    // The name check above is lexical; this one is on what the name resolves to.
+    if (!s.cfg.allow_local) try argv.append(a, "--deny-private");
     try argv.appendSlice(a, list);
     return present(a, try capture(s, a, cmd_relay.run, argv.items), out);
 }
@@ -1739,6 +1745,32 @@ test "relay_info reaches a local relay when the server allows it" {
     defer gpa.free(got);
     try testing.expect(has(got, "\"isError\":false"));
     try testing.expect(has(got, "local relay"));
+}
+
+fn resolveToLoopback(host: []const u8, port: u16, out: *[16]Io.net.IpAddress) ?usize {
+    if (!std.mem.eql(u8, host, "pinned.test")) return null;
+    out[0] = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    return 1;
+}
+
+test "relay_info refuses a public-looking name that resolves to a local address, unless allowed" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    cmd_relay.test_resolver = resolveToLoopback;
+    defer cmd_relay.test_resolver = null;
+    const l = try callLine(gpa, 1, "relay_info", "{\"relays\":[\"wss://pinned.test\"],\"timeout_ms\":3000}");
+    defer gpa.free(l);
+
+    const refused = try converse(gpa, .{}, l);
+    defer gpa.free(refused);
+    try testing.expect(has(refused, "\"isError\":true"));
+    try testing.expect(has(refused, "resolves to a private address"));
+
+    // With --allow-local the check is off, so the failure is the connection's.
+    const allowed = try converse(gpa, .{ .allow_local = true }, l);
+    defer gpa.free(allowed);
+    try testing.expect(!has(allowed, "resolves to a private address"));
 }
 
 test "public hosts and addresses pass the relay_info check" {

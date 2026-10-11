@@ -29,9 +29,12 @@ pub const usage =
     \\  --pretty           indent each document over several lines
     \\  --timeout <ms>     give up on a relay after this long (default 10000)
     \\  --allow-http       permit plain http to a host that is not local
+    \\  --deny-private     refuse a relay whose name resolves to a loopback,
+    \\                     private or link-local address, on every redirect
     \\
-    \\Exits: 1 if any relay failed, after saying why on stderr; the others are
-    \\still printed.
+    \\Exits: 0 when every relay answered; 1 if any relay failed, after saying
+    \\why on stderr (the others are still printed); 2 if the command line was
+    \\not understood.
     \\
 ;
 
@@ -45,7 +48,11 @@ const Settings = struct {
     pretty: bool = false,
     timeout_ms: u64 = 10_000,
     allow_http: bool = false,
+    deny_private: bool = false,
 };
+
+/// Test seam: replaces DNS for the document fetch.
+pub var test_resolver: ?http.Resolver = null;
 
 const Outcome = struct {
     ok: bool,
@@ -74,6 +81,8 @@ pub fn run(
             settings.pretty = true;
         } else if (std.mem.eql(u8, a, "--allow-http")) {
             settings.allow_http = true;
+        } else if (std.mem.eql(u8, a, "--deny-private")) {
+            settings.deny_private = true;
         } else if (std.mem.eql(u8, a, "--timeout")) {
             i += 1;
             if (i >= args.len) {
@@ -146,6 +155,7 @@ fn reasonText(gpa: std.mem.Allocator, e: Failure) []u8 {
         error.BadStatus => "the relay answered with an HTTP error",
         error.NotADocument => "the reply is not a JSON object",
         error.BadRelayUrl => "not a relay URL",
+        error.PrivateAddress => "resolves to a private address",
         else => |h| http.describe(h),
     };
     return gpa.dupe(u8, sentence) catch @constCast("failed");
@@ -171,6 +181,8 @@ fn document(gpa: std.mem.Allocator, io: std.Io, relay: []const u8, s: Settings) 
         .timeout_ms = s.timeout_ms,
         .max_bytes = max_doc_bytes,
         .allow_http = s.allow_http,
+        .deny_private = s.deny_private,
+        .resolver = test_resolver,
     });
     defer res.deinit(gpa);
     if (!res.ok()) return error.BadStatus;
@@ -320,6 +332,40 @@ test "usage mistakes exit 2" {
     try std.testing.expectEqual(cli.exit_usage, try runForTest(io, &.{}, &out, &err));
     try std.testing.expectEqual(cli.exit_usage, try runForTest(io, &.{"--bogus"}, &out, &err));
     try std.testing.expectEqual(cli.exit_usage, try runForTest(io, &.{ "--timeout", "0", "x" }, &out, &err));
+}
+
+fn resolveLoopback(host: []const u8, port: u16, out: *[16]std.Io.net.IpAddress) ?usize {
+    if (!std.mem.eql(u8, host, "pinned.test")) return null;
+    out[0] = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    return 1;
+}
+
+test "--deny-private refuses a name that resolves to a local address" {
+    const io = std.testing.io;
+    var srv: http.TestServer = undefined;
+    try srv.start(io, &.{.{ .path = "/", .body = doc_text }}, 1);
+    defer srv.stop(io);
+    test_resolver = resolveLoopback;
+    defer test_resolver = null;
+
+    var ub: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ub, "http://pinned.test:{d}/", .{srv.port()});
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+
+    const code = try runForTest(io, &.{ "--allow-http", "--deny-private", url }, &out, &err);
+    try std.testing.expectEqual(cli.exit_fail, code);
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "pinned.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "resolves to a private address") != null);
+
+    // The same name without the flag is asked.
+    err.clearRetainingCapacity();
+    const ok = try runForTest(io, &.{ "--allow-http", url }, &out, &err);
+    try std.testing.expectEqual(cli.exit_ok, ok);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Test Relay") != null);
 }
 
 test "a wss URL becomes the https document URL" {

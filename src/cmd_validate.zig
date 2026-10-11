@@ -69,6 +69,9 @@ pub const usage =
     \\
     \\This does not check ids or signatures: use `deed verify` for that.
     \\
+    \\Exits: 0 when every event passed; 1 if any failed or the schema could not
+    \\be had; 2 if the command line was not understood.
+    \\
 ;
 
 // ---------------------------------------------------------------------------

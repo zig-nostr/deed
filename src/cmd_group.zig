@@ -86,7 +86,7 @@ pub const usage =
     \\      --events         print the signed events, not a summary
 ++ auth.usage_lines ++
     \\
-    \\Exits 0 on success, 1 when the relay could not be reached, had nothing,
+    \\Exits: 0 on success, 1 when the relay could not be reached, had nothing,
     \\or refused, and 2 when the command made no sense.
     \\
 ;
@@ -786,7 +786,7 @@ fn publishOne(
     const conn = switch (dialled[0]) {
         .connected => |r| r,
         .failed => |e| {
-            try err.print("deed group: {s}: {s}: could not connect: {s}\n", .{ id, url, @errorName(e) });
+            try err.print("deed group: {s}: {s}: could not connect: {s}\n", .{ id, url, dial.describe(e) });
             return false;
         },
         .timed_out => {
@@ -843,7 +843,7 @@ fn publishOne(
     };
 
     conn.publishTimeout(ev, timeout) catch |e| {
-        try err.print("deed group: {s}: {s}: could not send: {s}\n", .{ id, url, @errorName(e) });
+        try err.print("deed group: {s}: {s}: could not send: {s}\n", .{ id, url, dial.describe(e) });
         return false;
     };
 
@@ -852,7 +852,7 @@ fn publishOne(
             if (e == error.Timeout) {
                 try err.print("deed group: {s}: {s}: no answer in time\n", .{ id, url });
             } else {
-                try err.print("deed group: {s}: {s}: {s}\n", .{ id, url, @errorName(e) });
+                try err.print("deed group: {s}: {s}: {s}\n", .{ id, url, dial.describe(e) });
             }
             return false;
         }) orelse {

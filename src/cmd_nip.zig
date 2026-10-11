@@ -41,7 +41,7 @@ pub const usage =
     \\The address can be changed with $DEED_NIPS_URL (default
     \\https://raw.githubusercontent.com/nostr-protocol/nips/master).
     \\
-    \\Exits 0 on success, 1 when the text could not be had or there is no such
+    \\Exits: 0 on success, 1 when the text could not be had or there is no such
     \\NIP, and 2 when the command made no sense.
     \\
 ;
@@ -240,12 +240,12 @@ fn load(
     }
 
     if (stale) |s| {
-        try err.print("deed nip: could not fetch {s} ({s}); using an older copy\n", .{ file, failure });
+        try err.print("deed nip: {s}: {s}; using an older copy\n", .{ url, failure });
         const text = s;
         stale = null;
         return text;
     }
-    try err.print("deed nip: could not fetch {s}: {s}\n", .{ url, failure });
+    try err.print("deed nip: {s}: {s}\n", .{ url, failure });
     return null;
 }
 
