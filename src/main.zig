@@ -256,6 +256,7 @@ test {
     _ = @import("cmd_count.zig");
     _ = @import("cmd_curl.zig");
     _ = @import("cmd_filter.zig");
+    _ = @import("cmd_git.zig");
     _ = @import("cmd_gift.zig");
     _ = @import("cmd_kind.zig");
     _ = @import("cmd_post.zig");
