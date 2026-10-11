@@ -1434,7 +1434,7 @@ test "a site deployed and then downloaded comes back byte for byte" {
     try testing.expect(has_x and has_server);
 
     // The same site again: nothing is uploaded and nothing is published.
-    var again = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    var again = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--title", "demo", relay_url });
     defer again.deinit();
     try testing.expectEqual(cli.exit_ok, again.code);
     try testing.expectEqualStrings("", again.out.written());
@@ -1444,7 +1444,7 @@ test "a site deployed and then downloaded comes back byte for byte" {
 
     // One file edited: only that one is uploaded, and a new manifest goes out.
     try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello again</h1>" });
-    var third = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    var third = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--title", "demo", relay_url });
     defer third.deinit();
     try testing.expectEqual(cli.exit_ok, third.code);
     try testing.expectEqual(@as(usize, 3), blobs.puts);
