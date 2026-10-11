@@ -37,8 +37,9 @@ pub const usage =
     \\Usage:
     \\  deed publish [--timeout <ms>] [--auth] <relay-url>... [<event-json>...]
     \\
-    \\Reads events as newline-delimited JSON on stdin when given no event
-    \\arguments, checks each one, and offers it to every relay named.
+    \\Relays are positional: name each as a ws:// or wss:// argument. Reads events
+    \\as newline-delimited JSON on stdin when given no event arguments, checks
+    \\each one, and offers it to every relay named.
     \\
     \\  deed event -c "hello" | deed publish wss://relay.example
     \\
@@ -61,7 +62,7 @@ pub const usage =
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
     \\
-    \\Exits 0 when every event was accepted by at least one relay, 1 when any
+    \\Exits: 0 when every event was accepted by at least one relay, 1 when any
     \\was not or there was nothing to publish, and 2 when the command made no
     \\sense.
     \\
@@ -541,10 +542,10 @@ const Set = struct {
         };
         for (outcomes[0..which.len], which) |o, i| switch (o) {
             .connected => self.startReader(i) catch |e| {
-                try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], @errorName(e) });
+                try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], dial.describe(e) });
                 try self.drop(i, .gone, err);
             },
-            .failed => |e| try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], @errorName(e) }),
+            .failed => |e| try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], dial.describe(e) }),
             .timed_out => try err.print("deed {s}: {s}: no answer within {d} ms\n", .{ self.verb, self.urls[i], bound_ms }),
         };
     }
@@ -651,7 +652,7 @@ const Set = struct {
                     f[i] = e;
                     try self.drop(i, .closed, err);
                 } else {
-                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], @errorName(e) });
+                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], dial.describe(e) });
                     try self.drop(i, .closed, err);
                 }
             }
@@ -697,7 +698,7 @@ const Set = struct {
                     continue;
                 }
             }
-            try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], @errorName(e) });
+            try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], dial.describe(e) });
         }
 
         self.seq += 1;
@@ -796,7 +797,7 @@ const Set = struct {
                         }
                     }
                     if (why) |e| {
-                        try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, url, @errorName(e) });
+                        try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, url, dial.describe(e) });
                     } else {
                         try err.print("deed {s}: {s}: {s}: closed before answering\n", .{ self.verb, id, url });
                     }

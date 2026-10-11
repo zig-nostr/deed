@@ -25,7 +25,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const blossom = nostr.blossom;
 
 /// Shown beside the name in `deed help` once `ready` is true.
-pub const summary = "List, upload, download, delete, check and mirror blobs on a Blossom server";
+pub const summary = "list, upload, download, delete, check and mirror blobs";
 
 /// False keeps the verb out of `deed help`.
 pub const ready = true;
@@ -55,9 +55,9 @@ pub const usage =
     \\Options:
     \\  -s, --server <url>   the server; repeat it to use several. upload sends to
     \\                       all of them, download tries them in order
-    \\      --sec <key>      the key that signs, as nsec1..., ncryptsec1... or 64
-    \\                       hex characters, or a remote signer as bunker://...
-    \\                       Falls back to $NOSTR_SECRET_KEY. upload, delete and
+    \\      --sec <key>      the key that signs: nsec1..., ncryptsec1...,
+    \\                       bunker://... or 64 hex characters; $NOSTR_SECRET_KEY
+    \\                       is read when --sec is absent. upload, delete and
     \\                       mirror need one; list, download and check sign only
     \\                       when one is given
     \\  -o, --output <path>  download: where to write the file (default: the
@@ -72,8 +72,8 @@ pub const usage =
     \\      --timeout <ms>   the deadline for one request (default 30000, and
     \\                       600000 for a transfer)
     \\
-    \\Exit status is 0 when everything asked for was done, 1 when something
-    \\failed, and 2 when the command line was not understood.
+    \\Exits: 0 when everything asked for was done; 1 when something failed;
+    \\2 if the command line was not understood.
     \\
     \\Examples:
     \\  deed blossom upload photo.jpg -s cdn.example.com --sec nsec1...
@@ -687,8 +687,14 @@ fn downloadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, sha: [32]
         break :blk headers[0..1];
     } else &.{};
 
-    const file = cwd.createFile(ctx.io, tmp, .{}) catch |e| {
-        try ctx.err.print("deed blossom download: cannot write {s}: {s}\n", .{ tmp, @errorName(e) });
+    // Exclusive: a leftover part file may be someone else's, or another
+    // download's still in progress, and is never truncated.
+    const file = cwd.createFile(ctx.io, tmp, .{ .exclusive = true }) catch |e| {
+        if (e == error.PathAlreadyExists) {
+            try ctx.err.print("deed blossom download: {s} already exists; remove it or choose another -o\n", .{tmp});
+        } else {
+            try ctx.err.print("deed blossom download: cannot write {s}: {s}\n", .{ tmp, @errorName(e) });
+        }
         return false;
     };
     var closed = false;
@@ -1664,6 +1670,37 @@ test "a download signs a get token when a key is given" {
     try testing.expectEqual(cli.exit_ok, r.code);
     try testing.expectEqual(@as(usize, 1), mock.auth_seen);
     try testing.expectEqual(@as(usize, 0), mock.problems);
+}
+
+test "a download leaves an existing part file alone and refuses" {
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+
+    var dir: TmpDir = undefined;
+    try dir.init();
+    defer dir.deinit();
+    var mock: Mock = undefined;
+    try mock.start(io, 1);
+    defer mock.stop(io);
+    mock.serve_len = 1000;
+    mock.serve_sha = patternSha(1000);
+    const hex = std.fmt.bytesToHex(mock.serve_sha, .lower);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dest = try dir.path(&pbuf, "got.bin");
+    var partbuf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const part_name = try std.fmt.bufPrint(&partbuf, "got.bin.{s}.part", .{hex[0..8]});
+    try dir.tmp.dir.writeFile(io, .{ .sub_path = part_name, .data = "precious" });
+    var bbuf: [64]u8 = undefined;
+
+    const r = try runWith(gpa, &.{ "download", &hex, "-s", mock.base(&bbuf), "-o", dest });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_fail, r.code);
+    try testing.expect(std.mem.find(u8, r.err, "already exists") != null);
+    var kept: [16]u8 = undefined;
+    const got = try dir.tmp.dir.readFile(io, part_name, &kept);
+    try testing.expectEqualStrings("precious", got);
 }
 
 test "delete sends a delete token naming the blob" {

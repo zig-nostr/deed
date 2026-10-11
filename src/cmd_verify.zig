@@ -25,6 +25,8 @@ pub const usage =
     \\Prints nothing when every event is valid and exits 0; reports each failure
     \\on stderr and exits 1.
     \\
+    \\Exits: 0 when every event is valid; 1 if any is not; 2 if the command line
+    \\was not understood.
 ;
 
 pub fn run(

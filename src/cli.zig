@@ -12,7 +12,7 @@ pub const exit_fail: u8 = 1;
 /// The command was not understood: unknown verb, unknown flag, missing
 /// argument. Nothing was attempted.
 pub const exit_usage: u8 = 2;
-/// The far end of the output pipe went away, as in `deed decode … | head -1`.
+/// The far end of the output pipe went away, as in `deed decode ... | head -1`.
 /// 128 + SIGPIPE, which is the status a shell shows for a filter whose reader
 /// left. deed reports the number rather than dying of the signal, because the
 /// I/O implementation it runs on installs a SIGPIPE handler of its own.

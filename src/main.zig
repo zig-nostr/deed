@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr = std.Io.File.stderr().writerStreaming(io, &err_buf);
 
     const code = run(gpa, io, argv.items, &stdout.interface, &stderr.interface) catch |e| blk: {
-        // `deed decode … | head -1` closes the pipe on purpose, and every other
+        // `deed decode ... | head -1` closes the pipe on purpose, and every other
         // filter goes quiet when its reader leaves rather than complaining that
         // it did. deed cannot die of SIGPIPE the way they do, because the I/O
         // implementation underneath installs a handler of its own, so it
@@ -135,12 +135,13 @@ fn testRun(args: []const []const u8, out_buf: []u8, err_buf: []u8) !TestRun {
     return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
 }
 
-test "no arguments prints the usage and reports that nothing was understood" {
-    var ob: [8192]u8 = undefined;
-    var eb: [1024]u8 = undefined;
+test "no arguments prints the usage on stderr and reports that nothing was understood" {
+    var ob: [1024]u8 = undefined;
+    var eb: [8192]u8 = undefined;
     const r = try testRun(&.{}, &ob, &eb);
     try std.testing.expectEqual(cli.exit_usage, r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "deed: the nostr command line") != null);
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "deed: the nostr command line") != null);
 }
 
 test "every spelling of version agrees" {

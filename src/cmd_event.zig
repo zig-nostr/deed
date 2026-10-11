@@ -51,9 +51,9 @@ pub const usage =
     \\             [--envelope] [--nevent] [--confirm]
     \\
     \\Options:
-    \\  --sec <key>          secret key, as nsec1…, ncryptsec1… or 64 hex
-    \\                       characters, or a remote signer as bunker://…
-    \\                       Falls back to $NOSTR_SECRET_KEY.
+    \\  --sec <key>          secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                       64 hex characters; $NOSTR_SECRET_KEY is read when
+    \\                       --sec is absent
     \\  -c, --content <text> event content (default: empty). `@path` reads the
     \\                       content from that file; `@@text` is a literal
     \\                       `@text`.
@@ -63,11 +63,12 @@ pub const usage =
     \\                       tag with more than two elements:
     \\                         -t 'e=<id>;wss://relay.example;reply'
     \\                       A bare name with no '=' makes a one-element tag.
-    \\  -e <id>              add an e tag: a hex id, note1… or nevent1…
-    \\  -p <pubkey>          add a p tag: hex, npub1… or nprofile1…
+    \\  -e <id>              add an e tag: a hex id, note1... or nevent1...
+    \\  -p <pubkey>          add a p tag: hex, npub1... or nprofile1...
     \\  -d <d>               add a d tag
-    \\  -h <h>               add an h tag
-    \\  -a <address>         add an a tag: kind:pubkey:d, an naddr1…, or a bare
+    \\  -h <h>               add an h tag. --help shows this; -h <value> adds an h
+    \\                       tag, and a bare -h as the last argument shows this too
+    \\  -a <address>         add an a tag: kind:pubkey:d, an naddr1..., or a bare
     \\                       pubkey (taken as <kind>:<pubkey>:<-d value>)
     \\  --created-at <n>     unix seconds (default: now)
     \\  --pow <bits>         proof of work (NIP-13): search for a nonce until the
@@ -80,8 +81,8 @@ pub const usage =
     \\  --pow-timeout <s>    give up on an event after <s> seconds, sign nothing
     \\                       for it, and exit 1. Applies to each event separately.
     \\                       Default: no limit.
-    \\  --envelope           print ["EVENT",{…}] instead of the bare event
-    \\  --nevent             print an nevent1… line after each event
+    \\  --envelope           print ["EVENT",{...}] instead of the bare event
+    \\  --nevent             print an nevent1... line after each event
     \\  --confirm            ask on the terminal before publishing; refuses when
     \\                       there is no terminal
     \\
@@ -102,10 +103,12 @@ pub const usage =
     \\input; this one has a complete default, so guessing at stdin would let a
     \\script sign whatever happened to be on the other end of the pipe.
     \\
-    \\  deed event -c "hello" --sec nsec1…
+    \\  deed event -c "hello" --sec nsec1...
     \\  deed event -k reaction -e <id> -p <pubkey> -c "+" wss://relay.example
-    \\  echo '{"kind":1,"content":"hi"}' | deed event - --sec nsec1…
+    \\  echo '{"kind":1,"content":"hi"}' | deed event - --sec nsec1...
     \\
+    \\Exits: 0 on success; 1 if an event could not be signed, a draft is bad, or
+    \\no relay accepted it; 2 if the command line was not understood.
 ;
 
 /// A tag shortcut flag, kept raw until every flag has been read: an `-a` with
@@ -166,7 +169,9 @@ pub fn run(
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (cli.isOneOf(a, &.{ "help", "--help" })) {
+        // `-h` is the h tag, so it asks for help only as the last argument,
+        // where it has no value to take.
+        if (cli.isOneOf(a, &.{ "help", "--help" }) or (std.mem.eql(u8, a, "-h") and i + 1 >= args.len)) {
             try out.writeAll(usage);
             return cli.exit_ok;
         }
@@ -472,9 +477,9 @@ const ShortcutError = error{ BadId, BadPubkey, BadAddress, OutOfMemory };
 
 fn shortcutReason(e: ShortcutError) []const u8 {
     return switch (e) {
-        error.BadId => "not an event id (want 64 hex characters, note1… or nevent1…)",
-        error.BadPubkey => "not a public key (want 64 hex characters, npub1… or nprofile1…)",
-        error.BadAddress => "not an address (want kind:pubkey:d, naddr1… or a public key)",
+        error.BadId => "not an event id (want 64 hex characters, note1... or nevent1...)",
+        error.BadPubkey => "not a public key (want 64 hex characters, npub1... or nprofile1...)",
+        error.BadAddress => "not an address (want kind:pubkey:d, naddr1... or a public key)",
         error.OutOfMemory => "out of memory",
     };
 }
@@ -1324,4 +1329,18 @@ test "a small stream signs on the calling thread and matches the sequential byte
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "a bare -h at the end shows the usage, while -h <value> is the h tag" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+
+    const help = try runEvent(arena, &.{"-h"});
+    try std.testing.expectEqual(cli.exit_ok, help.code);
+    try std.testing.expectEqualStrings(usage, help.out);
+
+    const tag = try runEvent(arena, &.{ "--sec", test_sec, "-h", "group" });
+    try std.testing.expectEqual(cli.exit_ok, tag.code);
+    try std.testing.expect(has(tag.out, "[\"h\",\"group\"]"));
 }

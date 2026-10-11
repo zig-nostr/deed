@@ -32,8 +32,8 @@ pub const usage =
     \\
     \\Options:
     \\  -k, --kind <n>       event kind, repeatable
-    \\  -a, --author <key>   author, as npub1… or 64 hex characters, repeatable
-    \\  -i, --id <id>        event id, as note1… or 64 hex characters, repeatable
+    \\  -a, --author <key>   author, as npub1... or 64 hex characters, repeatable
+    \\  -i, --id <id>        event id, as note1... or 64 hex characters, repeatable
     \\  -e <id>              an `e` tag value, repeatable
     \\  -p <key>             a `p` tag value, repeatable
     \\  -t <topic>           a `t` tag value, repeatable
@@ -48,6 +48,8 @@ pub const usage =
     \\      --store <path>   a local store to count from, with --local
     \\      --local          count from the store alone, dialling nothing
     \\      --timeout <ms>   give up on relays that have not answered (default 10000)
+    \\
+    \\Relays are positional: name each as a ws:// or wss:// argument.
     \\
     \\Prints one line per relay that answered: its URL, a tab, and its count. A
     \\count a relay marks as approximate has "~" in front of the number. A
@@ -399,7 +401,7 @@ pub fn run(
     for (req.relays, 0..) |url, i| {
         const ans = answers[i] orelse {
             switch (outcomes[i]) {
-                .failed => |e| try err.print("deed count: {s}: could not connect: {s}\n", .{ url, @errorName(e) }),
+                .failed => |e| try err.print("deed count: {s}: could not connect: {s}\n", .{ url, dial.describe(e) }),
                 else => try err.print("deed count: {s}: no answer within {d} ms\n", .{ url, req.timeout_ms }),
             }
             continue;

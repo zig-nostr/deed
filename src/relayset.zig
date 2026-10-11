@@ -49,7 +49,16 @@ pub const Options = struct {
     /// How long `auth.force_pre_auth` waits for a challenge before asking
     /// without one. Never longer than the deadline.
     challenge_wait_ms: i64 = 3_000,
+    /// The verb running the query, which prefixes what is said on `err`:
+    /// `deed req: ...`. Empty says just `deed: ...`.
+    verb: []const u8 = "",
 };
+
+/// `deed ` or `deed <verb>: ` in front of a line about a relay.
+fn lead(buf: []u8, verb: []const u8) []const u8 {
+    if (verb.len == 0) return "deed: ";
+    return std.fmt.bufPrint(buf, "deed {s}: ", .{verb}) catch "deed: ";
+}
 
 pub const Outcome = struct {
     /// Relays that answered the dial.
@@ -381,10 +390,12 @@ pub fn query(
     opts: Options,
 ) !Outcome {
     var result = Outcome{};
+    var lead_buf: [64]u8 = undefined;
+    const pre = lead(&lead_buf, opts.verb);
 
     const n = @min(urls.len, max_relays);
     if (urls.len > max_relays) {
-        try err.print("deed: {d} relays were named, and only the first {d} are asked\n", .{ urls.len, max_relays });
+        try err.print("{s}{d} relays were named, and only the first {d} are asked\n", .{ pre, urls.len, max_relays });
     }
 
     var sh: Shared = .{
@@ -421,12 +432,12 @@ pub fn query(
         switch (dialled[i]) {
             .connected => {},
             .failed => |e| {
-                try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
+                try err.print("{s}{s}: {s}\n", .{ pre, url, dial.describe(e) });
                 result.unreachable_count += 1;
                 continue;
             },
             .timed_out => {
-                try err.print("deed: {s}: no answer within {d} ms\n", .{ url, dial_ms });
+                try err.print("{s}{s}: no answer within {d} ms\n", .{ pre, url, dial_ms });
                 result.unreachable_count += 1;
                 continue;
             },
@@ -435,7 +446,7 @@ pub fn query(
         // inline, and an inline reader would be this thread waiting on one
         // relay while the others go unread.
         sh.readers[i] = io.concurrent(readLoop, .{ &sh, i }) catch |e| {
-            try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
+            try err.print("{s}{s}: {s}\n", .{ pre, url, dial.describe(e) });
             result.unreachable_count += 1;
             continue;
         };
@@ -477,7 +488,8 @@ pub fn query(
         defer if (!held) h.deinit(gpa);
 
         if (h.what == .deadline) {
-            try err.writeAll("deed: gave up waiting for the relays still answering\n");
+            try err.writeAll(pre);
+            try err.writeAll("gave up waiting for the relays still answering\n");
             break;
         }
         const i = h.index;
@@ -495,11 +507,11 @@ pub fn query(
                     // output people pipe into other tools has to do the same:
                     // this is the last point where a forgery can be stopped.
                     if (!(nostr.event.verify(gpa, signer, e.event) catch false)) {
-                        try err.print("deed: a relay sent an event that is not correctly signed\n", .{});
+                        try err.print("{s}a relay sent an event that is not correctly signed\n", .{pre});
                         continue;
                     }
                     if (!matchesAny(filters, e.event)) {
-                        try err.print("deed: a relay sent an event nobody asked for\n", .{});
+                        try err.print("{s}a relay sent an event nobody asked for\n", .{pre});
                         continue;
                     }
                     try seen.put(e.event.id, {});
@@ -521,32 +533,34 @@ pub fn query(
                     if (opts.until_eose) finish(&sh, &live, &live_count, i);
                 },
                 .closed => |c| {
-                    try err.writeAll("deed: a relay closed the subscription: ");
+                    try err.writeAll(pre);
+                    try err.writeAll("a relay closed the subscription: ");
                     try writeEscaped(err, c.message);
                     try err.writeAll("\n");
                     finish(&sh, &live, &live_count, i);
                 },
                 .notice => |notice| {
-                    try err.writeAll("deed: notice: ");
+                    try err.writeAll(pre);
+                    try err.writeAll("notice: ");
                     try writeEscaped(err, notice.message);
                     try err.writeAll("\n");
                 },
                 // A relay asking for NIP-42 when this run has no key to answer
                 // with. Saying so beats looking like a relay with nothing to say.
-                .auth => try err.print("deed: a relay wants authentication, which needs --auth\n", .{}),
+                .auth => try err.print("{s}a relay wants authentication, which needs --auth\n", .{pre}),
                 .ok => {},
                 .count, .neg_msg, .neg_err => {},
             },
-            .authenticating => try err.print("deed: {s}: authenticating\n", .{url}),
+            .authenticating => try err.print("{s}{s}: authenticating\n", .{ pre, url }),
             .auth_refused => |t| {
-                try err.print("deed: {s}: authentication refused: ", .{url});
+                try err.print("{s}{s}: authentication refused: ", .{ pre, url });
                 try writeEscaped(err, t);
                 try err.writeAll("\n");
                 finish(&sh, &live, &live_count, i);
             },
-            .no_challenge => try err.print("deed: {s}: no authentication challenge within {d} ms, asking without one\n", .{ url, sh.challenge_wait_ms }),
+            .no_challenge => try err.print("{s}{s}: no authentication challenge within {d} ms, asking without one\n", .{ pre, url, sh.challenge_wait_ms }),
             .subscribe_failed => |e| {
-                try err.print("deed: {s}: {s}\n", .{ url, @errorName(e) });
+                try err.print("{s}{s}: {s}\n", .{ pre, url, dial.describe(e) });
                 result.dialled -= 1;
                 result.unreachable_count += 1;
                 finish(&sh, &live, &live_count, i);
@@ -556,9 +570,9 @@ pub fn query(
                 // without. The events it already sent are still good.
                 if (why) |e| {
                     if (signing.describe(e)) |reason| {
-                        try err.print("deed: {s}: cannot authenticate: {s}\n", .{ url, reason });
+                        try err.print("{s}{s}: cannot authenticate: {s}\n", .{ pre, url, reason });
                     } else {
-                        try err.print("deed: a relay stopped answering: {s}\n", .{@errorName(e)});
+                        try err.print("{s}a relay stopped answering: {s}\n", .{ pre, @errorName(e) });
                     }
                 }
                 finish(&sh, &live, &live_count, i);
@@ -568,7 +582,8 @@ pub fn query(
     }
 
     if (opts.store) |st| try pending.flush(gpa, st, out, &result);
-    if (result.store_failed) try err.writeAll("deed: the store could not be written, so events from that point were not printed\n");
+    try err.writeAll(pre);
+    if (result.store_failed) try err.writeAll("the store could not be written, so events from that point were not printed\n");
     return result;
 }
 

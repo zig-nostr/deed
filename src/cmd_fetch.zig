@@ -48,6 +48,8 @@ pub const usage =
     \\A bare npub fetches that person's profile rather than everything they have
     \\ever written, which is what `npub` on its own can sensibly mean.
     \\
+    \\Exits: 0 if an event was found; 1 if a code is bad or nothing was found; 2 if
+    \\the command line was not understood.
 ;
 
 /// What a code resolves to: a question, and where to ask it.
@@ -164,6 +166,7 @@ pub fn run(
         }
         followed = try outbox.writeRelays(gpa, io, target.filter.authors.?[0], .{
             .bootstrap = bootstrap.items,
+            .verb = "fetch",
             .store = if (store) |*st| st else null,
         }, err);
         if (followed.?.urls.len == 0) {
@@ -176,6 +179,7 @@ pub fn run(
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
+        .verb = "fetch",
         .store = if (store) |*st| st else null,
         .auth = auth_opts,
     });

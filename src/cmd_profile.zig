@@ -52,9 +52,9 @@ pub const usage =
     \\if a relay accepted it.
     \\
     \\Options for set:
-    \\      --sec <key>        secret key, as nsec1..., ncryptsec1... or 64 hex
-    \\                         characters, or a remote signer as bunker://...
-    \\                         Falls back to $NOSTR_SECRET_KEY.
+    \\      --sec <key>        secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                         64 hex characters; $NOSTR_SECRET_KEY is read when
+    \\                         --sec is absent
     \\      --name <text>      --about <text>   --picture <url>   --banner <url>
     \\      --nip05 <name>     --lud16 <addr>   --website <url>
     \\      --metadata <json>  a JSON object of fields to set, applied before the
@@ -71,7 +71,7 @@ pub const usage =
     \\  deed profile npub1... wss://relay.example
     \\  deed profile set --sec nsec1... --about "hello" wss://relay.example
     \\
-    \\Exits 0 on success, 1 when the profile was not found or not published, and
+    \\Exits: 0 on success, 1 when the profile was not found or not published, and
     \\2 when the command made no sense.
     \\
 ;

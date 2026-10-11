@@ -43,10 +43,13 @@ pub const usage =
     \\           --data-urlencode or sent with -F or -T is not known to deed,
     \\           so no payload tag is added for it
     \\
+    \\-G, --get and --url-query are refused: they make curl request a different
+    \\URL from the one signed, so put the query in the URL itself.
+    \\
     \\Options:
-    \\  --sec <key>   the secret key to sign with (nsec1..., hex or ncryptsec1...),
-    \\                or a remote signer as bunker://... Falls back to
-    \\                $NOSTR_SECRET_KEY. Not passed on to curl.
+    \\  --sec <key>   the secret key to sign with: nsec1..., ncryptsec1...,
+    \\                bunker://... or 64 hex characters; $NOSTR_SECRET_KEY is
+    \\                read when --sec is absent. Not passed on to curl.
     \\
     \\The header carries the time it was signed, and servers accept it for a
     \\minute or so. It reaches curl on stdin, so it is not in the process
@@ -58,6 +61,8 @@ pub const usage =
     \\  deed curl https://example.com/api/me
     \\  deed curl -X PUT -d '{"a":1}' https://example.com/api/thing
     \\
+    \\Exits: curl's own status once it has run; 1 if the key is wrong or the
+    \\request could not be signed; 2 if the command line was not understood.
 ;
 
 /// What deed needs to know about a curl command line.
@@ -88,6 +93,9 @@ pub const ParseError = error{
     NoUrl,
     /// The URL has no http:// or https:// scheme.
     NotAbsoluteUrl,
+    /// `-G` or `--url-query`: curl would request a URL other than the one
+    /// signed.
+    ChangesUrl,
 } || std.mem.Allocator.Error;
 
 /// Short options of curl that take a value.
@@ -164,6 +172,7 @@ const Seen = struct {
     upload: bool = false,
     head: bool = false,
     get: bool = false,
+    changes_url: bool = false,
 };
 
 /// Reads the method, URL and inline body out of curl's arguments. The result
@@ -204,6 +213,7 @@ pub fn parseArgs(gpa: std.mem.Allocator, args: []const []const u8) ParseError!Pa
             }
             if (std.mem.eql(u8, a, "--head")) seen.head = true;
             if (std.mem.eql(u8, a, "--get")) seen.get = true;
+            if (std.mem.eql(u8, a, "--get") or std.mem.eql(u8, a, "--url-query")) seen.changes_url = true;
             try forward.append(gpa, a);
             if (!longTakesValue(a) or i + 1 >= args.len) continue;
             i += 1;
@@ -218,7 +228,10 @@ pub fn parseArgs(gpa: std.mem.Allocator, args: []const []const u8) ParseError!Pa
         while (j < a.len) : (j += 1) {
             const c = a[j];
             if (c == 'I') seen.head = true;
-            if (c == 'G') seen.get = true;
+            if (c == 'G') {
+                seen.get = true;
+                seen.changes_url = true;
+            }
             if (std.mem.indexOfScalar(u8, short_with_value, c) == null) continue;
             var value: []const u8 = undefined;
             if (j + 1 < a.len) {
@@ -236,6 +249,8 @@ pub fn parseArgs(gpa: std.mem.Allocator, args: []const []const u8) ParseError!Pa
     const target = seen.url orelse return error.NoUrl;
     if (!std.ascii.startsWithIgnoreCase(target, "http://") and !std.ascii.startsWithIgnoreCase(target, "https://"))
         return error.NotAbsoluteUrl;
+
+    if (seen.changes_url) return error.ChangesUrl;
 
     const method: []const u8 = seen.explicit orelse
         if (seen.head) "HEAD" else if (seen.get) "GET" else if (seen.data or seen.json or seen.form) "POST" else if (seen.upload) "PUT" else "GET";
@@ -332,6 +347,10 @@ pub fn run(
             try err.writeAll("deed curl: the URL must start with http:// or https:// so it can be signed as written\n");
             return cli.exit_usage;
         },
+        error.ChangesUrl => {
+            try err.writeAll("deed curl: -G, --get and --url-query make curl request a different URL from the one signed, so the signature would not match; put the query in the URL itself\n");
+            return cli.exit_usage;
+        },
         error.OutOfMemory => return e,
     };
     defer parsed.deinit(gpa);
@@ -386,8 +405,21 @@ fn curlArgv(gpa: std.mem.Allocator, header_ref: []const u8, forward: []const []c
 fn readsStdin(args: []const []const u8) bool {
     for (args) |a| {
         if (std.mem.eql(u8, a, "-")) return true;
-        if (std.mem.endsWith(u8, a, "@-")) return true;
+        if (namesStdin(a)) return true;
         if (a.len > 2 and a[0] == '-' and a[1] != '-' and a[a.len - 1] == '-') return true;
+    }
+    return false;
+}
+
+/// Whether `a` holds `@-` or `<-` ending the value or followed by a `;`, as
+/// in `-d @-`, `-F x=@-`, `-F 'x=<-'` and `-F 'x=@-;type=text/plain'`.
+fn namesStdin(a: []const u8) bool {
+    for ([_][]const u8{ "@-", "<-" }) |needle| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, a, from, needle)) |at| : (from = at + 1) {
+            const end = at + needle.len;
+            if (end == a.len or a[end] == ';') return true;
+        }
     }
     return false;
 }
@@ -610,11 +642,12 @@ test "the method, URL and body are read out of curl's arguments" {
         try testing.expectEqualStrings("HEAD", p.method);
     }
     {
-        // -G moves the data to the query string: a GET with no body.
-        var p = try parseArgs(gpa, &.{ "-G", "-d", "q=1", "https://example.com/" });
-        defer p.deinit(gpa);
-        try testing.expectEqualStrings("GET", p.method);
-        try testing.expect(p.body == null);
+        // -G and --url-query change the URL curl requests, so the signed u
+        // tag would not match it. They are refused.
+        try testing.expectError(error.ChangesUrl, parseArgs(gpa, &.{ "-G", "-d", "q=1", "https://example.com/" }));
+        try testing.expectError(error.ChangesUrl, parseArgs(gpa, &.{ "-sG", "https://example.com/" }));
+        try testing.expectError(error.ChangesUrl, parseArgs(gpa, &.{ "--get", "https://example.com/" }));
+        try testing.expectError(error.ChangesUrl, parseArgs(gpa, &.{ "--url-query", "a=b", "https://example.com/" }));
     }
     {
         // Bodies deed cannot read in full are not hashed.
@@ -767,6 +800,10 @@ test "only arguments that may read stdin send the header to a file" {
     try testing.expect(readsStdin(&.{ "-T-", "https://example.com/f" }));
     try testing.expect(readsStdin(&.{ "--data-binary", "@-", "https://example.com/" }));
     try testing.expect(readsStdin(&.{ "-F", "file=@-", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "-F", "x=<-", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "-F", "x=@-;type=text/plain", "https://example.com/" }));
+    try testing.expect(readsStdin(&.{ "--form", "x=<-;filename=a", "https://example.com/" }));
+    try testing.expect(!readsStdin(&.{ "-F", "x=a@-b", "https://example.com/" }));
     try testing.expect(readsStdin(&.{ "--config", "-", "https://example.com/" }));
 }
 

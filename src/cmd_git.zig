@@ -32,7 +32,7 @@ pub const summary = "NIP-34 repositories, patches and issues: read them, announc
 pub const ready = true;
 
 pub const usage =
-    \\deed git: NIP-34 repositories, patches and issues
+    \\deed git: NIP-34 repositories, patches and issues: read them, announce, send patches
     \\
     \\Usage:
     \\  deed git repo <repo> [options] [<relay-url>...]
@@ -108,7 +108,7 @@ pub const usage =
     \\  deed git patches naddr1... --apply-ready 1a2b3c4d | git am
     \\  deed git send-patch --repo naddr1... --sec nsec1... HEAD~2..HEAD
     \\
-    \\Exits 0 on success, 1 when nothing was found or nothing was accepted, and 2
+    \\Exits: 0 on success, 1 when nothing was found or nothing was accepted, and 2
     \\when the command made no sense.
     \\
 ;
@@ -561,6 +561,7 @@ fn fetch(rc: *Run, urls: []const []const u8, f: filter.Filter) !Fetched {
     const o = try relayset.query(rc.gpa, rc.io, take, &.{f}, &buf.writer, rc.err, .{
         .until_eose = true,
         .deadline_ms = rc.o.timeout_ms,
+        .verb = rc.verb,
     });
     var list: std.ArrayList(event.Parsed) = .empty;
     errdefer {

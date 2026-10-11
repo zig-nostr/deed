@@ -14,7 +14,7 @@ const nip06 = nostr.nip06;
 const bip39 = nostr.bip39;
 
 pub const usage =
-    \\deed key: make a key, derive the public one, protect or check a key
+    \\deed key: generate, public, encrypt and decrypt with a password, validate, expand, mnemonics
     \\
     \\Usage:
     \\  deed key generate [--hex]
@@ -26,7 +26,8 @@ pub const usage =
     \\  deed key mnemonic [--words N]
     \\  deed key from-mnemonic [--account N] [--passphrase] [--public] [--hex] [words...]
     \\
-    \\<secret-key> is a SECRET key, as nsec1…, ncryptsec1… or 64 hex characters. A
+    \\<secret-key> is a SECRET key, as nsec1..., ncryptsec1... or 64 hex characters
+    \\(a bunker:// remote signer is refused: these need the key itself). A
     \\bare 64-character hex string is read as a secret key, never as a public
     \\one. Pasting a public key here derives a different, wrong npub without
     \\complaining. An ncryptsec asks for its password.
@@ -56,6 +57,8 @@ pub const usage =
     \\there are none from the terminal with echo off, or from a pipe. --passphrase
     \\asks for a BIP-39 passphrase the same way. --public prints the npub.
     \\
+    \\Exits: 0 on success; 1 if a key is wrong, a password is wrong or missing, or
+    \\validate finds an invalid key; 2 if the command line was not understood.
 ;
 
 pub fn run(
@@ -322,7 +325,7 @@ fn decrypt(
         return cli.exit_usage;
     }, " \t\r\n");
     if (!keyinput.hasPrefix(raw, "ncryptsec1")) {
-        try err.writeAll("deed key decrypt: not an ncryptsec (want ncryptsec1…)\n");
+        try err.writeAll("deed key decrypt: not an ncryptsec (want ncryptsec1...)\n");
         return cli.exit_fail;
     }
 

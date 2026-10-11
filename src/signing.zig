@@ -265,7 +265,7 @@ pub fn report(verb: []const u8, e: anyerror, err: *Io.Writer) !u8 {
 /// `bunker://` URI. Null after one line on `err` saying why there is none.
 pub fn open(gpa: std.mem.Allocator, io: Io, verb: []const u8, text: []const u8, err: *Io.Writer) !?Signer {
     if (isBunkerUri(text)) return openRemote(gpa, io, verb, std.mem.trim(u8, text, " \t\r\n"), .{}, err);
-    var sk = keyinput.secretKeyForVerb(gpa, verb, text, err) catch |e| switch (e) {
+    var sk = keyinput.secretKeyForRemoteVerb(gpa, verb, text, err) catch |e| switch (e) {
         error.BadKey => return null,
         else => return e,
     };
@@ -412,7 +412,7 @@ pub fn start(
         } else if (describe(e)) |why| {
             try err.print("deed {s}: {s}\n", .{ verb, why });
         } else {
-            try err.print("deed {s}: cannot connect to the remote signer: {s}\n", .{ verb, @errorName(e) });
+            try err.print("deed {s}: cannot connect to the remote signer: {s}\n", .{ verb, dial.describe(e) });
         }
         return null;
     };

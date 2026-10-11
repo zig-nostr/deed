@@ -39,10 +39,12 @@ pub const usage =
     \\refused, because a name read from an event could otherwise point deed at
     \\the local network.
     \\
-    \\  deed decode npub1…            {"pubkey":"…"}
-    \\  deed decode nevent1…          {"id":"…","relays":[…],"kind":1}
-    \\  deed decode bob@example.com   {"pubkey":"…","relays":[…]}
+    \\  deed decode npub1...            {"pubkey":"..."}
+    \\  deed decode nevent1...          {"id":"...","relays":[...],"kind":1}
+    \\  deed decode bob@example.com   {"pubkey":"...","relays":[...]}
     \\
+    \\Exits: 0 when every code was decoded; 1 if any was not; 2 if the command
+    \\line was not understood.
 ;
 
 pub fn run(
@@ -144,7 +146,7 @@ fn decodeOne(gpa: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
 
 /// `deny_private` is passed to the NIP-05 lookup.
 fn decodeOneOpts(gpa: std.mem.Allocator, io: std.Io, raw: []const u8, deny_private: bool) ![]u8 {
-    // `nostr:npub1…` and `npub1…` are the same code wearing different clothes.
+    // `nostr:npub1...` and `npub1...` are the same code wearing different clothes.
     const code = keyinput.stripUri(std.mem.trim(u8, raw, " \t\r\n"));
 
     var buf: std.ArrayList(u8) = .empty;

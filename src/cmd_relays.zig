@@ -51,6 +51,8 @@ pub const usage =
     \\wss://purplepag.es or wss://relay.damus.io, are the usual choices.
     \\An nprofile's own relay hints are asked as well.
     \\
+    \\Exits: 0 if a relay list was found; 1 if none was or no relay answered; 2 if
+    \\the command line was not understood.
 ;
 
 pub fn run(
@@ -155,6 +157,7 @@ pub fn run(
 
     var lists = try outbox.lookup(gpa, io, pubkey, .{
         .bootstrap = bootstrap.items,
+        .verb = "relays",
         .store = if (store) |*st| st else null,
         .refresh = refresh,
         .timeout_ms = timeout_ms,

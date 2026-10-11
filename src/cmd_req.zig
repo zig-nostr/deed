@@ -30,8 +30,8 @@ pub const usage =
     \\
     \\Options:
     \\  -k, --kind <n>       event kind, repeatable
-    \\  -a, --author <key>   author, as npub1… or 64 hex characters, repeatable
-    \\  -i, --id <id>        event id, as note1… or 64 hex characters, repeatable
+    \\  -a, --author <key>   author, as npub1... or 64 hex characters, repeatable
+    \\  -i, --id <id>        event id, as note1... or 64 hex characters, repeatable
     \\  -e <id>              an `e` tag value, repeatable
     \\  -p <key>             a `p` tag value, repeatable
     \\  -t <topic>           a `t` tag value, repeatable
@@ -58,8 +58,9 @@ pub const usage =
     \\A filter can also be given as JSON: as an argument that starts with {, or
     \\on stdin when a lone - is given (one object, several, or an array of them).
     \\Stdin is read only for that -, never on its own, so a caller that leaves a
-    \\pipe open cannot stall a request; reading it gives up after --timeout. Flags are laid over each JSON filter: a field a flag sets replaces
-    \\the one in the JSON. Several filters make one subscription.
+    \\pipe open cannot stall a request; reading it gives up after --timeout.
+    \\Flags are laid over each JSON filter: a field a flag sets replaces the one
+    \\in the JSON. Several filters make one subscription.
     \\More than 500 ids or authors in a filter go out as several filters in the
     \\same REQ, so none is dropped.
     \\
@@ -67,6 +68,10 @@ pub const usage =
     \\Each page asks for events older than the oldest one seen so far, and an
     \\event two pages return is printed once. --paginate cannot be combined
     \\with --stream or --local, and --ids-only cannot be combined with --stream.
+    \\
+    \\Relays are positional: name each as a ws:// or wss:// argument. With none,
+    \\the REQ is printed and nothing is dialled. (--relay only says where to look
+    \\up relay lists.)
     \\
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
@@ -619,6 +624,7 @@ pub fn runWith(
     const outcome = try relayset.query(gpa, io, req.relays, filters.items, if (cut != null) &held.writer else out, err, .{
         .until_eose = !req.stream,
         .deadline_ms = req.timeout_ms,
+        .verb = "req",
         .store = store_ptr,
         .auth = auth_opts,
     });
@@ -678,6 +684,7 @@ fn runTask(gpa: std.mem.Allocator, io: std.Io, t: *Task, deadline_ms: i64, auth_
     t.outcome = relayset.query(gpa, io, t.urls, t.filters, &t.out.writer, &t.err.writer, .{
         .until_eose = true,
         .deadline_ms = deadline_ms,
+        .verb = "req",
         .auth = auth_opts,
     }) catch {
         t.failed = true;
@@ -952,6 +959,7 @@ fn pages(
         const outcome = try relayset.query(gpa, io, req.relays, page_filters, &capture.writer, err, .{
             .until_eose = true,
             .deadline_ms = req.timeout_ms,
+            .verb = "req",
             .store = store,
             .auth = auth_opts,
         });
@@ -1722,4 +1730,12 @@ test "--outbox with no relay to look through is a usage error, and cannot stream
     try std.testing.expectEqual(cli.exit_usage, r.code);
     const r2 = try runReq(&.{ "--outbox", "-a", pk }, &ob, &eb);
     try std.testing.expectEqual(cli.exit_usage, r2.code);
+}
+
+test "an unreachable relay is named with the verb and a plain reason" {
+    var ob: [4096]u8 = undefined;
+    var eb: [2048]u8 = undefined;
+    const r = try runReq(&.{ "-k", "1", "ws://127.0.0.1:1" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "deed req: ws://127.0.0.1:1: connection refused") != null);
 }

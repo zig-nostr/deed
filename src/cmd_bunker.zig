@@ -44,7 +44,7 @@ pub const usage =
     \\
     \\Usage:
     \\  deed bunker [options] <relay>...
-    \\  deed bunker connect <nostrconnect://…> [options] [<relay>...]
+    \\  deed bunker connect <nostrconnect://...> [options] [<relay>...]
     \\
     \\Holds a key and signs with it for the clients it trusts, over the relays
     \\given. Prints a bunker:// URI on stdout for a client to connect with, logs
@@ -57,9 +57,11 @@ pub const usage =
     \\(ps), so a key given there is not kept secret.
     \\
     \\Options:
-    \\  --sec <key>                    the key to sign with, in any form
-    \\                                 `deed event` takes; see above for why
-    \\                                 $NOSTR_SECRET_KEY is the better way
+    \\  --sec <key>                    the key to sign with: nsec1..., ncryptsec1...
+    \\                                 or 64 hex characters (bunker:// is
+    \\                                 refused: this verb needs the key itself).
+    \\                                 $NOSTR_SECRET_KEY is read when --sec is
+    \\                                 absent, and is the safer way to give it
     \\  -k, --authorized-keys <pubkey> a client served without a secret,
     \\                                 repeatable
     \\  --authorized-secrets-file <path>
@@ -96,10 +98,12 @@ pub const usage =
     \\  Answers a nostrconnect:// URI shown by a client, on the relays it names
     \\  and any given here, and then serves that client.
     \\
-    \\  NOSTR_SECRET_KEY=ncryptsec1… deed bunker wss://relay.example
+    \\  NOSTR_SECRET_KEY=ncryptsec1... deed bunker wss://relay.example
     \\  deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
-    \\  NOSTR_SECRET_KEY=ncryptsec1… deed bunker connect 'nostrconnect://…'
+    \\  NOSTR_SECRET_KEY=ncryptsec1... deed bunker connect 'nostrconnect://...'
     \\
+    \\Exits: 0 when stopped by a signal; 1 if the key is wrong or the bunker could
+    \\not start; 2 if the command line was not understood.
 ;
 
 /// Relays one bunker listens on at most.
@@ -240,7 +244,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, out: *Io.Writer
             p.sec = v;
         } else if (cli.isOneOf(a, &.{ "-k", "--authorized-keys" })) {
             const pk = keyinput.publicKey(arena, v) catch {
-                try err.print("deed bunker: '{s}' is not a public key (want npub1… or 64 hex characters)\n", .{v});
+                try err.print("deed bunker: '{s}' is not a public key (want npub1... or 64 hex characters)\n", .{v});
                 return null;
             };
             try appendUnique([32]u8, arena, &p.authorized_keys, pk);
@@ -1051,7 +1055,7 @@ fn serveOnce(d: *Daemon, index: usize, bunker: *nip46.Bunker) Ended {
         .connected => |r| r,
         .failed => |e| {
             if (isCancel(e)) return .stopped;
-            d.log("{s}: could not connect: {s}", .{ url, @errorName(e) });
+            d.log("{s}: could not connect: {s}", .{ url, dial.describe(e) });
             return .dropped;
         },
         .timed_out => {

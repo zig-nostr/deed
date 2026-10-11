@@ -35,7 +35,7 @@ pub const default_timeout_ms: i64 = 10_000;
 const max_content_bytes = 1 << 20;
 
 pub const usage =
-    \\deed post: publish a text note
+    \\deed post: publish a note, a reply or a comment
     \\
     \\Usage:
     \\  deed post [options] [<text>] [<relay-url>...]
@@ -51,9 +51,9 @@ pub const usage =
     \\  echo "hello" | deed post --sec nsec1... wss://relay.example
     \\
     \\Options:
-    \\      --sec <key>         secret key, as nsec1..., ncryptsec1... or 64 hex
-    \\                          characters, or a remote signer as bunker://...
-    \\                          Falls back to $NOSTR_SECRET_KEY.
+    \\      --sec <key>         secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                          64 hex characters; $NOSTR_SECRET_KEY is read when
+    \\                          --sec is absent
     \\      --reply <code>      reply to an event (nevent, note or 64 hex
     \\                          characters). The parent is fetched from the relays
     \\                          named, and the note gets NIP-10 root and reply
@@ -74,7 +74,7 @@ pub const usage =
     \\named. A code with an author but no hints is also looked up at the relays that
     \\author writes to. The note itself goes only to the ones named, or to yours.
     \\
-    \\Exits 0 when a relay accepted the note, 1 when none did, and 2 when the
+    \\Exits: 0 when a relay accepted the note, 1 when none did, and 2 when the
     \\command made no sense.
     \\
 ;
@@ -285,6 +285,7 @@ pub fn fetchNewest(
     const o = try relayset.query(gpa, io, urls, &.{f}, &buf.writer, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
+        .verb = "post",
         .store = store,
     });
     var best: ?event.Parsed = null;
