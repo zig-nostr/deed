@@ -12,6 +12,10 @@
 //!    leave https for http, and a hop to another origin drops the credentials.
 //!  - https only. Plain http is allowed for a loopback host, or when the
 //!    caller says so with `allow_http`.
+//!  - Optionally, `deny_private`: the host is resolved here, refused if any
+//!    answer is a loopback, private, link-local, CGNAT, multicast or similar
+//!    address, and the connection goes to the address that was checked, so a
+//!    second lookup cannot answer differently. Every redirect hop is checked.
 //!  - Errors in one small set, each with a plain sentence (`describe`).
 //!
 //! The status is returned, never turned into an error: a 404 with a body is
@@ -52,6 +56,9 @@ pub const Error = error{
     ConnectionRefused,
     ConnectFailed,
     TlsFailed,
+    /// `deny_private` is set and the host resolves to a loopback, private,
+    /// link-local or otherwise non-public address.
+    PrivateAddress,
     /// The connection broke or the server's reply was not HTTP.
     RequestFailed,
     /// The writer that receives the body failed.
@@ -71,6 +78,10 @@ pub const Body = union(enum) {
     stream: struct { reader: *Io.Reader, len: u64 },
 };
 
+/// Stands in for DNS: fills `out` with the addresses of `host` (port set to
+/// `port`) and returns how many, or null when the name is unknown. For tests.
+pub const Resolver = *const fn (host: []const u8, port: u16, out: *[16]Io.net.IpAddress) ?usize;
+
 pub const Options = struct {
     method: Method = .GET,
     /// Sent as given (Accept, Authorization, ...). Authorization, Cookie and
@@ -87,6 +98,15 @@ pub const Options = struct {
     max_redirects: u8 = 3,
     /// Permit plain http to any host. Loopback hosts never need it.
     allow_http: bool = false,
+    /// Refuse a host that resolves to a loopback, private, link-local,
+    /// unique-local, CGNAT, unspecified or multicast address (IPv4-mapped
+    /// forms included), on the first request and on every redirect hop, and
+    /// connect to the address that passed. For URLs that come from untrusted
+    /// data, where a crafted name could otherwise reach the local network.
+    deny_private: bool = false,
+    /// Replaces DNS. Setting it also makes the connection go to the address
+    /// it returned. For tests.
+    resolver: ?Resolver = null,
 };
 
 /// A response held in memory.
@@ -177,7 +197,12 @@ fn run(gpa: std.mem.Allocator, io: Io, url: []const u8, o: Options, sink: *Io.Wr
             try extra.append(arena, h);
         }
 
+        const pinned: ?*http.Client.Connection = if (o.deny_private or o.resolver != null)
+            try pinConnection(&client, io, uri, o)
+        else
+            null;
         var req = client.request(method, uri, .{
+            .connection = pinned,
             .redirect_behavior = .unhandled,
             .keep_alive = false,
             .headers = .{
@@ -186,7 +211,13 @@ fn run(gpa: std.mem.Allocator, io: Io, url: []const u8, o: Options, sink: *Io.Wr
                 .content_type = if (o.content_type) |ct| .{ .override = ct } else .default,
             },
             .extra_headers = extra.items,
-        }) catch |e| return mapError(e);
+        }) catch |e| {
+            if (pinned) |c| {
+                c.closing = true;
+                client.connection_pool.release(c, io);
+            }
+            return mapError(e);
+        };
         defer req.deinit();
 
         sendRequest(&req, method, body) catch |e| return mapError(e);
@@ -235,6 +266,155 @@ fn run(gpa: std.mem.Allocator, io: Io, url: []const u8, o: Options, sink: *Io.Wr
         try drain(reader, sink, o.max_bytes, &response);
         return status;
     }
+}
+
+/// Resolves the host of `uri`, applies `deny_private`, and opens a connection
+/// to one of the addresses that was checked. TLS still verifies the name.
+fn pinConnection(client: *http.Client, io: Io, uri: Uri, o: Options) Error!*http.Client.Connection {
+    var host_buf: [Io.net.HostName.max_len]u8 = undefined;
+    const raw = (uri.getHost(&host_buf) catch return error.InvalidUrl).bytes;
+    const host = if (raw.len >= 2 and raw[0] == '[' and raw[raw.len - 1] == ']') raw[1 .. raw.len - 1] else raw;
+    const port = portOf(uri);
+    const protocol: http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
+
+    var addrs: [16]Io.net.IpAddress = undefined;
+    var n: usize = 0;
+    if (Io.net.IpAddress.parse(host, port)) |a| {
+        addrs[0] = a;
+        n = 1;
+    } else |_| if (o.resolver) |r| {
+        n = r(host, port, &addrs) orelse return error.HostNotFound;
+    } else {
+        n = try lookupAddresses(io, host, port, &addrs);
+    }
+    if (n == 0) return error.HostNotFound;
+    if (o.deny_private) {
+        for (addrs[0..n]) |a| if (isPrivateAddress(a)) return error.PrivateAddress;
+    }
+
+    // request() prepares the certificate bundle, but only after the
+    // connection it is handed exists, and a TLS connection needs it first.
+    if (protocol == .tls) try prepareTls(client, io);
+
+    var last: Error = error.ConnectFailed;
+    for (addrs[0..n]) |a| {
+        var text_buf: [48]u8 = undefined;
+        const text = addressText(&text_buf, a);
+        return client.connectTcpOptions(.{
+            .host = .{ .bytes = text },
+            .port = port,
+            .protocol = protocol,
+            .proxied_host = .{ .bytes = host },
+            .proxied_port = port,
+        }) catch |e| {
+            last = mapError(e);
+            if (last == error.Canceled or last == error.OutOfMemory) return last;
+            continue;
+        };
+    }
+    return last;
+}
+
+fn lookupAddresses(io: Io, host: []const u8, port: u16, out: *[16]Io.net.IpAddress) Error!usize {
+    const name = Io.net.HostName.init(host) catch return error.InvalidUrl;
+    var qbuf: [32]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&qbuf);
+    var future = io.async(Io.net.HostName.lookup, .{ name, io, &queue, .{ .port = port } });
+    var n: usize = 0;
+    while (queue.getOne(io)) |r| switch (r) {
+        .address => |a| {
+            if (n < out.len) {
+                out[n] = a;
+                n += 1;
+            }
+        },
+        .canonical_name => {},
+    } else |e| switch (e) {
+        error.Canceled => {
+            future.cancel(io) catch {};
+            return error.Canceled;
+        },
+        error.Closed => {},
+    }
+    future.await(io) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        else => if (n == 0) return error.HostNotFound,
+    };
+    return n;
+}
+
+fn prepareTls(client: *http.Client, io: Io) Error!void {
+    {
+        client.ca_bundle_lock.lockShared(io) catch return error.Canceled;
+        defer client.ca_bundle_lock.unlockShared(io);
+        if (client.now != null) return;
+    }
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = Io.Clock.real.now(io);
+    bundle.rescan(client.allocator, io, now) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        else => return error.TlsFailed,
+    };
+    client.ca_bundle_lock.lock(io) catch return error.Canceled;
+    defer client.ca_bundle_lock.unlock(io);
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+}
+
+/// A literal the connect path parses back to the same address, without the
+/// port and without brackets.
+fn addressText(buf: *[48]u8, a: Io.net.IpAddress) []const u8 {
+    switch (a) {
+        .ip4 => |v| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3] }) catch unreachable,
+        .ip6 => |v| {
+            var w: Io.Writer = .fixed(buf);
+            for (0..8) |i| {
+                if (i != 0) w.writeByte(':') catch unreachable;
+                const g = std.mem.readInt(u16, v.bytes[i * 2 ..][0..2], .big);
+                w.print("{x}", .{g}) catch unreachable;
+            }
+            return w.buffered();
+        },
+    }
+}
+
+/// True for an address a public name should never lead to: loopback, private
+/// (10/8, 172.16/12, 192.168/16), link-local, unique-local, CGNAT,
+/// unspecified, multicast and reserved ranges, and the IPv4-mapped, NAT64 and
+/// 6to4 forms that carry one of those.
+pub fn isPrivateAddress(a: Io.net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |v| isPrivate4(v.bytes),
+        .ip6 => |v| isPrivate6(v.bytes),
+    };
+}
+
+fn isPrivate4(b: [4]u8) bool {
+    if (b[0] == 0 or b[0] == 10 or b[0] == 127) return true;
+    if (b[0] == 169 and b[1] == 254) return true;
+    if (b[0] == 172 and b[1] >= 16 and b[1] <= 31) return true;
+    if (b[0] == 192 and b[1] == 168) return true;
+    if (b[0] == 100 and b[1] >= 64 and b[1] <= 127) return true;
+    return b[0] >= 224;
+}
+
+fn isPrivate6(b: [16]u8) bool {
+    const zeros10 = [_]u8{0} ** 10;
+    if (std.mem.eql(u8, b[0..10], &zeros10)) {
+        // ::, ::1, ::ffff:a.b.c.d (mapped) and ::a.b.c.d (compatible).
+        if (b[10] == 0 and b[11] == 0) {
+            if (std.mem.eql(u8, b[12..15], &[_]u8{ 0, 0, 0 })) return true;
+            return isPrivate4(b[12..16].*);
+        }
+        if (b[10] == 0xff and b[11] == 0xff) return isPrivate4(b[12..16].*);
+    }
+    if (b[0] == 0x00 and b[1] == 0x64 and b[2] == 0xff and b[3] == 0x9b and
+        std.mem.eql(u8, b[4..12], &[_]u8{0} ** 8)) return isPrivate4(b[12..16].*);
+    if (b[0] == 0x20 and b[1] == 0x02) return isPrivate4(b[2..6].*);
+    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true;
+    if ((b[0] & 0xfe) == 0xfc) return true;
+    return b[0] == 0xff;
 }
 
 fn sendRequest(req: *http.Client.Request, method: Method, body: Body) !void {
@@ -412,6 +592,7 @@ pub fn describe(e: Error) []const u8 {
         error.ConnectionRefused => "connection refused",
         error.ConnectFailed => "could not connect",
         error.TlsFailed => "the TLS handshake failed",
+        error.PrivateAddress => "the host resolves to a local or private address",
         error.RequestFailed => "the connection broke or the reply was not HTTP",
         error.SinkFailed => "could not write the response",
         error.ConcurrencyUnavailable => "cannot run the request with a deadline here",
@@ -725,4 +906,88 @@ test "loopback hosts" {
     try std.testing.expect(!isLoopbackHost("example.com"));
     try std.testing.expect(!isLoopbackHost("128.0.0.1"));
     try std.testing.expect(!isLoopbackHost("localhost.example.com"));
+}
+
+fn ip(text: []const u8) Io.net.IpAddress {
+    return Io.net.IpAddress.parse(text, 80) catch unreachable;
+}
+
+test "private, loopback and reserved addresses are denied, public ones are not" {
+    const denied = [_][]const u8{
+        "127.0.0.1",       "127.9.9.9",          "10.0.0.1",        "172.16.0.1",
+        "172.31.255.1",    "192.168.1.1",        "169.254.169.254", "100.64.0.1",
+        "100.127.0.1",     "0.0.0.0",            "224.0.0.1",       "255.255.255.255",
+        "::",              "::1",                "fe80::1",         "febf::1",
+        "fc00::1",         "fd12:3456::1",       "ff02::1",         "::ffff:127.0.0.1",
+        "::ffff:10.1.2.3", "::ffff:192.168.0.1", "64:ff9b::7f00:1", "2002:c0a8:0101::1",
+    };
+    for (denied) |t| try std.testing.expect(isPrivateAddress(ip(t)));
+    const allowed = [_][]const u8{
+        "1.1.1.1",     "8.8.8.8",     "172.15.0.1",      "172.32.0.1",     "100.63.0.1",
+        "100.128.0.1", "193.168.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "fec0::1",
+    };
+    for (allowed) |t| try std.testing.expect(!isPrivateAddress(ip(t)));
+}
+
+test "address text parses back to the same address" {
+    var buf: [48]u8 = undefined;
+    for ([_][]const u8{ "1.2.3.4", "2606:4700::1111", "::1" }) |t| {
+        const a = ip(t);
+        const text = addressText(&buf, a);
+        try std.testing.expect(a.eql(&(try Io.net.IpAddress.parse(text, 80))));
+    }
+}
+
+fn resolveFake(host: []const u8, port: u16, out: *[16]Io.net.IpAddress) ?usize {
+    if (std.mem.eql(u8, host, "rebind.test")) {
+        out[0] = Io.net.IpAddress.parse("93.184.216.34", port) catch unreachable;
+        out[1] = Io.net.IpAddress.parse("192.168.1.10", port) catch unreachable;
+        return 2;
+    }
+    if (std.mem.eql(u8, host, "loop.test")) {
+        out[0] = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+        return 1;
+    }
+    if (std.mem.eql(u8, host, "mapped.test")) {
+        out[0] = Io.net.IpAddress.parse("::ffff:10.0.0.5", port) catch unreachable;
+        return 1;
+    }
+    return null;
+}
+
+test "deny_private refuses a name that resolves to a private address" {
+    const io = std.testing.io;
+    var da: TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the request leaked");
+    const gpa = da.allocator();
+    for ([_][]const u8{ "https://rebind.test/x", "https://loop.test/x", "https://mapped.test/x", "https://127.0.0.1/x", "https://[::1]/x", "https://10.0.0.1/x" }) |url| {
+        try std.testing.expectError(error.PrivateAddress, fetch(gpa, io, url, .{ .deny_private = true, .resolver = resolveFake }));
+    }
+    try std.testing.expectError(error.HostNotFound, fetch(gpa, io, "https://nowhere.test/x", .{ .deny_private = true, .resolver = resolveFake }));
+}
+
+test "a resolver makes the connection go to the address it returned" {
+    const io = std.testing.io;
+    var da: TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the request leaked");
+    const gpa = da.allocator();
+
+    var srv: TestServer = undefined;
+    try srv.start(io, &.{.{ .path = "/hello", .body = "pinned" }}, 1);
+    defer srv.stop(io);
+
+    const R = struct {
+        var port: u16 = 0;
+        fn resolve(host: []const u8, _: u16, out: *[16]Io.net.IpAddress) ?usize {
+            if (!std.mem.eql(u8, host, "pinned.test")) return null;
+            out[0] = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+            return 1;
+        }
+    };
+    R.port = srv.port();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://pinned.test:{d}/hello", .{srv.port()});
+    var res = try fetch(gpa, io, url, .{ .allow_http = true, .resolver = R.resolve });
+    defer res.deinit(gpa);
+    try std.testing.expectEqualStrings("pinned", res.body);
 }

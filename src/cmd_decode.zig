@@ -23,7 +23,7 @@ pub const usage =
     \\deed decode: turn a NIP-19 code into the fields it carries
     \\
     \\Usage:
-    \\  deed decode [<code>...]
+    \\  deed decode [--allow-local] [<code>...]
     \\
     \\Accepts npub, nsec, note, nprofile, nevent, naddr and nrelay, with or
     \\without a leading `nostr:`, in lower case or all upper case (the form a
@@ -34,7 +34,10 @@ pub const usage =
     \\is looked up over https and prints what an nprofile would: the pubkey and
     \\the relays the domain lists for it. A redirect is an error, as NIP-05
     \\requires. A domain on this machine (localhost, 127.x.x.x, ::1) is asked
-    \\over plain http.
+    \\over plain http only with --allow-local, which also permits a domain that
+    \\resolves to a private or link-local address; without it such a domain is
+    \\refused, because a name read from an event could otherwise point deed at
+    \\the local network.
     \\
     \\  deed decode npub1…            {"pubkey":"…"}
     \\  deed decode nevent1…          {"id":"…","relays":[…],"kind":1}
@@ -51,8 +54,13 @@ pub fn run(
 ) !u8 {
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(gpa);
+    var allow_local = false;
 
     for (args) |a| {
+        if (std.mem.eql(u8, a, "--allow-local")) {
+            allow_local = true;
+            continue;
+        }
         if (cli.isOneOf(a, &.{ "help", "-h", "--help" })) {
             try out.writeAll(usage);
             return cli.exit_ok;
@@ -87,7 +95,7 @@ pub fn run(
                 continue;
             },
         };
-        const line = decodeOne(gpa, io, code) catch |e| {
+        const line = decodeOneOpts(gpa, io, code, !allow_local) catch |e| {
             try err.print("deed decode: {s}: {s}\n", .{ code, reason(e) });
             failures += 1;
             continue;
@@ -113,7 +121,7 @@ fn reason(e: anyerror) []const u8 {
         error.InvalidJson => "the domain's reply is not JSON in the NIP-05 shape",
         error.BadStatus => "the domain answered with an HTTP error",
         error.TooManyRedirects => "the domain redirected, which NIP-05 does not allow",
-        error.InsecureScheme, error.UnsupportedScheme, error.InvalidUrl, error.InvalidHeader, error.BodyNotAllowed, error.RedirectInvalid, error.RedirectNeedsResend, error.ResponseTooLarge, error.UnsupportedEncoding, error.TimedOut, error.HostNotFound, error.ConnectionRefused, error.ConnectFailed, error.TlsFailed, error.RequestFailed, error.SinkFailed, error.ConcurrencyUnavailable => |h| http.describe(h),
+        error.InsecureScheme, error.UnsupportedScheme, error.InvalidUrl, error.InvalidHeader, error.BodyNotAllowed, error.RedirectInvalid, error.RedirectNeedsResend, error.ResponseTooLarge, error.UnsupportedEncoding, error.TimedOut, error.HostNotFound, error.ConnectionRefused, error.ConnectFailed, error.TlsFailed, error.RequestFailed, error.SinkFailed, error.ConcurrencyUnavailable, error.PrivateAddress => |h| http.describe(h),
         error.InvalidPrefix => "not a code deed knows",
         error.WrongLength => "wrong length for its prefix",
         error.InvalidTlv => "malformed contents",
@@ -131,6 +139,11 @@ fn reason(e: anyerror) []const u8 {
 
 /// Decodes one code into a JSON object. Caller owns the returned bytes.
 fn decodeOne(gpa: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
+    return decodeOneOpts(gpa, io, raw, false);
+}
+
+/// `deny_private` is passed to the NIP-05 lookup.
+fn decodeOneOpts(gpa: std.mem.Allocator, io: std.Io, raw: []const u8, deny_private: bool) ![]u8 {
     // `nostr:npub1…` and `npub1…` are the same code wearing different clothes.
     const code = keyinput.stripUri(std.mem.trim(u8, raw, " \t\r\n"));
 
@@ -139,7 +152,7 @@ fn decodeOne(gpa: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
     try buf.append(gpa, '{');
 
     if (isNip05(code)) {
-        var r = try resolveNip05(gpa, io, code);
+        var r = try resolveNip05Opts(gpa, io, code, deny_private);
         defer r.deinit();
         try appendHexField(&buf, gpa, "pubkey", &r.pubkey, true);
         try appendRelays(&buf, gpa, r.relays, false);
@@ -200,6 +213,12 @@ pub const Nip05Error = nip05.ParseError || nip05.ResponseError || http.Error || 
 /// on this machine is asked over plain http, so a local server can be tried
 /// without a certificate.
 pub fn resolveNip05(gpa: std.mem.Allocator, io: std.Io, text: []const u8) Nip05Error!nip05.Resolved {
+    return resolveNip05Opts(gpa, io, text, false);
+}
+
+/// As `resolveNip05`; with `deny_private` a domain that resolves to a
+/// loopback, private or link-local address is refused (`PrivateAddress`).
+pub fn resolveNip05Opts(gpa: std.mem.Allocator, io: std.Io, text: []const u8, deny_private: bool) Nip05Error!nip05.Resolved {
     const id = try nip05.parseIdentifier(text);
     const https_url = try nip05.wellKnownUrl(gpa, &id);
     defer gpa.free(https_url);
@@ -217,6 +236,7 @@ pub fn resolveNip05(gpa: std.mem.Allocator, io: std.Io, text: []const u8) Nip05E
         .timeout_ms = nip05_timeout_ms,
         .max_bytes = nip05_max_bytes,
         .max_redirects = 0,
+        .deny_private = deny_private,
     });
     defer res.deinit(gpa);
     if (!res.ok()) return error.BadStatus;
@@ -478,4 +498,12 @@ test "an identifier that is not valid is refused before any request" {
     try std.testing.expect(isNip05("bob@example.com"));
     try std.testing.expect(isNip05("example.com"));
     try std.testing.expect(!isNip05("npub1abc"));
+}
+
+test "a NIP-05 domain on this machine is refused unless allowed" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.PrivateAddress, decodeOneOpts(gpa, io, "bob@localhost", true));
+    try std.testing.expectError(error.PrivateAddress, decodeOneOpts(gpa, io, "bob@127.0.0.1", true));
+    try std.testing.expectError(error.PrivateAddress, decodeOneOpts(gpa, io, "bob@192.168.1.5", true));
 }
