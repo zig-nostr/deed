@@ -297,6 +297,8 @@ const Conn = struct {
     signer: keys.Signer,
     challenge: [32]u8 = undefined,
     authed: ?[32]u8 = null,
+    /// An AUTH challenge has gone to this client.
+    challenge_sent: bool = false,
     host_buf: [256]u8 = undefined,
     host_len: usize = 0,
 
@@ -421,6 +423,15 @@ const Conn = struct {
         @memcpy(payload[2..][0..n], reason[0..n]);
         if (code != 1000) c.server.log("{s}: closed: {s}", .{ c.peer(), reason });
         try c.sendPayload(.close, payload[0 .. 2 + n]);
+    }
+
+    /// Sends the NIP-42 challenge, once.
+    fn sendChallenge(c: *Conn) SendError!void {
+        if (c.challenge_sent) return;
+        c.challenge_sent = true;
+        var hexbuf: [64]u8 = undefined;
+        const ch = std.fmt.bufPrint(&hexbuf, "{x}", .{&c.challenge}) catch unreachable;
+        try c.sendOwned(try message.encodeAuthChallenge(c.gpa, ch));
     }
 
     fn needsAuth(c: *const Conn) bool {
@@ -753,10 +764,7 @@ fn serveConn(c: *Conn, registered: *bool) Io.Cancelable!void {
     recv.shrinkRetainingCapacity(recv.items.len - head_end);
 
     if (c.server.opts.auth_required) {
-        var hexbuf: [64]u8 = undefined;
-        const ch = std.fmt.bufPrint(&hexbuf, "{x}", .{&c.challenge}) catch unreachable;
-        const payload = message.encodeAuthChallenge(gpa, ch) catch return;
-        c.sendOwned(payload) catch |e| return goneOrCanceled(e);
+        c.sendChallenge() catch |e| return goneOrCanceled(e);
     }
 
     readFrames(c, &r, &recv) catch |e| return goneOrCanceled(e);
@@ -982,7 +990,12 @@ fn refuse(c: *Conn, ev: Event) SendError!?[]const u8 {
     if (expiration(ev)) |at| if (at <= nowSeconds(c.io)) return "invalid: the event has expired";
     // NIP-70: a protected event is taken only from its own author.
     if (isProtected(ev)) {
-        const a = c.authed orelse return "auth-required: a protected event needs its author to AUTH";
+        // Without --auth-required nothing has asked the client to AUTH yet,
+        // and a protected event can never be taken without it.
+        const a = c.authed orelse {
+            try c.sendChallenge();
+            return "auth-required: a protected event needs its author to AUTH";
+        };
         if (!std.mem.eql(u8, &a, &ev.pubkey)) return "restricted: a protected event is taken only from its author";
     }
     return null;
@@ -2249,4 +2262,34 @@ test "a page's websocket is refused unless its origin is allowed" {
     defer any.stop();
     const star = try RawClient.connectWith(any.da.allocator(), any.server.port(), "Origin: https://evil.example\r\n");
     star.deinit();
+}
+
+test "a protected event on a relay that does not require AUTH gets a challenge" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 6);
+    const now = nowSeconds(testing.io);
+
+    var cl = try RawClient.connect(gpa, ts.server.port());
+    defer cl.deinit();
+    const tags: []const []const []const u8 = &.{&.{"-"}};
+    const ev = try event.create(arena, signer, kp, now, 1, tags, "mine", null);
+    try cl.send(try message.encodeEvent(arena, ev));
+    var parsed = try message.parseRelayMessage(gpa, try cl.text());
+    defer parsed.deinit();
+    const challenge = try arena.dupe(u8, parsed.value.auth.challenge);
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "false,\"auth-required:") != null);
+
+    const good = try nostr.nip42.authEvent(arena, signer, kp, ts.server.url(), challenge, now, null);
+    try cl.send(try message.encodeAuth(arena, good));
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "true") != null);
+    try cl.send(try message.encodeEvent(arena, ev));
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "true") != null);
 }
