@@ -88,6 +88,8 @@ pub const table = [_]Verb{
     fromModule("mcp", @import("cmd_mcp.zig")),
     fromModule("outbox", @import("cmd_outbox.zig")),
     fromModule("nsite", @import("cmd_nsite.zig")),
+    fromModule("nip", @import("cmd_nip.zig")),
+    fromModule("group", @import("cmd_group.zig")),
 };
 
 const name_width = 10;
