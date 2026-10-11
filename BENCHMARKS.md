@@ -2,7 +2,7 @@
 
 ## deed and nak
 
-deed 0.5.0 beats nak v0.21.2 on every benchmark run here: faster or smaller on 50 of 51 comparisons, with one tie and none slower.
+deed 0.5.0 beats nak v0.21.2 on every benchmark run here: faster or smaller on all 53 comparisons where both have the feature, with no ties.
 
 | Benchmark | deed 0.5.0 | nak v0.21.2 | deed is |
 | --- | --- | --- | --- |
@@ -32,11 +32,13 @@ deed 0.5.0 beats nak v0.21.2 on every benchmark run here: faster or smaller on 5
 | proof of work, 16 bits (best of 10, luck) | 2.52 ms | 133 ms | 53x faster |
 | proof of work, 20 bits (best of 10, luck) | 7.93 ms | 163 ms | 21x faster |
 | relay serving, accept 10,000 published events | 1397 ms | 3540 ms | 2.5x faster |
-| relay serving, query for the latest 500 of 10,000 | 16.09 ms | 16.10 ms | tie |
+| relay serving, 32 clients each asking for the latest 500 of 10,000 | 16.33 ms | 74.92 ms | 4.6x faster |
+| relay serving, 200 requests in a row on one connection | 99.05 ms | 515 ms | 5.2x faster |
+| relay serving, 32 clients, 100,000 events stored | 16.90 ms | 68.67 ms | 4.1x faster |
 | NIP-77 sync, 50,000 events with 1% missing (nak's relays) | 146 ms | 790 ms | 5.4x faster |
 | NIP-77 sync, same (deed's relays) | 108 ms | 243 ms | 2.2x faster |
 
-Proof of work is a geometric draw, so the best of 10 runs depends on luck. deed also mines on several threads and nak on one; with deed limited to one thread the 20-bit run took 61.02 ms, still faster than nak's 163 ms. The relay serving rows compare the two relays, `deed serve` and `nak serve`, with the same client (deed) driving both. `nak serve` caps a REQ at 500 events, so the query asks for 500 and both relays are bounded by the client, which is why that row is a tie. In the sync rows the first line has `nak serve` relays on both ends, and the second has `deed serve`.
+Proof of work is a geometric draw, so the best of 10 runs depends on luck. deed also mines on several threads and nak on one; with deed limited to one thread the 20-bit run took 61.02 ms, still faster than nak's 163 ms. The relay serving rows compare the two relays, `deed serve` and `nak serve`, with the same client driving both. `nak serve` caps a REQ at 500 events, so every query asks for 500. A single query is bounded by the client rather than the relay (16.09 ms against 16.10 ms), so the query rows put the relay under load instead: 32 clients at once, or 200 requests in a row on one connection. In the sync rows the first line has `nak serve` relays on both ends, and the second has `deed serve`.
 
 ### How this was measured
 

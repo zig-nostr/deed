@@ -406,7 +406,7 @@ An MCP client can run deed directly with `deed mcp`, see above. In Claude Code t
 
 ## How fast it is
 
-deed beats nak on every benchmark run: faster or smaller on 50 of 51 comparisons, with one tie and none slower. Startup is 1.9 ms against 121 ms, verifying 10,000 events is 32 ms against 1,967 ms, and memory at startup is 2 MB against 69 MB (deed 0.5.0 and nak v0.21.2, release builds on an Apple M2 Pro, relays on loopback). [BENCHMARKS.md](BENCHMARKS.md) has the full table, how each number was measured and how to reproduce the deed figures.
+deed beats nak on every benchmark run: faster or smaller on all 53 comparisons where both have the feature, with no ties. Startup is 1.9 ms against 121 ms, verifying 10,000 events is 32 ms against 1,967 ms, and memory at startup is 2 MB against 69 MB (deed 0.5.0 and nak v0.21.2, release builds on an Apple M2 Pro, relays on loopback). [BENCHMARKS.md](BENCHMARKS.md) has the full table, how each number was measured and how to reproduce the deed figures.
 
 deed covers every nak command except `fs`, and adds a local event store that `req`, `fetch` and `count` read offline, the `store` verb to manage it, and `fetch --thread` for whole conversations.
 
