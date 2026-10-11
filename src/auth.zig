@@ -110,10 +110,11 @@ pub fn resolve(gpa: std.mem.Allocator, io: std.Io, flags: Flags, verb: []const u
         remote.* = (try signing.open(gpa, io, verb, raw, err)) orelse return ResolveError.BadKey;
         return .{ .remote = remote, .owns_remote = true, .force_pre_auth = flags.force_pre_auth };
     }
-    const sk = keyinput.secretKeyForRemoteVerb(gpa, verb, raw, err) catch |e| switch (e) {
+    var sk = keyinput.secretKeyForRemoteVerb(gpa, verb, raw, err) catch |e| switch (e) {
         error.BadKey => return ResolveError.BadKey,
         else => |other| return other,
     };
+    defer std.crypto.secureZero(u8, &sk);
     var signer = keys.Signer.init();
     defer signer.deinit();
     const kp = signer.keyPairFromSecretKey(sk) catch {

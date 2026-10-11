@@ -141,7 +141,8 @@ pub fn run(
     var parsed = (try parseArgs(arena, args, out, err)) orelse return cli.exit_usage;
     if (parsed.help) return cli.exit_ok;
 
-    const config = (try resolve(arena, io, &parsed, getEnv("NOSTR_SECRET_KEY"), err)) orelse return parsed.failure;
+    var config = (try resolve(arena, io, &parsed, getEnv("NOSTR_SECRET_KEY"), err)) orelse return parsed.failure;
+    defer config.wipe();
 
     var held: ?Io.File = null;
     defer if (held) |f| f.close(io);
@@ -293,6 +294,9 @@ pub const Config = struct {
     keypair: keys.KeyPair,
     /// The key as it was given, for the persist file.
     sec_text: []const u8,
+    /// The arena copy of `sec_text` when it was read from the persist file,
+    /// so the run can zero it. Null when the text is the caller's own.
+    sec_owned: ?[]u8 = null,
     relays: []const []const u8,
     authorized_keys: []const [32]u8,
     authorized_secrets: []const []const u8,
@@ -303,11 +307,26 @@ pub const Config = struct {
     persist_dir: ?Io.Dir = null,
     persist_path: ?[]const u8 = null,
     invite: ?nip46.NostrConnectUri = null,
+
+    /// Zeroes the key and the copies of it this run owns.
+    fn wipe(self: *Config) void {
+        std.crypto.secureZero(u8, &self.keypair.secret_key);
+        if (self.sec_owned) |b| std.crypto.secureZero(u8, b);
+    }
 };
 
 /// Merges the command line with the environment and the persist file. Null
 /// after printing why it could not, with `p.failure` set to the exit code.
 fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, err: *Io.Writer) !?Config {
+    var session = keyinput.terminalSession();
+    defer session.deinit();
+    return resolveWith(arena, io, p, env_sec, err, &session);
+}
+
+/// `resolve` with the password source passed in. Both ncryptsecs it may open
+/// (the one given and the one the persist file keeps) are read through it, so
+/// a run asks for the password once.
+fn resolveWith(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, err: *Io.Writer, source: anytype) !?Config {
     var stored = Stored{};
     var persist_path: ?[]const u8 = null;
     if (p.persist) |raw| {
@@ -338,23 +357,28 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
     };
     var signer = keys.Signer.init();
     defer signer.deinit();
-    const sk = keyinput.secretKeyForVerb(arena, "bunker", sec_text, err) catch |e| switch (e) {
+    var sk = keyinput.secretKeyOrSay(arena, "bunker", sec_text, source, err) catch |e| switch (e) {
         error.BadKey => {
             p.failure = cli.exit_fail;
             return null;
         },
         else => return e,
     };
-    const keypair = signer.keyPairFromSecretKey(sk) catch {
+    defer std.crypto.secureZero(u8, &sk);
+    var keypair = signer.keyPairFromSecretKey(sk) catch {
         p.failure = cli.exit_fail;
         try err.writeAll("deed bunker: not a valid secret key\n");
         return null;
     };
+    // Whatever way out is not the Config, the key pair is wiped.
+    var handed_over = false;
+    defer if (!handed_over) std.crypto.secureZero(u8, &keypair.secret_key);
     if (given != null) {
-        if (stored.sec) |kept| {
+        // The same text is the same key: nothing to open to know it.
+        if (stored.sec) |kept| if (!std.mem.eql(u8, std.mem.trim(u8, kept, " \t\r\n"), std.mem.trim(u8, sec_text, " \t\r\n"))) {
             // A file remembers which clients may use ONE key. Pointing it at
             // another would hand that key to clients nobody authorized for it.
-            const kept_sk = keyinput.secretKey(arena, kept) catch |e| {
+            var kept_sk = keyinput.secretKeyWith(arena, kept, source) catch |e| {
                 p.failure = cli.exit_fail;
                 try err.print("deed bunker: {s} {s}\n", .{ persist_path.?, switch (e) {
                     keyinput.Error.WrongPassword => "holds an ncryptsec that password does not open",
@@ -363,12 +387,13 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
                 } });
                 return null;
             };
+            defer std.crypto.secureZero(u8, &kept_sk);
             if (!std.mem.eql(u8, &kept_sk, &sk)) {
                 p.failure = cli.exit_fail;
                 try err.print("deed bunker: {s} belongs to a different key; give it the same --sec, or use another file\n", .{persist_path.?});
                 return null;
             }
-        }
+        };
     }
 
     // Relays given on the command line replace the remembered ones.
@@ -431,9 +456,11 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
     // No URI secret when only named keys are to be served, or when this run is
     // answering one client's invitation.
     const keys_only = p.authorized_keys.items.len > 0 and secrets.items.len == 0;
+    handed_over = true;
     return .{
         .keypair = keypair,
         .sec_text = sec_text,
+        .sec_owned = if (given == null and stored.sec != null) @constCast(stored.sec.?) else null,
         .relays = relays.items,
         .authorized_keys = authorized.items,
         .authorized_secrets = secrets.items,
@@ -493,6 +520,9 @@ fn loadStored(arena: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8) L
         error.StreamTooLong => return error.NotAPersistFile,
         else => return error.Unreadable,
     };
+    // The file holds the key: the parse copies what it keeps, so the raw
+    // text is zeroed on every way out.
+    defer std.crypto.secureZero(u8, @constCast(text));
     if (builtin.os.tag != .windows) {
         const st = dir.statFile(io, path, .{}) catch return error.Unreadable;
         if (st.permissions.toMode() & 0o077 != 0) return error.ReadableByOthers;
@@ -1695,4 +1725,59 @@ test "help is printed and nothing starts" {
     defer err.deinit();
     try testing.expectEqual(cli.exit_ok, try run(testing.allocator, testing.io, &.{"--help"}, &out.writer, &err.writer));
     try testing.expect(std.mem.indexOf(u8, out.written(), "deed bunker") != null);
+}
+
+const CountingPassword = struct {
+    n: *usize,
+    pub fn get(self: CountingPassword, out: *@import("password.zig").Secret) @import("password.zig").Error!void {
+        self.n.* += 1;
+        return @import("password.zig").fromText(out, "hunter2");
+    }
+};
+
+test "--sec and a persist file that both hold an ncryptsec ask for the password once" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = [_]u8{0x21} ** 32;
+    // Two encryptions of one key: different salts, so different text.
+    const a = try nostr.nip49.encrypt(arena, io, raw, "hunter2", 4, .unknown);
+    const b = try nostr.nip49.encrypt(arena, io, raw, "hunter2", 4, .unknown);
+    try testing.expect(!std.mem.eql(u8, a, b));
+    try saveStored(arena, io, tmp.dir, "b.json", .{ .sec = b });
+
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root);
+    const path = try std.fmt.allocPrint(arena, "{s}/b.json", .{root[0..root_len]});
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    var p = (try parseArgs(arena, &.{ "--sec", a, "--persist", path, "wss://relay.example" }, &out.writer, &err.writer)) orelse return error.TestUnexpectedResult;
+
+    var asked: usize = 0;
+    var session = keyinput.SessionPassword(CountingPassword).init(.{ .n = &asked });
+    defer session.deinit();
+    var config = (try resolveWith(arena, io, &p, null, &err.writer, &session)) orelse {
+        std.debug.print("{s}\n", .{err.written()});
+        return error.TestUnexpectedResult;
+    };
+    defer config.wipe();
+    try testing.expectEqual(@as(usize, 1), asked);
+}
+
+test "a config wipes its key and the stored copy of it" {
+    var stored = "nsec1example".*;
+    var config = std.mem.zeroes(Config);
+    config.keypair.secret_key = [_]u8{0x55} ** 32;
+    config.sec_owned = &stored;
+    config.wipe();
+    try testing.expectEqual([_]u8{0} ** 32, config.keypair.secret_key);
+    try testing.expectEqual([_]u8{0} ** stored.len, stored);
 }
