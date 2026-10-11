@@ -1636,3 +1636,34 @@ test "the auth flags are checked before anything is dialled" {
     try std.testing.expectEqual(cli.exit_usage, (try runPublish(arena, &.{ "ws://127.0.0.1:1", "--sec" })).code);
     try std.testing.expectEqual(cli.exit_fail, (try runPublish(arena, &.{ "--auth", "--sec", "not-a-key", "ws://127.0.0.1:1", "{}" })).code);
 }
+
+test "an event is published through a CONNECT proxy and a SOCKS5 proxy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const proxy = @import("proxy.zig");
+
+    for ([_]testrelay.Tunnel.Kind{ .connect, .socks5 }, [_][]const u8{ "http://", "socks5h://" }) |kind, scheme| {
+        var yes: testrelay.Relay = undefined;
+        try yes.start(io, .accept);
+        defer yes.stop(io);
+        var tun: testrelay.Tunnel = undefined;
+        try tun.start(io, kind, 1);
+        defer tun.stop(io);
+
+        const saved = proxy.global;
+        defer proxy.global = saved;
+        var pb: [64]u8 = undefined;
+        proxy.global = .{ .explicit = .{ .url = try tun.url(&pb, scheme), .name = "--proxy", .explicit = true } };
+
+        const url = try std.fmt.allocPrint(arena, "ws://relay.example.test:{d}", .{yes.port()});
+        const ev = try signedEvent(arena, io, "hello through a proxy");
+        const id = try idOf(arena, ev);
+        const r = try runPublish(arena, &.{ url, ev });
+        try std.testing.expectEqual(cli.exit_ok, r.code);
+        try std.testing.expect(contains(r.err, try std.fmt.allocPrint(arena, "deed publish: {s}: {s}: accepted\n", .{ id, url })));
+        try std.testing.expectEqual(@as(usize, 1), yes.events.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), tun.opened.load(.monotonic));
+    }
+}

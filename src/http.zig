@@ -513,7 +513,7 @@ fn resolveTarget(io: Io, host: []const u8, port: u16, o: Options, out: *[16]Io.n
 }
 
 /// A TCP connection to the proxy itself, trying each of its addresses.
-fn connectProxy(io: Io, p: proxy.Proxy) Error!Io.net.Stream {
+pub fn connectProxy(io: Io, p: proxy.Proxy) Error!Io.net.Stream {
     var addrs: [16]Io.net.IpAddress = undefined;
     var n: usize = 0;
     if (Io.net.IpAddress.parse(p.host, p.port)) |a| {
@@ -629,7 +629,9 @@ fn pinConnection(client: *http.Client, io: Io, uri: Uri, o: Options) Error!*http
     return last;
 }
 
-fn lookupAddresses(io: Io, host: []const u8, port: u16, out: *[16]Io.net.IpAddress) Error!usize {
+/// Up to 16 addresses of `host`, each with `port`. Fails with `HostNotFound`
+/// when there are none, and with `Canceled` when cancelled.
+pub fn lookupAddresses(io: Io, host: []const u8, port: u16, out: *[16]Io.net.IpAddress) Error!usize {
     const name = Io.net.HostName.init(host) catch return error.InvalidUrl;
     var qbuf: [32]Io.net.HostName.LookupResult = undefined;
     var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&qbuf);
@@ -678,7 +680,7 @@ fn prepareTls(client: *http.Client, io: Io) Error!void {
 
 /// A literal the connect path parses back to the same address, without the
 /// port and without brackets.
-fn addressText(buf: *[48]u8, a: Io.net.IpAddress) []const u8 {
+pub fn addressText(buf: *[48]u8, a: Io.net.IpAddress) []const u8 {
     switch (a) {
         .ip4 => |v| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3] }) catch unreachable,
         .ip6 => |v| {
