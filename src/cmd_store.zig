@@ -38,6 +38,8 @@ pub const usage =
     \\         per line on stdout. Takes the filter options of `deed req`:
     \\         -k, -a, -i, -e, -p, -d, -h, -t, -T, --search, -l, -s and -u. As in
     \\         `deed req`, -h <value> is the h tag; a bare -h at the end is help.
+    \\         The long forms --kind, --author, --id, --tag, --limit, --since
+    \\         and --until work too.
     \\import   Reads one JSON event per line on stdin and stores them. Each
     \\         event is verified first; a line that is not an event, or whose
     \\         id or signature is wrong, is reported on stderr with its line
