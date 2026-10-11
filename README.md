@@ -406,7 +406,11 @@ An MCP client can run deed directly with `deed mcp`, see above. In Claude Code t
 
 ## How fast it is
 
-A one-shot command runs in about 2.3 ms and under 2 MB of memory. deed signs and verifies about 31,000 events a second each, stores 100,000 events from a relay at about 17,000 a second, and answers a lookup from that store in about 3 ms, start to finish. The binaries are 2.3 to 2.7 MB. [BENCHMARKS.md](BENCHMARKS.md) has the full set and how to reproduce every number.
+deed beats nak on every benchmark run: faster or smaller on 50 of 51 comparisons, with one tie and none slower. Startup is 1.9 ms against 121 ms, verifying 10,000 events is 32 ms against 1,967 ms, and memory at startup is 2 MB against 69 MB (deed 0.5.0 and nak v0.21.2, release builds on an Apple M2 Pro, relays on loopback). [BENCHMARKS.md](BENCHMARKS.md) has the full table, how each number was measured and how to reproduce the deed figures.
+
+deed covers every nak command except `fs`, and adds a local event store that `req`, `fetch` and `count` read offline, the `store` verb to manage it, and `fetch --thread` for whole conversations.
+
+A one-shot command runs in about 2 ms and 2 MB of memory. deed signs and verifies about 310,000 events a second each, stores 100,000 events from a relay at about 17,000 a second, and answers a lookup from that store in about 3 ms, start to finish. The macOS binary is 5.4 MB.
 
 ## Build
 
