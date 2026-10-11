@@ -889,7 +889,7 @@ fn handleText(c: *Conn, text: []const u8) SendError!void {
     defer if (!kept) parsed.deinit();
     switch (parsed.value) {
         .event => |ev| kept = try onEvent(c, parsed, ev),
-        .req => |q| kept = try onReq(c, parsed, q.subscription_id, q.filters),
+        .req => |q| try onReq(c, parsed, q.subscription_id, q.filters, &kept),
         .close => |q| onClose(c, q.subscription_id),
         .count => |q| try onCount(c, q.subscription_id, q.filters),
         .auth => |ev| try onAuth(c, ev),
@@ -972,22 +972,23 @@ fn refuse(c: *Conn, ev: Event) SendError!?[]const u8 {
 
 /// Registers the subscription, then sends what is stored. In that order, so
 /// an event stored while the query runs is either in the results or fanned
-/// out to the subscription, never neither. Returns true when the
-/// subscription keeps `parsed`.
-fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filters: []const Filter) SendError!bool {
+/// out to the subscription, never neither. Sets `kept` as soon as the
+/// subscription owns `parsed`, so an error after that point leaves it to
+/// the subscription instead of freeing it under the fan-out's feet.
+fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filters: []const Filter, kept: *bool) SendError!void {
     const limits = c.server.opts.limits;
     if (c.needsAuth()) {
         try c.closed(sub_id, "auth-required: this relay answers only after AUTH");
-        return false;
+        return;
     }
     if (filters.len == 0) {
         try c.closed(sub_id, "invalid: a REQ needs at least one filter");
-        return false;
+        return;
     }
     if (filters.len > limits.max_filters) {
         var buf: [96]u8 = undefined;
         try c.closed(sub_id, std.fmt.bufPrint(&buf, "invalid: too many filters, at most {d}", .{limits.max_filters}) catch unreachable);
-        return false;
+        return;
     }
 
     var old: ?Sub = null;
@@ -1001,9 +1002,13 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
             defer c.sub_mu.lockUncancelable(c.io);
             var buf: [96]u8 = undefined;
             try c.closed(sub_id, std.fmt.bufPrint(&buf, "blocked: too many subscriptions, at most {d}", .{limits.max_subscriptions}) catch unreachable);
-            return false;
+            return;
         }
-        try c.subs.put(c.gpa, sub_id, .{ .parsed = parsed, .filters = filters });
+        c.subs.put(c.gpa, sub_id, .{ .parsed = parsed, .filters = filters }) catch |e| {
+            if (old) |*o| o.parsed.deinit();
+            return e;
+        };
+        kept.* = true;
     }
     if (old) |*o| o.parsed.deinit();
 
@@ -1018,7 +1023,7 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
             c.server.log("a query failed: {s}", .{@errorName(e)});
             try c.closed(sub_id, "error: the store could not answer");
             dropSub(c, sub_id);
-            return true;
+            return;
         };
         defer res.deinit();
         for (res.events) |ev| {
@@ -1033,7 +1038,6 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
         }
     }
     try c.sendOwned(try message.encodeEose(c.gpa, sub_id));
-    return true;
 }
 
 /// Removes a subscription that `onReq` registered but could not answer. The
@@ -2157,4 +2161,37 @@ test "stopping with events still queued does not hang" {
     // Stop while the relay is still working through them, unread.
     ts.stop();
     cl.deinit();
+}
+
+test "a REQ cut off mid-answer does not free a subscription that is still registered" {
+    var ts: TestServer = undefined;
+    try ts.start(.{ .limits = .{ .queue_hard = 256 * 1024, .queue_soft = 64 * 1024 } });
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 9);
+    const big = try arena.alloc(u8, 60 * 1024);
+    @memset(big, 'x');
+    var i: usize = 0;
+    while (i < 150) : (i += 1) {
+        _ = try ts.ts.store.ingest(testing.allocator, try makeEvent(arena, signer, kp, 1, 1_600_000_000 + @as(i64, @intCast(i)), big), .{});
+    }
+    var sleeper = try RawClient.connect(gpa, ts.server.port());
+    defer sleeper.deinit();
+    try sleeper.send("[\"REQ\",\"all\",{\"kinds\":[1]}]");
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+
+    var publisher = try RawClient.connect(gpa, ts.server.port());
+    defer publisher.deinit();
+    i = 0;
+    while (i < 40) : (i += 1) {
+        try publisher.send(try message.encodeEvent(arena, try makeEvent(arena, signer, kp, 1, 1_700_000_000 + @as(i64, @intCast(i)), big)));
+        _ = try publisher.text();
+    }
+    try testing.expect(ts.server.dropped.load(.monotonic) > 0);
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
 }
