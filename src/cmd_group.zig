@@ -28,6 +28,7 @@ const event = nostr.event;
 const filter = nostr.filter;
 const hex = nostr.hex;
 const nip19 = nostr.nip19;
+const nip11 = nostr.nip11;
 
 /// Shown beside the name in `deed help`.
 pub const summary = "read and write NIP-29 groups: info, chat, join, moderation";
@@ -65,6 +66,14 @@ pub const usage =
     \\with the roles after the key. With --events, those three print the signed
     \\events the relay sent instead. chat prints the newest kind 9 messages,
     \\oldest first, as one event per line.
+    \\
+    \\The group's state (kinds 39000, 39001 and 39002) counts only when the
+    \\relay's own key signed it. That key is the `self` field of the relay's
+    \\NIP-11 document, or its `pubkey` field when `self` is absent; events from
+    \\any other key are dropped. A relay that states neither, or whose document
+    \\cannot be read, is still read, with a warning, and info then carries
+    \\"verified":false. Text the relay supplies is printed with control
+    \\characters escaped.
     \\
     \\Everything that writes is signed with --sec (or $NOSTR_SECRET_KEY), offered
     \\to the group's relay, and printed only if the relay accepted it. Every
@@ -416,6 +425,63 @@ fn fetch(
     return list;
 }
 
+/// Where the relay says its own key is: `self` in its NIP-11 document, or
+/// `pubkey` when `self` is missing. Null when it states neither, or the
+/// document cannot be had or read. Only a cancel is an error.
+fn relayKey(gpa: std.mem.Allocator, io: Io, relay: []const u8, timeout_ms: i64) error{ Canceled, OutOfMemory }!?[32]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const url = if (info_url_override) |u| u else nip11.httpUrl(arena, relay) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    var res = http.fetch(gpa, io, url, .{
+        .headers = &.{.{ .name = nip11.accept_header_name, .value = nip11.accept_header_value }},
+        .timeout_ms = @intCast(@max(timeout_ms, 1)),
+        .max_bytes = 1024 * 1024,
+        .allow_http = std.mem.startsWith(u8, relay, "ws://"),
+    }) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer res.deinit(gpa);
+    if (!res.ok()) return null;
+    var info = nip11.parse(gpa, res.body) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidJson => return null,
+    };
+    defer info.deinit();
+    const stated = info.self orelse info.pubkey orelse return null;
+    var key: [32]u8 = undefined;
+    if (stated.len != 64) return null;
+    _ = std.fmt.hexToBytes(&key, stated) catch return null;
+    return key;
+}
+
+/// Test seam: where the NIP-11 document is fetched from instead of beside
+/// the relay's own address.
+var info_url_override: ?[]const u8 = null;
+
+/// Drops, and frees, the events not signed by `key`. Returns how many.
+fn keepSignedBy(list: *std.ArrayList(event.Parsed), key: [32]u8) usize {
+    var dropped: usize = 0;
+    var w: usize = 0;
+    for (list.items) |*p| {
+        if (std.mem.eql(u8, &p.value.pubkey, &key)) {
+            list.items[w] = p.*;
+            w += 1;
+        } else {
+            p.deinit();
+            dropped += 1;
+        }
+    }
+    list.shrinkRetainingCapacity(w);
+    return dropped;
+}
+
 fn freeAll(gpa: std.mem.Allocator, list: *std.ArrayList(event.Parsed)) void {
     for (list.items) |*p| p.deinit();
     list.deinit(gpa);
@@ -464,6 +530,15 @@ fn readState(
     var list = (try fetch(gpa, io, group.relay, .{ .kinds = kinds, .tags = &tag_filters }, opts.timeout_ms, auth_opts, err)) orelse return cli.exit_fail;
     defer freeAll(gpa, &list);
 
+    var verified = false;
+    if (try relayKey(gpa, io, group.relay, opts.timeout_ms)) |key| {
+        verified = true;
+        const dropped = keepSignedBy(&list, key);
+        if (dropped > 0) try err.print("deed group: {s}: ignored {d} event(s) not signed by the relay's own key\n", .{ group.relay, dropped });
+    } else {
+        try err.print("deed group: {s} does not state its own key in its NIP-11 document (or it could not be read); the group state is unverified\n", .{group.relay});
+    }
+
     const meta = newest(list.items, kind_metadata);
     const admins = newest(list.items, kind_admins);
     const members = newest(list.items, kind_members);
@@ -499,18 +574,24 @@ fn readState(
     switch (cmd) {
         .members => {
             for (members.?.tags) |t| {
-                if (t.len >= 2 and std.mem.eql(u8, t[0], "p")) try out.print("{s}\n", .{t[1]});
+                if (t.len >= 2 and std.mem.eql(u8, t[0], "p")) {
+                    try relayset.writeEscaped(out, t[1]);
+                    try out.writeByte('\n');
+                }
             }
         },
         .admins => {
             for (admins.?.tags) |t| {
                 if (t.len < 2 or !std.mem.eql(u8, t[0], "p")) continue;
-                try out.writeAll(t[1]);
-                for (t[2..]) |role| try out.print(" {s}", .{role});
+                try relayset.writeEscaped(out, t[1]);
+                for (t[2..]) |role| {
+                    try out.writeByte(' ');
+                    try relayset.writeEscaped(out, role);
+                }
                 try out.writeByte('\n');
             }
         },
-        else => try writeInfo(arena, out, group, meta.?, admins, members),
+        else => try writeInfo(arena, out, group, meta.?, admins, members, verified),
     }
     return cli.exit_ok;
 }
@@ -524,6 +605,7 @@ fn writeInfo(
     meta: event.Event,
     admins: ?event.Event,
     members: ?event.Event,
+    verified: bool,
 ) !void {
     var admin_list: std.ArrayList(Admin) = .empty;
     if (admins) |ev| for (ev.tags) |t| {
@@ -545,6 +627,7 @@ fn writeInfo(
         .hidden = hasFlagTag(meta, "hidden"),
         .admins = admin_list.items,
         .members = member_list.items,
+        .verified = verified,
     };
     const text = try std.json.Stringify.valueAlloc(arena, info, .{});
     try out.print("{s}\n", .{text});
@@ -728,7 +811,10 @@ fn publishOne(
         // Wait for the relay's challenge before offering anything.
         const wait = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(@min(timeout_ms, 3_000)), .clock = .awake });
         while (true) {
-            var msg = (conn.receiveTimeout(.{ .deadline = wait }) catch break) orelse break;
+            var msg = (conn.receiveTimeout(.{ .deadline = wait }) catch |e| {
+                if (isCancel(e)) return error.Canceled;
+                break;
+            }) orelse break;
             defer msg.deinit();
             switch (msg.value) {
                 .auth => |a| {
@@ -737,7 +823,10 @@ fn publishOne(
                     authed = false;
                     // Its verdict on us comes next.
                     while (true) {
-                        var reply = (conn.receiveTimeout(.{ .deadline = wait }) catch break) orelse break;
+                        var reply = (conn.receiveTimeout(.{ .deadline = wait }) catch |e| {
+                            if (isCancel(e)) return error.Canceled;
+                            break;
+                        }) orelse break;
                         defer reply.deinit();
                         if (reply.value == .ok and std.mem.eql(u8, &reply.value.ok.event_id, &auth_id.?)) {
                             authed = reply.value.ok.accepted;
@@ -818,6 +907,11 @@ fn publishOne(
             else => {},
         }
     }
+}
+
+/// A cancel is never a reason to stop waiting quietly: it goes up.
+fn isCancel(e: anyerror) bool {
+    return e == error.Canceled;
 }
 
 fn resend(conn: *nostr.relay.Relay, ev: event.Event, timeout: Io.Timeout) !void {
@@ -948,6 +1042,11 @@ const Harness = struct {
     url_buf: [40]u8 = undefined,
     url: []const u8 = "",
     address: []const u8 = "",
+    /// The NIP-11 document the relay serves. Null: one that names the relay's
+    /// own key in `self`.
+    doc: ?[]const u8 = null,
+    info: http.TestServer = undefined,
+    info_url_buf: [64]u8 = undefined,
 
     fn start(self: *Harness, io: Io, script: *Script) !void {
         return self.startFor(io, script, 1);
@@ -961,9 +1060,22 @@ const Harness = struct {
         self.url = try testrelay.url(&self.url_buf, self.relay.port());
         script.want_url = self.url;
         self.address = try std.fmt.allocPrint(self.arena_state.allocator(), "{s}'pizza", .{self.url});
+
+        const body = self.doc orelse blk: {
+            var signer = try nostr.keys.Signer.initRandomized(io);
+            defer signer.deinit();
+            const kp = try signer.keyPairFromSecretKey(relay_secret);
+            const pk = try hex.encode(self.arena_state.allocator(), &kp.public_key);
+            break :blk try std.fmt.allocPrint(self.arena_state.allocator(), "{{\"name\":\"t\",\"self\":\"{s}\"}}", .{pk});
+        };
+        const routes = try self.arena_state.allocator().dupe(http.TestServer.Route, &.{.{ .path = "/", .body = body }});
+        try self.info.start(io, routes, 8);
+        info_url_override = try self.info.url(&self.info_url_buf, "/");
     }
 
     fn finish(self: *Harness, io: Io) void {
+        info_url_override = null;
+        self.info.stop(io);
         self.relay.stop(io);
         self.arena_state.deinit();
         if (self.da.deinit() == .leak) @panic("the group verb leaked");
@@ -1274,4 +1386,76 @@ test "usage errors" {
     try std.testing.expectEqual(cli.exit_usage, try run(gpa, io, &.{ "info", "nonsense" }, &out.writer, &err.writer));
     try std.testing.expectEqual(cli.exit_usage, try run(gpa, io, &.{ "info", "r.example'x", "--send", "no" }, &out.writer, &err.writer));
     try std.testing.expectEqual(cli.exit_usage, try run(gpa, io, &.{ "put-user", "r.example'x", "--sec", "3131313131313131313131313131313131313131313131313131313131313131" }, &out.writer, &err.writer));
+}
+
+test "state signed by any key but the relay's own is dropped" {
+    const io = std.testing.io;
+    var h: Harness = .{};
+    const arena = h.arena_state.allocator();
+    var script: Script = .{};
+    const good = try serveGroupState(arena, io);
+    const forged = try signedBy(arena, io, test_secret, 1_800_000_000, kind_metadata, &.{
+        try mk(arena, &.{ "d", "pizza" }),
+        try mk(arena, &.{ "name", "Forged" }),
+    }, "");
+    const served = try arena.alloc([]const u8, good.len + 1);
+    @memcpy(served[0..good.len], good);
+    served[good.len] = forged;
+    script.serve = served;
+    try h.startFor(io, &script, 1);
+    defer h.finish(io);
+    const gpa = h.da.allocator();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    try std.testing.expectEqual(cli.exit_ok, try run(gpa, io, &.{ "info", h.address, "--timeout", "3000" }, &out.writer, &err.writer));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Pizza Lovers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Forged") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"verified\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "ignored 1 event") != null);
+}
+
+test "a relay that states no key of its own is read with a warning and marked unverified" {
+    const io = std.testing.io;
+    var h: Harness = .{ .doc = "{\"name\":\"anon\"}" };
+    var script: Script = .{};
+    script.serve = try serveGroupState(h.arena_state.allocator(), io);
+    try h.startFor(io, &script, 1);
+    defer h.finish(io);
+    const gpa = h.da.allocator();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    try std.testing.expectEqual(cli.exit_ok, try run(gpa, io, &.{ "info", h.address, "--timeout", "3000" }, &out.writer, &err.writer));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"verified\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "unverified") != null);
+}
+
+test "control characters in what the relay supplies are escaped when printed" {
+    const io = std.testing.io;
+    var h: Harness = .{};
+    const arena = h.arena_state.allocator();
+    var script: Script = .{};
+    const served = try arena.alloc([]const u8, 1);
+    served[0] = try signedBy(arena, io, relay_secret, 1_700_000_100, kind_admins, &.{
+        try mk(arena, &.{ "d", "pizza" }),
+        try mk(arena, &.{ "p", "ab\x1b[2Jcd", "ro\x07le" }),
+    }, "");
+    script.serve = served;
+    try h.startFor(io, &script, 1);
+    defer h.finish(io);
+    const gpa = h.da.allocator();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    try std.testing.expectEqual(cli.exit_ok, try run(gpa, io, &.{ "admins", h.address, "--timeout", "3000" }, &out.writer, &err.writer));
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), 0x07) == null);
+    try std.testing.expectEqualStrings("ab\\x1b[2Jcd ro\\x07le\n", out.written());
 }
