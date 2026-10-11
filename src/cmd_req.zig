@@ -10,6 +10,7 @@ const nostr = @import("nostr");
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const filterflags = @import("filterflags.zig");
+const outbox = @import("outbox.zig");
 const relayset = @import("relayset.zig");
 const storepath = @import("storepath.zig");
 
@@ -98,6 +99,11 @@ pub const Request = struct {
     auth: auth.Flags = .{},
     /// A lone `-` was given: read filters from stdin.
     stdin: bool = false,
+    /// Ask each author's own write relays.
+    outbox: bool = false,
+    outbox_per_pubkey: u32 = 3,
+    /// Relays to find relay lists through, for `outbox`.
+    bootstrap: []const []const u8 = &.{},
 };
 
 /// How long a run waits on relays still answering, once they are reached.
@@ -148,6 +154,7 @@ pub fn parse(
     flags: *filterflags.Flags,
     relays: *Collected([]const u8),
     jsons: *Collected([]const u8),
+    bootstrap: *Collected([]const u8),
     err: *std.Io.Writer,
 ) !?Request {
     var bare = false;
@@ -160,6 +167,8 @@ pub fn parse(
     var timeout_ms: i64 = default_timeout_ms;
     var auth_flags: auth.Flags = .{};
     var from_stdin = false;
+    var use_outbox = false;
+    var per_pubkey: u32 = 3;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -199,6 +208,10 @@ pub fn parse(
             paginate = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--outbox")) {
+            use_outbox = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "{")) {
             if (!jsons.push(a)) {
                 try err.writeAll("deed req: too many filters\n");
@@ -215,7 +228,7 @@ pub fn parse(
         }
 
         const takes_value = filterflags.isFilterFlag(a) or
-            cli.isOneOf(a, &.{ "--store", "--timeout", "--paginate-interval" });
+            cli.isOneOf(a, &.{ "--store", "--timeout", "--paginate-interval", "-n", "--outbox-relays-per-pubkey", "-r", "--relay" });
         if (!takes_value) {
             try err.print("deed req: unknown option '{s}'\n", .{a});
             return ParseError.Usage;
@@ -236,6 +249,17 @@ pub fn parse(
                 try err.print("deed req: '{s}' is not a number of milliseconds\n", .{v});
                 return ParseError.BadValue;
             };
+        } else if (cli.isOneOf(a, &.{ "-n", "--outbox-relays-per-pubkey" })) {
+            per_pubkey = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (per_pubkey == 0) {
+                try err.print("deed req: '{s}' is not a number of relays, at least 1\n", .{v});
+                return ParseError.BadValue;
+            }
+        } else if (cli.isOneOf(a, &.{ "-r", "--relay" })) {
+            if (!bootstrap.push(v)) {
+                try err.writeAll("deed req: too many --relay values\n");
+                return ParseError.Usage;
+            }
         } else if (std.mem.eql(u8, a, "--paginate-interval")) {
             paginate_interval_ms = parseInterval(v) orelse {
                 try err.print("deed req: '{s}' is not a duration like 500, 500ms or 2s\n", .{v});
@@ -253,6 +277,11 @@ pub fn parse(
         return ParseError.Usage;
     }
 
+    if (use_outbox and (stream or local or paginate)) {
+        try err.writeAll("deed req: --outbox cannot be combined with --stream, --paginate or --local\n");
+        return ParseError.Usage;
+    }
+
     return .{
         .filter = flags.finish(),
         .relays = relays.slice() orelse &.{},
@@ -266,6 +295,9 @@ pub fn parse(
         .paginate_interval_ms = paginate_interval_ms,
         .auth = auth_flags,
         .stdin = from_stdin,
+        .outbox = use_outbox,
+        .outbox_per_pubkey = per_pubkey,
+        .bootstrap = bootstrap.slice() orelse &.{},
     };
 }
 
@@ -407,8 +439,9 @@ pub fn runWith(
     var flags: filterflags.Flags = .{};
     var relays: Collected([]const u8) = .{};
     var jsons: Collected([]const u8) = .{};
+    var bootstrap: Collected([]const u8) = .{};
 
-    const req = parse(gpa, args, &flags, &relays, &jsons, err) catch |e| {
+    const req = parse(gpa, args, &flags, &relays, &jsons, &bootstrap, err) catch |e| {
         return switch (e) {
             ParseError.Usage => cli.exit_usage,
             ParseError.BadValue => cli.exit_fail,
@@ -501,7 +534,7 @@ pub fn runWith(
 
     // No relay named: say what would be sent, and stop. The filter is the thing
     // worth seeing before it is asked of anybody.
-    if (req.relays.len == 0) {
+    if (req.relays.len == 0 and !req.outbox) {
         if (req.bare) {
             for (filters.items) |f| {
                 var list: std.ArrayList(u8) = .empty;
@@ -530,6 +563,15 @@ pub fn runWith(
     }
     const store_ptr: ?*nostr.store.Store = if (store) |*st| st else null;
 
+    if (req.outbox) {
+        if (try outboxRun(gpa, io, req, auth_opts, filters.items, store_ptr, out, err)) |code| return code;
+    }
+
+    if (req.relays.len == 0) {
+        try err.writeAll("deed req: no relay to ask: name one\n");
+        return cli.exit_usage;
+    }
+
     if (req.paginate or req.ids_only) {
         return pages(gpa, io, req, auth_opts, filters.items, store_ptr, out, err);
     }
@@ -550,6 +592,249 @@ pub fn runWith(
         return cli.exit_fail;
     }
     return cli.exit_ok;
+}
+
+/// One relay, and the part of the question it is asked.
+const Task = struct {
+    urls: []const []const u8,
+    filters: []const filter.Filter,
+    out: std.Io.Writer.Allocating,
+    err: std.Io.Writer.Allocating,
+    outcome: relayset.Outcome = .{},
+    failed: bool = false,
+};
+
+fn runTask(gpa: std.mem.Allocator, io: std.Io, t: *Task, deadline_ms: i64, auth_opts: ?auth.Options) void {
+    t.outcome = relayset.query(gpa, io, t.urls, t.filters, &t.out.writer, &t.err.writer, .{
+        .until_eose = true,
+        .deadline_ms = deadline_ms,
+        .auth = auth_opts,
+    }) catch {
+        t.failed = true;
+        return;
+    };
+}
+
+/// How many relays are asked at once.
+const wave_size = 16;
+
+/// Asks each author's own write relays for that author. Returns null when no
+/// filter names an author, so the caller carries on with the relays it was
+/// given.
+///
+/// Relay lists come from `lookupMany`, one request per bootstrap relay. Each
+/// relay is then asked only about the authors who write there, all relays at
+/// once in waves, and what comes back is checked by the same code a plain run
+/// uses, merged by id, stored when asked, and printed once.
+fn outboxRun(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    req: Request,
+    auth_opts: ?auth.Options,
+    filters: []const filter.Filter,
+    store: ?*nostr.store.Store,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !?u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var index = std.AutoHashMap([32]u8, usize).init(a);
+    var authors: std.ArrayList([32]u8) = .empty;
+    for (filters) |f| {
+        for (f.authors orelse continue) |pk| {
+            if (index.contains(pk)) continue;
+            try index.put(pk, authors.items.len);
+            try authors.append(a, pk);
+        }
+    }
+    if (authors.items.len == 0) return null;
+
+    var boot: std.ArrayList([]const u8) = .empty;
+    try boot.appendSlice(a, req.bootstrap);
+    try outbox.appendEnvBootstrap(a, &boot);
+    if (boot.items.len == 0) try boot.appendSlice(a, req.relays);
+    if (boot.items.len == 0) {
+        try err.writeAll("deed req: --outbox needs a relay to find relay lists through: name one (with --relay, DEED_RELAYS, or as an argument)\n");
+        return cli.exit_usage;
+    }
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    var lists = try outbox.lookupMany(gpa, io, authors.items, .{
+        .bootstrap = boot.items,
+        .store = store,
+        .timeout_ms = @min(req.timeout_ms, 10_000),
+    }, err);
+    defer lists.deinit();
+
+    // relay -> the authors who write there
+    const Group = struct { url: []const u8, member: []bool };
+    var groups: std.ArrayList(Group) = .empty;
+    var by_url: std.StringHashMap(usize) = .init(a);
+    const reached = try a.alloc(bool, authors.items.len);
+    @memset(reached, false);
+    for (authors.items, 0..) |pk, ai| {
+        const entry = lists.find(pk) orelse continue;
+        var taken: u32 = 0;
+        for (entry.relays) |r| {
+            if (!r.write) continue;
+            if (taken >= req.outbox_per_pubkey) break;
+            const url = std.mem.trimEnd(u8, r.url, "/");
+            const gop = try by_url.getOrPut(url);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = groups.items.len;
+                const member = try a.alloc(bool, authors.items.len);
+                @memset(member, false);
+                try groups.append(a, .{ .url = try a.dupe(u8, url), .member = member });
+            }
+            const g = groups.items[gop.value_ptr.*];
+            if (!g.member[ai]) {
+                g.member[ai] = true;
+                taken += 1;
+                reached[ai] = true;
+            }
+        }
+    }
+
+    var tasks: std.ArrayList(*Task) = .empty;
+    defer for (tasks.items) |t| {
+        t.out.deinit();
+        t.err.deinit();
+    };
+
+    for (groups.items) |g| {
+        const sub = try subsetFilters(a, filters, index, g.member, false);
+        if (sub.len == 0) continue;
+        const t = try a.create(Task);
+        const urls = try a.alloc([]const u8, 1);
+        urls[0] = g.url;
+        t.* = .{ .urls = urls, .filters = sub, .out = .init(gpa), .err = .init(gpa) };
+        try tasks.append(a, t);
+    }
+
+    // Authors nobody could place, and filters that name no author, go where
+    // the caller said.
+    var unplaced: usize = 0;
+    for (reached) |r| {
+        if (!r) unplaced += 1;
+    }
+    const rest = try subsetFilters(a, filters, index, reached, true);
+    if (rest.len > 0) {
+        if (req.relays.len > 0) {
+            const t = try a.create(Task);
+            t.* = .{ .urls = req.relays, .filters = rest, .out = .init(gpa), .err = .init(gpa) };
+            try tasks.append(a, t);
+        } else if (unplaced > 0) {
+            try err.print("deed req: {d} authors have no known relay and none was named, so they are not asked\n", .{unplaced});
+        }
+    }
+
+    var seen = std.AutoHashMap([32]u8, void).init(gpa);
+    defer seen.deinit();
+    var kept: std.ArrayList(nostr.event.Parsed) = .empty;
+    defer {
+        for (kept.items) |*p| p.deinit();
+        kept.deinit(gpa);
+    }
+    var relays_answered: usize = 0;
+    var relays_asked: usize = 0;
+
+    var wave: usize = 0;
+    while (wave < tasks.items.len) : (wave += wave_size) {
+        const left = req.timeout_ms - (std.Io.Timestamp.now(io, .awake).toMilliseconds() - started);
+        if (left <= 0) {
+            try err.writeAll("deed req: --timeout ran out before every relay was asked\n");
+            break;
+        }
+        const end = @min(wave + wave_size, tasks.items.len);
+        var group: std.Io.Group = .init;
+        for (tasks.items[wave..end]) |t| {
+            group.concurrent(io, runTask, .{ gpa, io, t, left, auth_opts }) catch runTask(gpa, io, t, left, auth_opts);
+        }
+        try group.await(io);
+        for (tasks.items[wave..end]) |t| {
+            relays_asked += t.urls.len;
+            relays_answered += t.outcome.dialled;
+            if (t.err.written().len > 0) try err.writeAll(t.err.written());
+            var lines = std.mem.splitScalar(u8, t.out.written(), '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var parsed = nostr.event.fromJson(gpa, line) catch continue;
+                if ((try seen.fetchPut(parsed.value.id, {})) != null) {
+                    parsed.deinit();
+                    continue;
+                }
+                try kept.append(gpa, parsed);
+            }
+        }
+    }
+
+    if (store) |st| {
+        var at: usize = 0;
+        while (at < kept.items.len) {
+            const n = @min(kept.items.len - at, 512);
+            var events: [512]nostr.event.Event = undefined;
+            var outcomes: [512]nostr.store.IngestResult = undefined;
+            for (kept.items[at .. at + n], 0..) |p, i| events[i] = p.value;
+            st.ingestBatch(gpa, events[0..n], .{}, outcomes[0..n]) catch {
+                try err.writeAll("deed req: the store could not take the events\n");
+                return cli.exit_fail;
+            };
+            at += n;
+        }
+    }
+    for (kept.items) |p| {
+        if (req.ids_only) {
+            try printId(gpa, out, p.value.id);
+            continue;
+        }
+        const json = try nostr.event.toJson(gpa, p.value);
+        defer gpa.free(json);
+        try out.print("{s}\n", .{json});
+    }
+
+    const placed = authors.items.len - unplaced;
+    try err.print("deed req: reached {d} of {d} authors through their own relays ({d} of {d} relays answered)", .{ placed, authors.items.len, relays_answered, relays_asked });
+    if (unplaced > 0) try err.print("; {d} had no known relay", .{unplaced});
+    try err.writeAll("\n");
+
+    if (relays_answered == 0) {
+        try err.writeAll("deed req: no relay answered\n");
+        return cli.exit_fail;
+    }
+    return cli.exit_ok;
+}
+
+/// The filters narrowed to the authors flagged in `member`. A filter with no
+/// authors is kept whole only when `with_authorless` (it belongs to the relays
+/// the caller named, not to anyone's own). A filter whose authors all fall
+/// outside `member` is dropped.
+fn subsetFilters(
+    a: std.mem.Allocator,
+    filters: []const filter.Filter,
+    index: std.AutoHashMap([32]u8, usize),
+    member: []const bool,
+    with_authorless: bool,
+) ![]filter.Filter {
+    var list: std.ArrayList(filter.Filter) = .empty;
+    for (filters) |f| {
+        const as = f.authors orelse {
+            if (with_authorless) try list.append(a, f);
+            continue;
+        };
+        var keep: std.ArrayList([32]u8) = .empty;
+        for (as) |pk| {
+            const i = index.get(pk) orelse continue;
+            // `rest` passes the reached flags: it wants the ones that are not.
+            if (member[i] != with_authorless) try keep.append(a, pk);
+        }
+        if (keep.items.len == 0) continue;
+        var nf = f;
+        nf.authors = keep.items;
+        try list.append(a, nf);
+    }
+    return list.items;
 }
 
 fn printId(gpa: std.mem.Allocator, out: *std.Io.Writer, id: [32]u8) !void {
@@ -1199,4 +1484,81 @@ test "--ids-only prints ids and nothing else" {
         try std.testing.expectEqual(@as(usize, 64), l.len);
         _ = try nostr.hex.decodeFixed(32, l);
     }
+}
+
+test "--outbox asks each author's own relay, and the named relay for the author with no list" {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the run leaked");
+    const gpa = da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const ka = try signer.keyPairFromSecretKey([_]u8{0x61} ** 32);
+    const kb = try signer.keyPairFromSecretKey([_]u8{0x62} ** 32);
+    const kc = try signer.keyPairFromSecretKey([_]u8{0x63} ** 32);
+
+    const ev_a = try nostr.event.toJson(arena, try nostr.event.create(arena, signer, ka, 1_700_000_100, 1, &.{}, "from a", null));
+    const ev_b = try nostr.event.toJson(arena, try nostr.event.create(arena, signer, kb, 1_700_000_200, 1, &.{}, "from b", null));
+    const ev_c = try nostr.event.toJson(arena, try nostr.event.create(arena, signer, kc, 1_700_000_300, 1, &.{}, "from c", null));
+
+    // Each home relay holds its own author's note and also, wrongly, the
+    // other's: only the first may come out of it.
+    var home_a: testrelay.Relay = undefined;
+    try home_a.start(io, .serve);
+    home_a.serving = &.{ ev_a, ev_b };
+    defer home_a.stop(io);
+    var home_b: testrelay.Relay = undefined;
+    try home_b.start(io, .serve);
+    home_b.serving = &.{ev_b};
+    defer home_b.stop(io);
+    var named: testrelay.Relay = undefined;
+    try named.start(io, .serve);
+    named.serving = &.{ev_c};
+    defer named.stop(io);
+    var ba: [40]u8 = undefined;
+    var bb: [40]u8 = undefined;
+    var bn: [40]u8 = undefined;
+    const url_a = try testrelay.url(&ba, home_a.port());
+    const url_b = try testrelay.url(&bb, home_b.port());
+    const url_n = try testrelay.url(&bn, named.port());
+
+    const list_a = try nostr.event.create(arena, signer, ka, 1_700_000_050, 10002, &.{&.{ "r", url_a, "write" }}, "", null);
+    const list_b = try nostr.event.create(arena, signer, kb, 1_700_000_050, 10002, &.{&.{ "r", url_b, "write" }}, "", null);
+    var script: outbox.Script = .{
+        .list = try nostr.event.toJson(arena, list_a),
+        .list2 = try nostr.event.toJson(arena, list_b),
+    };
+    var directory: testrelay.Relay = undefined;
+    try outbox.startScript(&directory, io, &script, 2);
+    defer directory.stop(io);
+    var bd: [40]u8 = undefined;
+    const url_d = try testrelay.url(&bd, directory.port());
+
+    const ha = try nostr.hex.encode(arena, &ka.public_key);
+    const hb = try nostr.hex.encode(arena, &kb.public_key);
+    const hc = try nostr.hex.encode(arena, &kc.public_key);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    const code = try runWith(gpa, io, &.{ "--outbox", "-k", "1", "-a", ha, "-a", hb, "-a", hc, "--relay", url_d, "--timeout", "5000", url_n }, null, &out.writer, &err.writer);
+    try std.testing.expectEqual(cli.exit_ok, code);
+    try std.testing.expectEqual(@as(usize, 3), countLines(out.written()));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "from a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "from b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "from c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "reached 2 of 3 authors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "1 had no known relay") != null);
+}
+
+test "--outbox with no relay to look through is a usage error, and cannot stream" {
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const pk = "61" ** 32;
+    const r = try runReq(&.{ "--outbox", "-a", pk, "--stream" }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_usage, r.code);
+    const r2 = try runReq(&.{ "--outbox", "-a", pk }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_usage, r2.code);
 }
