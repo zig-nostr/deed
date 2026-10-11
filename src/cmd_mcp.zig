@@ -23,7 +23,6 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const dial = @import("dial.zig");
-const kinds = @import("kinds.zig");
 const keyinput = @import("keyinput.zig");
 const cmd_post = @import("cmd_post.zig");
 const cmd_decode = @import("cmd_decode.zig");
@@ -49,7 +48,7 @@ pub const usage =
     \\deed mcp: serve deed's tools to MCP clients over stdio
     \\
     \\Usage:
-    \\  deed mcp [--store <path>] [--allow-publish [--sec <key>]]
+    \\  deed mcp [--store <path>] [--allow-local] [--allow-publish [--sec <key>]]
     \\
     \\Speaks the Model Context Protocol (JSON-RPC 2.0, one message per line)
     \\on stdin and stdout, for an MCP client to start as a subprocess. Logs go
@@ -66,6 +65,8 @@ pub const usage =
     \\                         signing key, from --sec or $NOSTR_SECRET_KEY
     \\                         (nsec1..., 64 hex characters or ncryptsec1...)
     \\      --sec <key>        the key to sign with
+    \\      --allow-local      let relay_info reach loopback and private
+    \\                         addresses, for a relay on this machine or LAN
     \\
     \\Without --allow-publish the publishing tools are not listed and cannot be
     \\called. The key is never accepted as a tool argument and never returned.
@@ -88,6 +89,8 @@ const max_notes_bytes = 4 * 1024;
 const max_line_bytes = 1 << 20;
 /// Relays one call may name.
 const max_tool_relays = 8;
+/// How deeply a tool's arguments may nest.
+const max_json_depth = 32;
 
 const default_timeout_ms: i64 = 10_000;
 const min_timeout_ms: i64 = 100;
@@ -98,12 +101,42 @@ const max_limit: i64 = 200;
 const max_content_bytes = 256 * 1024;
 const max_tags = 512;
 
+/// The kinds publish_event signs, and nothing else. A signature is a
+/// credential: some kinds act for the key rather than say something, and a
+/// relay that answers OK false has still been handed the signed event, so the
+/// list names what is safe instead of what is not.
+const publishable_kinds = [_]u16{
+    // A text note: the same thing publish_note signs.
+    1,
+    // A repost of a kind 1 note. It points at a note that already exists.
+    6,
+    // A reaction to an event.
+    7,
+    // A generic repost of an event of any other kind.
+    16,
+    // A comment (NIP-22).
+    1111,
+    // A highlight (NIP-84): a quote from a piece of content.
+    9802,
+};
+
+/// Tags whose meaning belongs to an authentication or a deletion-like event:
+/// NIP-42 AUTH (relay, challenge), NIP-62 request to vanish (relay), and
+/// NIP-98 HTTP auth (u, method, payload). Refused on every kind, so an event
+/// signed here never carries what a careless verifier would check.
+const refused_tags = [_][]const u8{ "challenge", "relay", "u", "method", "payload" };
+
+/// How far created_at may be from now, either way.
+const max_clock_skew_s: i64 = 300;
+
 pub const Config = struct {
     /// The store `store_query` reads. Null leaves the tool out.
     store_path: ?[]const u8 = null,
     /// The key that signs what the publishing tools publish. Null leaves
     /// those tools out.
     secret: ?nostr.keys.SecretKey = null,
+    /// relay_info may reach loopback and private addresses.
+    allow_local: bool = false,
 };
 
 const Handler = *const fn (s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) anyerror!bool;
@@ -185,7 +218,7 @@ const tools = [_]Tool{
     },
     .{
         .name = "relay_info",
-        .description = "Fetch relays' NIP-11 information documents.",
+        .description = "Fetch relays' NIP-11 information documents. Relays are ws:// or wss:// URLs on public addresses.",
         .schema =
         \\{"type":"object","properties":{"relays":
         ++ relays_schema ++
@@ -235,9 +268,9 @@ const tools = [_]Tool{
     },
     .{
         .name = "publish_event",
-        .description = "Sign an event with the server's key and offer it to the relays named. Returns the event and the relays that accepted it. Replaceable, addressable and deletion kinds are refused, because publishing one over data that was not read first can destroy it.",
+        .description = "Sign an event with the server's key and offer it to the relays named. Returns the event and the relays that accepted it. Only kinds 1 (note), 6 and 16 (repost), 7 (reaction), 1111 (comment) and 9802 (highlight) are signed; created_at must be within five minutes of now, and challenge, relay, u, method and payload tags are refused.",
         .schema =
-        \\{"type":"object","properties":{"kind":{"type":"integer","minimum":0,"maximum":65535},"content":{"type":"string"},"tags":{"type":"array","items":{"type":"array","items":{"type":"string"}}},"created_at":{"type":"integer"},"relays":
+        \\{"type":"object","properties":{"kind":{"type":"integer","enum":[1,6,7,16,1111,9802]},"content":{"type":"string"},"tags":{"type":"array","items":{"type":"array","items":{"type":"string"}}},"created_at":{"type":"integer","description":"unix seconds, within 300 of now; defaults to now"},"relays":
         ++ relays_schema ++
             \\,"timeout_ms":{"type":"integer","minimum":100,"maximum":30000,"default":10000}},"required":["kind","relays"]}
         ,
@@ -278,6 +311,8 @@ pub fn run(
         }
         if (std.mem.eql(u8, a, "--allow-publish")) {
             allow_publish = true;
+        } else if (std.mem.eql(u8, a, "--allow-local")) {
+            cfg.allow_local = true;
         } else if (cli.isOneOf(a, &.{ "--store", "--sec" })) {
             i += 1;
             if (i >= args.len) {
@@ -447,6 +482,11 @@ fn toolsCall(s: *Server, a: Allocator, id: Json, params: Json, out: *Io.Writer) 
     if (name_v != .string) return replyError(out, id, -32602, "Invalid params: name must be a string");
     const args: Json = params.object.get("arguments") orelse .{ .object = .empty };
     if (args != .object) return replyError(out, id, -32602, "Invalid params: arguments must be an object");
+    // Arguments are written back out as JSON for the verbs, and the writer
+    // allows 256 levels at most. A filter or an event needs a handful.
+    if (!shallow(args, max_json_depth)) {
+        return replyError(out, id, -32602, "Invalid params: arguments are nested too deeply");
+    }
 
     const tool = for (tools) |t| {
         if (listed(s.cfg, t) and std.mem.eql(u8, t.name, name_v.string)) break t;
@@ -533,6 +573,23 @@ fn failf(out: *Io.Writer.Allocating, comptime fmt: []const u8, args: anytype) !b
     return false;
 }
 
+/// True when `v` nests no deeper than `left` levels. The walk stops at the
+/// limit, so a deep value costs no more stack than a shallow one.
+fn shallow(v: Json, left: usize) bool {
+    switch (v) {
+        .array => |arr| {
+            if (left == 0) return false;
+            for (arr.items) |item| if (!shallow(item, left - 1)) return false;
+        },
+        .object => |obj| {
+            if (left == 0) return false;
+            for (obj.values()) |item| if (!shallow(item, left - 1)) return false;
+        },
+        else => {},
+    }
+    return true;
+}
+
 fn field(args: Json, name: []const u8) ?Json {
     if (args != .object) return null;
     const v = args.object.get(name) orelse return null;
@@ -561,8 +618,27 @@ fn timeoutMs(args: Json) i64 {
     return clamped(args, "timeout_ms", default_timeout_ms, min_timeout_ms, max_timeout_ms);
 }
 
+/// `n` as an argument for a verb. Never negative: a verb would read "-1" as
+/// an option, so every number a tool passes on is checked here as well as by
+/// the tool.
 fn num(a: Allocator, n: i64) ![]const u8 {
+    if (n < 0) return error.BadArgument;
     return std.fmt.allocPrint(a, "{d}", .{n});
+}
+
+const kind_range_message = "kind must be a number from 0 to 65535";
+
+/// The `kind` argument when it is a number, checked against the range of
+/// kinds. Null when absent or not a number; `error.BadArgument` when out of
+/// range.
+fn kindArg(args: Json) !?u16 {
+    const n = intArg(args, "kind") orelse {
+        // A float that is not a whole number is not a kind either.
+        if (field(args, "kind")) |v| if (v == .float) return error.BadArgument;
+        return null;
+    };
+    if (n < 0 or n > 65535) return error.BadArgument;
+    return @intCast(n);
 }
 
 /// Text that is safe to hand a verb as a positional argument: not empty, not
@@ -577,6 +653,71 @@ fn isWsUrl(s: []const u8) bool {
     if (!(std.mem.startsWith(u8, s, "wss://") or std.mem.startsWith(u8, s, "ws://"))) return false;
     if (s.len > 512) return false;
     for (s) |c| if (c <= 0x20 or c == 0x7f) return false;
+    return true;
+}
+
+/// The host of a ws:// or wss:// URL, without brackets, port or a trailing
+/// dot. Null when there is none, or when the URL carries a user name.
+fn relayHost(url: []const u8) ?[]const u8 {
+    const after = (std.mem.indexOf(u8, url, "://") orelse return null) + 3;
+    const rest = url[after..];
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return null;
+    var host = authority;
+    if (std.mem.startsWith(u8, authority, "[")) {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+        host = authority[1..close];
+    } else if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+    }
+    host = std.mem.trimEnd(u8, host, ".");
+    return if (host.len == 0) null else host;
+}
+
+/// True for a host name, or an address, that is not this machine, a private
+/// network, or link-local. A number written any way but four plain decimal
+/// parts is not public either: a resolver reads "127.1" and "2130706433" as
+/// loopback.
+fn publicHost(host: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, host, ':') != null) {
+        const ip6 = Io.net.Ip6Address.parse(host, 0) catch return false;
+        return publicIp6(ip6.bytes);
+    }
+    for ([_][]const u8{ "localhost", ".localhost", ".local", ".internal", ".home.arpa" }) |name| {
+        if (name[0] == '.') {
+            if (std.ascii.endsWithIgnoreCase(host, name)) return false;
+        } else if (std.ascii.eqlIgnoreCase(host, name)) return false;
+    }
+    const last = host[if (std.mem.lastIndexOfScalar(u8, host, '.')) |dot| dot + 1 else 0..];
+    const numeric = std.ascii.startsWithIgnoreCase(host, "0x") or
+        for (last) |c| {
+            if (!std.ascii.isDigit(c)) break false;
+        } else true;
+    if (!numeric) return true;
+    const ip4 = Io.net.Ip4Address.parse(host, 0) catch return false;
+    return publicIp4(ip4.bytes);
+}
+
+fn publicIp4(b: [4]u8) bool {
+    return !(b[0] == 0 or b[0] == 10 or b[0] == 127 or b[0] >= 224 or
+        (b[0] == 100 and b[1] & 0xc0 == 64) or
+        (b[0] == 169 and b[1] == 254) or
+        (b[0] == 172 and b[1] & 0xf0 == 16) or
+        (b[0] == 192 and b[1] == 0 and b[2] == 0) or
+        (b[0] == 192 and b[1] == 168) or
+        (b[0] == 198 and b[1] & 0xfe == 18));
+}
+
+fn publicIp6(b: [16]u8) bool {
+    // ::/96 holds :: and ::1 and the old IPv4-compatible form.
+    if (std.mem.allEqual(u8, b[0..12], 0)) return false;
+    // ::ffff:0:0/96 (IPv4-mapped) and 64:ff9b::/96 (NAT64) carry an IPv4
+    // address, which decides.
+    const mapped = std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
+    const nat64 = std.mem.eql(u8, b[0..12], &[_]u8{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
+    if (mapped or nat64) return publicIp4(b[12..16].*);
+    // Unique local fc00::/7, link-local and site-local fe80::/9, multicast.
+    if (b[0] & 0xfe == 0xfc or b[0] == 0xff or (b[0] == 0xfe and b[1] & 0x80 == 0x80)) return false;
     return true;
 }
 
@@ -635,11 +776,69 @@ const Captured = struct {
     err: []const u8,
 };
 
+/// Keeps what is written to it up to a number of lines and of bytes. Past
+/// either, a `.stop` writer fails the write, which ends the verb writing to it
+/// and closes every connection that verb holds; a `.drop` writer throws the
+/// rest away and carries on.
+const Bounded = struct {
+    a: Allocator,
+    list: std.ArrayList(u8) = .empty,
+    max_lines: usize = std.math.maxInt(usize),
+    max_bytes: usize,
+    on_full: enum { stop, drop },
+    lines: usize = 0,
+    full: bool = false,
+    writer: Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *Bounded = @alignCast(@fieldParentPtr("writer", w));
+        for (data[0 .. data.len - 1]) |d| try self.put(d);
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.put(last);
+        var n: usize = last.len * splat;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        return n;
+    }
+
+    fn put(self: *Bounded, bytes: []const u8) Io.Writer.Error!void {
+        const room = self.max_bytes -| self.list.items.len;
+        var take: usize = 0;
+        while (take < bytes.len and take < room and self.lines < self.max_lines) : (take += 1) {
+            if (bytes[take] == '\n') self.lines += 1;
+        }
+        self.list.appendSlice(self.a, bytes[0..take]) catch return error.WriteFailed;
+        if (take < bytes.len) {
+            self.full = true;
+            if (self.on_full == .stop) return error.WriteFailed;
+        }
+    }
+};
+
 fn capture(s: *Server, a: Allocator, runner: VerbFn, argv: []const []const u8) !Captured {
-    var o: Io.Writer.Allocating = .init(a);
-    var e: Io.Writer.Allocating = .init(a);
-    const code = try runner(s.gpa, s.io, argv, &o.writer, &e.writer);
-    return .{ .code = code, .out = o.written(), .err = std.mem.trim(u8, e.written(), "\n ") };
+    return captureLines(s, a, runner, argv, null);
+}
+
+/// Runs a verb, keeping at most `max_lines` lines of what it prints. A verb
+/// stopped at that limit, or at the size limit, counts as a success with a
+/// note saying where it stopped: what it printed before is good.
+fn captureLines(s: *Server, a: Allocator, runner: VerbFn, argv: []const []const u8, max_lines: ?usize) !Captured {
+    var o: Bounded = .{ .a = a, .max_bytes = 2 * max_result_bytes, .on_full = .stop };
+    if (max_lines) |n| o.max_lines = n;
+    var e: Bounded = .{ .a = a, .max_bytes = 2 * max_notes_bytes, .on_full = .drop };
+    var code = runner(s.gpa, s.io, argv, &o.writer, &e.writer) catch |err| switch (err) {
+        error.WriteFailed => if (o.full) cli.exit_ok else return err,
+        else => return err,
+    };
+    var notes = std.mem.trim(u8, e.list.items, "\n ");
+    if (o.full) {
+        code = cli.exit_ok;
+        const why = if (o.lines >= o.max_lines)
+            try std.fmt.allocPrint(a, "stopped at the limit of {d} events", .{o.lines})
+        else
+            try std.fmt.allocPrint(a, "stopped after {d} bytes", .{o.list.items.len});
+        notes = if (notes.len == 0) why else try std.mem.concat(a, u8, &.{ notes, "\n", why });
+    }
+    return .{ .code = code, .out = o.list.items, .err = notes };
 }
 
 /// Writes what a verb produced as the tool's text. Success is its stdout and
@@ -700,7 +899,8 @@ fn toolEncode(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) 
         if (!plain(v)) return fail(out, "pubkey must be 64 hex characters");
         try argv.appendSlice(a, &.{ "--pubkey", v });
     }
-    if (intArg(args, "kind")) |k| try argv.appendSlice(a, &.{ "--kind", try num(a, k) });
+    const event_kind = kindArg(args) catch return fail(out, kind_range_message);
+    if (event_kind) |k| try argv.appendSlice(a, &.{ "--kind", try num(a, k) });
     return present(a, try capture(s, a, encodeRunner, argv.items), out);
 }
 
@@ -732,9 +932,12 @@ fn toolReq(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bo
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, filter_json);
     try argv.appendSlice(a, relays);
-    try argv.appendSlice(a, &.{ "-l", try num(a, clamped(args, "limit", default_limit, 1, max_limit)) });
+    const limit = clamped(args, "limit", default_limit, 1, max_limit);
+    try argv.appendSlice(a, &.{ "-l", try num(a, limit) });
     try argv.appendSlice(a, &.{ "--timeout", try num(a, timeoutMs(args)) });
-    return present(a, try capture(s, a, cmd_req.run, argv.items), out);
+    // The limit goes in the filter, and a relay may ignore it, so it is also
+    // where collecting stops.
+    return present(a, try captureLines(s, a, cmd_req.run, argv.items, @intCast(limit)), out);
 }
 
 fn toolFetch(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
@@ -760,10 +963,15 @@ fn toolCount(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !
 }
 
 fn toolRelayInfo(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
-    const list = (stringList(a, args, "relays") catch return fail(out, "relays must be an array of strings")) orelse
-        return fail(out, "relays is required");
-    if (list.len == 0 or list.len > max_tool_relays) return failf(out, "name between 1 and {d} relays", .{max_tool_relays});
-    for (list) |r| if (!plain(r) or std.mem.indexOfScalar(u8, r, ' ') != null) return failf(out, "'{s}' is not a relay", .{r[0..@min(r.len, 100)]});
+    // The verb turns ws:// into http:// and wss:// into https:// itself, so
+    // the caller never names an HTTP URL, and with it an arbitrary endpoint.
+    const list = (try relayList(a, args, out, true)) orelse return false;
+    for (list) |r| {
+        const host = relayHost(r) orelse return failf(out, "'{s}' is not a ws:// or wss:// relay URL", .{r[0..@min(r.len, 100)]});
+        if (!s.cfg.allow_local and !publicHost(host)) {
+            return failf(out, "'{s}' is a local or private address; start the server with --allow-local to ask one", .{r[0..@min(r.len, 100)]});
+        }
+    }
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ "--timeout", try num(a, @divTrunc(timeoutMs(args) + 999, 1000)) });
     try argv.appendSlice(a, list);
@@ -784,7 +992,10 @@ fn toolRelays(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) 
 fn toolKind(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
     var argv: std.ArrayList([]const u8) = .empty;
     if (field(args, "kind")) |k| switch (k) {
-        .integer => |n| try argv.append(a, try num(a, n)),
+        .integer, .float => {
+            const n = (kindArg(args) catch return fail(out, kind_range_message)) orelse return fail(out, kind_range_message);
+            try argv.append(a, try num(a, n));
+        },
         .string => |t| {
             if (!plain(t)) return fail(out, "kind must be a number or a name");
             try argv.append(a, t);
@@ -797,10 +1008,11 @@ fn toolKind(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !b
 fn toolStoreQuery(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
     const path = s.cfg.store_path orelse return fail(out, "no store was named when the server started");
     const filter_json = (try jsonArg(a, args, "filter", out)) orelse return false;
+    const limit = clamped(args, "limit", default_limit, 1, max_limit);
     const argv = [_][]const u8{
-        filter_json, "--local", "--store", path, "-l", try num(a, clamped(args, "limit", default_limit, 1, max_limit)),
+        filter_json, "--local", "--store", path, "-l", try num(a, limit),
     };
-    return present(a, try capture(s, a, cmd_req.run, &argv), out);
+    return present(a, try captureLines(s, a, cmd_req.run, &argv, @intCast(limit)), out);
 }
 
 fn toolPublishNote(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
@@ -812,10 +1024,9 @@ fn toolPublishEvent(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Alloca
     const kind_n = intArg(args, "kind") orelse return fail(out, "kind is required");
     if (kind_n < 0 or kind_n > 65535) return fail(out, "kind must be from 0 to 65535");
     const kind: u16 = @intCast(kind_n);
-    if (kinds.classOf(kind) != .regular and kinds.classOf(kind) != .ephemeral) {
-        return fail(out, "refused: replaceable and addressable kinds replace what a relay holds, and that has to be read first; use a command line for those");
+    if (std.mem.indexOfScalar(u16, &publishable_kinds, kind) == null) {
+        return failf(out, "refused: kind {d} is not one this server signs; it signs kinds 1, 6, 7, 16, 1111 and 9802", .{kind});
     }
-    if (kind == 5) return fail(out, "refused: deletion requests are not offered as a tool");
     const content = strArg(args, "content") orelse "";
 
     var tags: std.ArrayList(event.Tag) = .empty;
@@ -829,6 +1040,9 @@ fn toolPublishEvent(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Alloca
                 if (p != .string) return fail(out, "each tag is a non-empty array of strings");
                 try parts.append(a, p.string);
             }
+            for (refused_tags) |name| if (std.mem.eql(u8, parts.items[0], name)) {
+                return failf(out, "refused: a {s} tag belongs to an authentication or deletion event", .{name});
+            };
             try tags.append(a, parts.items);
         }
     }
@@ -846,6 +1060,10 @@ fn publish(
     out: *Io.Writer.Allocating,
 ) !bool {
     const sk = s.cfg.secret orelse return fail(out, "no signing key");
+    const now = Io.Timestamp.now(s.io, .real).toSeconds();
+    if (created_at) |t| if (t < now - max_clock_skew_s or t > now + max_clock_skew_s) {
+        return failf(out, "created_at must be within {d} seconds of now", .{max_clock_skew_s});
+    };
     if (content.len > max_content_bytes) return failf(out, "content is longer than {d} bytes", .{max_content_bytes});
     if (std.mem.trim(u8, content, " \t\r\n").len == 0 and kind == 1) return fail(out, "nothing to post");
     const relays = (try relayList(a, args, out, true)) orelse return false;
@@ -853,7 +1071,7 @@ fn publish(
     var signer = try nostr.keys.Signer.initRandomized(s.io);
     defer signer.deinit();
     const kp = try signer.keyPairFromSecretKey(sk);
-    const at = created_at orelse Io.Timestamp.now(s.io, .real).toSeconds();
+    const at = created_at orelse now;
     const ev = try event.create(a, signer, kp, at, kind, tags, content, null);
     const wire = try event.toJson(a, ev);
     const id = try nostr.hex.encode(a, &ev.id);
@@ -1249,9 +1467,233 @@ test "publish_event refuses kinds that replace, and a relay that refuses reports
     const got = try converse(gpa, .{ .secret = [_]u8{0x44} ** 32 }, all);
     defer gpa.free(got);
     var b: [32]u8 = undefined;
-    try testing.expect(has(replyFor(got, 1, &b).?, "refused: replaceable"));
+    try testing.expect(has(replyFor(got, 1, &b).?, "refused: kind 3"));
     const r2 = replyFor(got, 2, &b).?;
     try testing.expect(has(r2, "\"isError\":true"));
     try testing.expect(has(r2, "no relay accepted"));
     try testing.expect(!has(r2, "\\\"accepted\\\":true"));
+}
+
+/// Asks publish_event for `kind_args` against a relay that refuses every
+/// event, and checks that the call is refused before anything is signed.
+fn refusedBeforeSigning(kind_args: []const u8, want: []const u8) !void {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    var script = cmd_post.Script{ .refuse = true };
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, cmd_post.Script.handle, &script);
+    defer relay.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, relay.port());
+    const a1 = try std.fmt.allocPrint(gpa, "{{{s},\"relays\":[\"{s}\"],\"timeout_ms\":3000}}", .{ kind_args, url });
+    defer gpa.free(a1);
+    const l1 = try callLine(gpa, 1, "publish_event", a1);
+    defer gpa.free(l1);
+    const got = try converse(gpa, .{ .secret = [_]u8{0x44} ** 32 }, l1);
+    defer gpa.free(got);
+    // A relay that answers OK false has still seen the signed event, so the
+    // refusal has to come before the relay is offered anything.
+    try testing.expectEqual(@as(usize, 0), script.events);
+    try testing.expect(has(got, "\"isError\":true"));
+    try testing.expect(has(got, want));
+}
+
+test "publish_event refuses a NIP-42 AUTH event for another relay" {
+    try refusedBeforeSigning("\"kind\":22242,\"tags\":[[\"relay\",\"wss://victim.example\"],[\"challenge\",\"c\"]]", "refused: kind 22242");
+}
+
+test "publish_event refuses a NIP-62 request to vanish" {
+    try refusedBeforeSigning("\"kind\":62,\"tags\":[[\"relay\",\"ALL_RELAYS\"]]", "refused: kind 62");
+}
+
+test "publish_event refuses NIP-98 and NIP-46 kinds" {
+    try refusedBeforeSigning("\"kind\":27235,\"tags\":[[\"u\",\"https://x.example\"],[\"method\",\"GET\"]]", "refused: kind 27235");
+    try refusedBeforeSigning("\"kind\":24133,\"content\":\"x\"", "refused: kind 24133");
+}
+
+test "publish_event refuses auth tags on an allowed kind" {
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"tags\":[[\"challenge\",\"c\"]]", "refused: a challenge tag");
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"tags\":[[\"relay\",\"wss://victim.example\"]]", "refused: a relay tag");
+}
+
+test "publish_event refuses a created_at far from now" {
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"created_at\":1000", "created_at must be within");
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"created_at\":99999999999", "created_at must be within");
+}
+
+test "a filter or event nested past the limit is refused, not a crash" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const deep_open = "[" ** 300;
+    const deep_close = "]" ** 300;
+    const l1 = try callLine(gpa, 1, "req", "{\"filter\":{\"x\":" ++ deep_open ++ deep_close ++ "},\"relays\":[\"ws://127.0.0.1:1\"]}");
+    defer gpa.free(l1);
+    const l2 = try callLine(gpa, 2, "verify", "{\"event\":{\"x\":" ++ deep_open ++ deep_close ++ "}}");
+    defer gpa.free(l2);
+    const l3 = try callLine(gpa, 3, "count", "{\"filter\":{\"x\":" ++ deep_open ++ deep_close ++ "},\"relays\":[\"ws://127.0.0.1:1\"]}");
+    defer gpa.free(l3);
+    const l4 = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}\n";
+    const all = try std.mem.concat(gpa, u8, &.{ l1, l2, l3, l4 });
+    defer gpa.free(all);
+    const got = try converse(gpa, .{}, all);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    for ([_]u32{ 1, 2, 3 }) |id| {
+        const r = replyFor(got, id, &b).?;
+        try testing.expect(has(r, "\"error\":{\"code\":-32602"));
+        try testing.expect(has(r, "nested too deeply"));
+    }
+    try testing.expect(has(replyFor(got, 4, &b).?, "\"result\":{}"));
+}
+
+test "relay_info takes ws:// and wss:// relays only, and no local or private address" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const refused = [_][]const u8{
+        "http://127.0.0.1:1",
+        "https://relay.example",
+        "relay.example",
+        "ws://127.0.0.1:1",
+        "wss://localhost",
+        "wss://LOCALHOST.:443/",
+        "wss://app.localhost",
+        "wss://10.1.2.3",
+        "wss://172.16.0.1",
+        "wss://192.168.1.1",
+        "wss://169.254.169.254",
+        "wss://100.64.0.1",
+        "wss://0.0.0.0",
+        "wss://user@127.0.0.1",
+        "wss://2130706433",
+        "wss://127.1",
+        "wss://0x7f000001",
+        "wss://[::1]",
+        "wss://[fd00::1]:8080",
+        "wss://[fe80::1]",
+        "wss://[::ffff:127.0.0.1]",
+        "wss://printer.local",
+    };
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(gpa);
+    for (refused, 1..) |r, id| {
+        const args = try std.fmt.allocPrint(gpa, "{{\"relays\":[\"{s}\"],\"timeout_ms\":300}}", .{r});
+        defer gpa.free(args);
+        const l = try callLine(gpa, @intCast(id), "relay_info", args);
+        defer gpa.free(l);
+        try all.appendSlice(gpa, l);
+    }
+    const got = try converse(gpa, .{}, all.items);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    for (refused, 1..) |r, id| {
+        const reply = replyFor(got, @intCast(id), &b).?;
+        testing.expect(has(reply, "\"isError\":true") and
+            (has(reply, "is not a ws:// or wss:// relay URL") or has(reply, "local or private address"))) catch |e| {
+            std.debug.print("not refused: {s}: {s}\n", .{ r, reply });
+            return e;
+        };
+    }
+}
+
+test "relay_info reaches a local relay when the server allows it" {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const http = @import("http.zig");
+    var srv: http.TestServer = undefined;
+    try srv.start(io, &.{.{ .path = "/", .body = "{\"name\":\"local relay\"}" }}, 1);
+    defer srv.stop(io);
+    const args = try std.fmt.allocPrint(gpa, "{{\"relays\":[\"ws://127.0.0.1:{d}\"],\"timeout_ms\":3000}}", .{srv.port()});
+    defer gpa.free(args);
+    const l = try callLine(gpa, 1, "relay_info", args);
+    defer gpa.free(l);
+    const got = try converse(gpa, .{ .allow_local = true }, l);
+    defer gpa.free(got);
+    try testing.expect(has(got, "\"isError\":false"));
+    try testing.expect(has(got, "local relay"));
+}
+
+test "public hosts and addresses pass the relay_info check" {
+    for ([_][]const u8{ "relay.example", "nos.lol", "1.2.3.4", "8.8.8.8", "2001:db8::1", "1relay.example" }) |h| {
+        try testing.expect(publicHost(h));
+    }
+    try testing.expectEqualStrings("relay.example", relayHost("wss://relay.example:443/path").?);
+    try testing.expectEqualStrings("::1", relayHost("wss://[::1]:80").?);
+    try testing.expect(relayHost("wss://u@relay.example") == null);
+}
+
+test "a negative or out of range number is refused before it reaches a verb" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const l1 = try callLine(gpa, 1, "kind", "{\"kind\":-1}");
+    defer gpa.free(l1);
+    const l2 = try callLine(gpa, 2, "kind", "{\"kind\":70000}");
+    defer gpa.free(l2);
+    const l3 = try callLine(gpa, 3, "encode", "{\"type\":\"naddr\",\"value\":\"x\",\"pubkey\":\"" ++ "11" ** 32 ++ "\",\"kind\":-30023}");
+    defer gpa.free(l3);
+    const l4 = try callLine(gpa, 4, "kind", "{\"kind\":-1.0}");
+    defer gpa.free(l4);
+    const all = try std.mem.concat(gpa, u8, &.{ l1, l2, l3, l4 });
+    defer gpa.free(all);
+    const got = try converse(gpa, .{}, all);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    for ([_]u32{ 1, 2, 3, 4 }) |id| {
+        const r = replyFor(got, id, &b).?;
+        try testing.expect(has(r, "\"isError\":true"));
+        try testing.expect(has(r, "kind must be a number from 0 to 65535"));
+    }
+}
+
+/// A relay that ignores `limit`: every REQ gets all of `events` and no EOSE.
+const Flood = struct {
+    events: []const []const u8,
+    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void {
+        const self: *Flood = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.startsWith(u8, frame, "[\"REQ\"")) return;
+        var line: [8192]u8 = undefined;
+        for (self.events) |ev| {
+            try testrelay.sendText(w, try std.fmt.bufPrint(&line, "[\"EVENT\",\"deed\",{s}]", .{ev}));
+        }
+    }
+};
+
+test "req stops at its limit when a relay ignores it, without waiting for the deadline" {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var evs: [40][]const u8 = undefined;
+    for (&evs, 0..) |*e, i| {
+        e.* = try cmd_post.signedJson(a, io, [_]u8{0x33} ** 32, 1, &.{}, try std.fmt.allocPrint(a, "flood {d}", .{i}), 1_700_000_000 + @as(i64, @intCast(i)));
+    }
+    var flood = Flood{ .events = &evs };
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, Flood.handle, &flood);
+    defer relay.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, relay.port());
+
+    const args = try std.fmt.allocPrint(gpa, "{{\"filter\":{{\"kinds\":[1]}},\"relays\":[\"{s}\"],\"limit\":3,\"timeout_ms\":8000}}", .{url});
+    defer gpa.free(args);
+    const line = try callLine(gpa, 1, "req", args);
+    defer gpa.free(line);
+    const started = Io.Timestamp.now(io, .awake).toMilliseconds();
+    const got = try converse(gpa, .{}, line);
+    defer gpa.free(got);
+    const took = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try testing.expect(has(got, "\"isError\":false"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "flood "));
+    try testing.expect(has(got, "stopped at the limit of 3 events"));
+    try testing.expect(took < 4000);
 }
