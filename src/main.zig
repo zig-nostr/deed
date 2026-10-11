@@ -135,12 +135,13 @@ fn testRun(args: []const []const u8, out_buf: []u8, err_buf: []u8) !TestRun {
     return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
 }
 
-test "no arguments prints the usage and reports that nothing was understood" {
-    var ob: [8192]u8 = undefined;
-    var eb: [1024]u8 = undefined;
+test "no arguments prints the usage on stderr and reports that nothing was understood" {
+    var ob: [1024]u8 = undefined;
+    var eb: [8192]u8 = undefined;
     const r = try testRun(&.{}, &ob, &eb);
     try std.testing.expectEqual(cli.exit_usage, r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "deed: the nostr command line") != null);
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "deed: the nostr command line") != null);
 }
 
 test "every spelling of version agrees" {

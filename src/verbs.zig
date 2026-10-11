@@ -147,7 +147,7 @@ pub fn dispatch(
     err: *std.Io.Writer,
 ) !u8 {
     if (args.len == 0) {
-        try out.writeAll(usage);
+        try err.writeAll(usage);
         return cli.exit_usage;
     }
 

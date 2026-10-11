@@ -57,9 +57,11 @@ pub const usage =
     \\(ps), so a key given there is not kept secret.
     \\
     \\Options:
-    \\  --sec <key>                    the key to sign with, in any form
-    \\                                 `deed event` takes; see above for why
-    \\                                 $NOSTR_SECRET_KEY is the better way
+    \\  --sec <key>                    the key to sign with: nsec1..., ncryptsec1...
+    \\                                 or 64 hex characters (bunker:// is
+    \\                                 refused: this verb needs the key itself).
+    \\                                 $NOSTR_SECRET_KEY is read when --sec is
+    \\                                 absent, and is the safer way to give it
     \\  -k, --authorized-keys <pubkey> a client served without a secret,
     \\                                 repeatable
     \\  --authorized-secrets-file <path>

@@ -47,9 +47,9 @@ pub const usage =
     \\A pubkey is npub1... or 64 hex characters; an id is 64 hex characters.
     \\
     \\Options:
-    \\  --sec <key>      the secret key to sign with (nsec1..., hex or
-    \\                   ncryptsec1...), or a remote signer as bunker://...
-    \\                   Falls back to $NOSTR_SECRET_KEY.
+    \\  --sec <key>      the secret key to sign with: nsec1..., ncryptsec1...,
+    \\                   bunker://... or 64 hex characters; $NOSTR_SECRET_KEY
+    \\                   is read when --sec is absent
     \\  --pretty         indent the JSON
     \\  --timeout <s>    give up after this many seconds (default 15)
     \\  --allow-http     permit plain http to a host that is not local

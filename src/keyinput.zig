@@ -62,6 +62,12 @@ pub fn secretKey(gpa: std.mem.Allocator, s: []const u8) !keys.SecretKey {
 /// this way needs the key itself, and the verbs a remote signer can serve read
 /// their key through `signing.open`, which takes one.
 pub fn secretKeyOrSay(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, source: anytype, err: *std.Io.Writer) !keys.SecretKey {
+    return secretKeyOrSayFor(gpa, verb, s, source, err, false);
+}
+
+/// `secretKeyOrSay`, for a verb that also takes a `bunker://` URI (which it
+/// handles before it gets here): the line for a bad key lists that form too.
+pub fn secretKeyOrSayFor(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, source: anytype, err: *std.Io.Writer, remote_ok: bool) !keys.SecretKey {
     if (isBunkerUri(s)) {
         try err.print("deed {s}: a remote signer (bunker://) cannot be used here, this needs the secret key itself\n", .{verb});
         return error.BadKey;
@@ -70,7 +76,10 @@ pub fn secretKeyOrSay(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, s
         switch (e) {
             Error.WrongPassword => try err.print("deed {s}: wrong password for that ncryptsec\n", .{verb}),
             Error.NoPassword => try err.print("deed {s}: an ncryptsec needs a password: run on a terminal, or set {s}\n", .{ verb, password.password_env }),
-            else => try err.print("deed {s}: not a secret key (want nsec1..., ncryptsec1... or 64 hex characters)\n", .{verb}),
+            else => if (remote_ok)
+                try err.print("deed {s}: not a secret key (want nsec1..., ncryptsec1..., bunker://... or 64 hex characters)\n", .{verb})
+            else
+                try err.print("deed {s}: not a secret key (want nsec1..., ncryptsec1... or 64 hex characters)\n", .{verb}),
         }
         return error.BadKey;
     };
@@ -84,6 +93,11 @@ pub fn isBunkerUri(s: []const u8) bool {
 /// `secretKeyOrSay`, asking for an ncryptsec's password where `secretKey` does.
 pub fn secretKeyForVerb(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, err: *std.Io.Writer) !keys.SecretKey {
     return secretKeyOrSay(gpa, verb, s, TerminalPassword{}, err);
+}
+
+/// `secretKeyForVerb` for a verb that takes a remote signer as well.
+pub fn secretKeyForRemoteVerb(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, err: *std.Io.Writer) !keys.SecretKey {
+    return secretKeyOrSayFor(gpa, verb, s, TerminalPassword{}, err, true);
 }
 
 /// `secretKey` with the password source passed in, so a test can supply one.

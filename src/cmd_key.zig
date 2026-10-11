@@ -14,7 +14,7 @@ const nip06 = nostr.nip06;
 const bip39 = nostr.bip39;
 
 pub const usage =
-    \\deed key: make a key, derive the public one, protect or check a key
+    \\deed key: generate, public, encrypt and decrypt with a password, validate, expand, mnemonics
     \\
     \\Usage:
     \\  deed key generate [--hex]
@@ -26,7 +26,8 @@ pub const usage =
     \\  deed key mnemonic [--words N]
     \\  deed key from-mnemonic [--account N] [--passphrase] [--public] [--hex] [words...]
     \\
-    \\<secret-key> is a SECRET key, as nsec1..., ncryptsec1... or 64 hex characters. A
+    \\<secret-key> is a SECRET key, as nsec1..., ncryptsec1... or 64 hex characters
+    \\(a bunker:// remote signer is refused: these need the key itself). A
     \\bare 64-character hex string is read as a secret key, never as a public
     \\one. Pasting a public key here derives a different, wrong npub without
     \\complaining. An ncryptsec asks for its password.

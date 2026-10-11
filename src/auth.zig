@@ -75,10 +75,9 @@ pub const usage_lines = "\n" ++
     \\                       and try once more
     \\      --force-pre-auth wait for the challenge and answer it before
     \\                       asking anything (implies --auth)
-    \\      --sec <key>      the key to authenticate with, as nsec1...,
-    \\                       ncryptsec1... or 64 hex characters, or a remote
-    \\                       signer as bunker://... Falls back to
-    \\                       $NOSTR_SECRET_KEY
+    \\      --sec <key>      the key to authenticate with: nsec1...,
+    \\                       ncryptsec1..., bunker://... or 64 hex characters.
+    \\                       $NOSTR_SECRET_KEY is read when --sec is absent
     \\
 ;
 
@@ -111,14 +110,14 @@ pub fn resolve(gpa: std.mem.Allocator, io: std.Io, flags: Flags, verb: []const u
         remote.* = (try signing.open(gpa, io, verb, raw, err)) orelse return ResolveError.BadKey;
         return .{ .remote = remote, .owns_remote = true, .force_pre_auth = flags.force_pre_auth };
     }
-    const sk = keyinput.secretKeyForVerb(gpa, verb, raw, err) catch |e| switch (e) {
+    const sk = keyinput.secretKeyForRemoteVerb(gpa, verb, raw, err) catch |e| switch (e) {
         error.BadKey => return ResolveError.BadKey,
         else => |other| return other,
     };
     var signer = keys.Signer.init();
     defer signer.deinit();
     const kp = signer.keyPairFromSecretKey(sk) catch {
-        try err.print("deed {s}: not a secret key (want nsec1... or 64 hex characters)\n", .{verb});
+        try err.print("deed {s}: not a secret key (want nsec1..., ncryptsec1..., bunker://... or 64 hex characters)\n", .{verb});
         return ResolveError.BadKey;
     };
     return .{ .keypair = kp, .force_pre_auth = flags.force_pre_auth };

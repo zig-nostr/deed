@@ -40,16 +40,16 @@ pub const Direction = enum {
 };
 
 pub const encrypt_usage =
-    \\deed encrypt: encrypt a message to someone, with NIP-44
+    \\deed encrypt: encrypt a message to someone, NIP-44, or NIP-04 with --nip04
     \\
     \\Usage:
     \\  deed encrypt --to <pubkey> [--sec <key>] [--nip04] [<message>...]
     \\
     \\Options:
     \\  --to <pubkey>   recipient, as npub1... or 64 hex characters
-    \\  --sec <key>     your secret key, as nsec1..., ncryptsec1... or 64 hex
-    \\                  characters, or a remote signer as bunker://...
-    \\                  Falls back to $NOSTR_SECRET_KEY.
+    \\  --sec <key>     your secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                  64 hex characters; $NOSTR_SECRET_KEY is read when --sec
+    \\                  is absent
     \\  --nip04         use legacy NIP-04 (payload ends in ?iv=...) instead of
     \\                  NIP-44. It has no authentication; use it only to talk
     \\                  to older clients.
@@ -63,16 +63,16 @@ pub const encrypt_usage =
 ;
 
 pub const decrypt_usage =
-    \\deed decrypt: decrypt a NIP-44 payload from someone
+    \\deed decrypt: decrypt a message from someone, NIP-44, or NIP-04 with --nip04
     \\
     \\Usage:
     \\  deed decrypt --from <pubkey> [--sec <key>] [--nip04] [<payload>...]
     \\
     \\Options:
     \\  --from <pubkey> sender, as npub1... or 64 hex characters
-    \\  --sec <key>     your secret key, as nsec1..., ncryptsec1... or 64 hex
-    \\                  characters, or a remote signer as bunker://...
-    \\                  Falls back to $NOSTR_SECRET_KEY.
+    \\  --sec <key>     your secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                  64 hex characters; $NOSTR_SECRET_KEY is read when --sec
+    \\                  is absent
     \\  --nip04         the payload is legacy NIP-04. A wrong key or an altered
     \\                  payload is only noticed when the padding turns out
     \\                  malformed, so a successful decrypt proves nothing.

@@ -51,9 +51,9 @@ pub const usage =
     \\             [--envelope] [--nevent] [--confirm]
     \\
     \\Options:
-    \\  --sec <key>          secret key, as nsec1..., ncryptsec1... or 64 hex
-    \\                       characters, or a remote signer as bunker://...
-    \\                       Falls back to $NOSTR_SECRET_KEY.
+    \\  --sec <key>          secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                       64 hex characters; $NOSTR_SECRET_KEY is read when
+    \\                       --sec is absent
     \\  -c, --content <text> event content (default: empty). `@path` reads the
     \\                       content from that file; `@@text` is a literal
     \\                       `@text`.

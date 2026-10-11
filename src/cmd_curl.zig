@@ -44,9 +44,9 @@ pub const usage =
     \\           so no payload tag is added for it
     \\
     \\Options:
-    \\  --sec <key>   the secret key to sign with (nsec1..., hex or ncryptsec1...),
-    \\                or a remote signer as bunker://... Falls back to
-    \\                $NOSTR_SECRET_KEY. Not passed on to curl.
+    \\  --sec <key>   the secret key to sign with: nsec1..., ncryptsec1...,
+    \\                bunker://... or 64 hex characters; $NOSTR_SECRET_KEY is
+    \\                read when --sec is absent. Not passed on to curl.
     \\
     \\The header carries the time it was signed, and servers accept it for a
     \\minute or so. It reaches curl on stdin, so it is not in the process

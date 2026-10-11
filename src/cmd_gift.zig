@@ -38,11 +38,10 @@ pub const usage =
     \\Options:
     \\  --to <pubkey>   recipient, as npub1... or 64 hex characters. dm takes it
     \\                  more than once.
-    \\  --sec <key>     your secret key, as nsec1..., ncryptsec1... or 64 hex
-    \\                  characters, or a remote signer as bunker://... (it
-    \\                  signs and encrypts the seal; the wrap is signed by a
-    \\                  one-time key made here, as always).
-    \\                  Falls back to $NOSTR_SECRET_KEY.
+    \\  --sec <key>     your secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                  64 hex characters; $NOSTR_SECRET_KEY is read when --sec
+    \\                  is absent. A remote signer signs and encrypts the seal;
+    \\                  the wrap is signed by a one-time key made here.
     \\  --json          unwrap: print {"sender":...,"rumor":...} instead of the
     \\                  rumor alone
     \\

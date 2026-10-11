@@ -25,7 +25,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const blossom = nostr.blossom;
 
 /// Shown beside the name in `deed help` once `ready` is true.
-pub const summary = "List, upload, download, delete, check and mirror blobs on a Blossom server";
+pub const summary = "list, upload, download, delete, check and mirror blobs";
 
 /// False keeps the verb out of `deed help`.
 pub const ready = true;
@@ -55,9 +55,9 @@ pub const usage =
     \\Options:
     \\  -s, --server <url>   the server; repeat it to use several. upload sends to
     \\                       all of them, download tries them in order
-    \\      --sec <key>      the key that signs, as nsec1..., ncryptsec1... or 64
-    \\                       hex characters, or a remote signer as bunker://...
-    \\                       Falls back to $NOSTR_SECRET_KEY. upload, delete and
+    \\      --sec <key>      the key that signs: nsec1..., ncryptsec1...,
+    \\                       bunker://... or 64 hex characters; $NOSTR_SECRET_KEY
+    \\                       is read when --sec is absent. upload, delete and
     \\                       mirror need one; list, download and check sign only
     \\                       when one is given
     \\  -o, --output <path>  download: where to write the file (default: the

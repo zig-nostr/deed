@@ -32,7 +32,7 @@ pub const summary = "NIP-34 repositories, patches and issues: read them, announc
 pub const ready = true;
 
 pub const usage =
-    \\deed git: NIP-34 repositories, patches and issues
+    \\deed git: NIP-34 repositories, patches and issues: read them, announce, send patches
     \\
     \\Usage:
     \\  deed git repo <repo> [options] [<relay-url>...]
