@@ -33,7 +33,10 @@ pub const usage =
     \\
     \\Options:
     \\      --hostname <host>  the address to listen on (default 127.0.0.1);
-    \\                         an IP address, or localhost
+    \\                         an IP address, or localhost. Any address other
+    \\                         than 127.0.0.1 or localhost exposes the relay to
+    \\                         other machines on that network; --auth-required
+    \\                         and --allow-origin are the controls
     \\      --port <n>         the port (default 10547); 0 lets the system pick
     \\      --store <path>     keep events in the store at this path, which
     \\                         outlives the relay (default: a store in a
