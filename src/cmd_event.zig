@@ -322,7 +322,7 @@ pub fn run(
         // read starts at byte 0 of the file behind the descriptor and re-reads
         // records an earlier reader on the same descriptor already consumed.
         var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
-        var input = cli.Input.init(&.{}, &stdin_reader.interface);
+        var input = cli.Input.initJson(&.{}, &stdin_reader.interface);
 
         // Without --pow, drafts are signed in chunks on every core. With it,
         // each event is already mined on `--pow-threads` threads, so another

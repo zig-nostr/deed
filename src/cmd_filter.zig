@@ -152,7 +152,7 @@ pub fn runWith(
         }
     }
 
-    var input = cli.Input.init(&.{}, stdin);
+    var input = cli.Input.initJson(&.{}, stdin);
     var matched: u64 = 0;
     var bad: usize = 0;
     while (try input.next()) |record| {

@@ -192,7 +192,7 @@ fn runWith(
     var signer = (try signing.open(gpa, io, verb, sec_text, err)) orelse return cli.exit_fail;
     defer signer.deinit();
 
-    var input = cli.Input.init(positionals.items, stdin);
+    var input = if (sub == .dm) cli.Input.init(positionals.items, stdin) else cli.Input.initJson(positionals.items, stdin);
     var failures: usize = 0;
     while (try input.next()) |record| {
         const text = switch (record) {

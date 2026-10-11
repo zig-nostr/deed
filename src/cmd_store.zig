@@ -436,24 +436,19 @@ fn importEvents(gpa: std.mem.Allocator, io: std.Io, st: *Store, reader: *std.Io.
     var batch: Batch = .{};
     defer batch.deinit(gpa);
     var tally: Tally = .{};
-    var line_no: usize = 0;
+    // A value may span lines, so the number reported is the line it began on.
+    var input = cli.Input.initJson(&.{}, reader);
 
-    // Read here rather than through `cli.Input`, which drops empty lines and
-    // so would make the line numbers reported below disagree with the file.
-    while (true) {
-        line_no += 1;
-        const raw = reader.takeDelimiter('\n') catch |e| switch (e) {
-            error.StreamTooLong => {
-                if (reader.discardDelimiterInclusive('\n')) |_| {} else |skip| {
-                    if (skip != error.EndOfStream) return skip;
-                }
+    while (try input.next()) |record| {
+        const line_no = input.start_line;
+        const text = switch (record) {
+            .line => |l| std.mem.trim(u8, l, " \t\r"),
+            .too_long => {
                 try err.print("deed store import: line {d}: longer than {d} bytes\n", .{ line_no, max_record_bytes });
                 tally.rejected += 1;
                 continue;
             },
-            else => |other| return other,
-        } orelse break;
-        const text = std.mem.trim(u8, raw, " \t\r");
+        };
         if (text.len == 0) continue;
         const parsed = event.fromJson(gpa, text) catch |e| {
             try err.print("deed store import: line {d}: not an event: {s}\n", .{ line_no, @errorName(e) });

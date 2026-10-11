@@ -21,7 +21,7 @@ pub const usage =
     \\Usage:
     \\  deed verify [<event-json>...]
     \\
-    \\Reads events as newline-delimited JSON on stdin when given no arguments.
+    \\Reads events as JSON on stdin when given no arguments: one per line, pretty-printed, or several run together.
     \\Prints nothing when every event is valid and exits 0; reports each failure
     \\on stderr and exits 1.
     \\
@@ -65,8 +65,12 @@ pub fn run(
     // records an earlier reader on the same descriptor already consumed.
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
 
-    var input = cli.Input.init(positionals.items, &stdin_reader.interface);
+    var input = cli.Input.initJson(positionals.items, &stdin_reader.interface);
+    return verifyStream(gpa, io, &input, err);
+}
 
+/// Verifies every record `input` yields, reporting failures on `err`.
+fn verifyStream(gpa: std.mem.Allocator, io: std.Io, input: *cli.Input, err: *std.Io.Writer) !u8 {
     var ctx: Ctx = .{ .signer = keys.Signer.init(), .err = err };
     defer ctx.signer.deinit();
 
@@ -96,8 +100,8 @@ pub fn run(
             switch (record) {
                 // Trimmed here rather than in `Input`: surrounding space around
                 // an event is noise, and `deed encrypt` needs the same bytes it was given.
-                .line => |l| try local.add(std.mem.trim(u8, l, " \t")),
-                .too_long => try local.addTooLong(),
+                .line => |l| try local.add(std.mem.trim(u8, l, " \t"), input.start_line),
+                .too_long => try local.addTooLong(input.start_line),
             }
         }
         if (local.entries.items.len == 0) break;
@@ -127,13 +131,15 @@ const chunk_bytes = 256 * 1024;
 
 const Outcome = struct {
     const Tag = enum { ok, too_long, not_event, bad_signature, out_of_memory };
+    /// Where the record started on stdin, 0 for an argument.
+    line: usize = 0,
     tag: Tag = .ok,
     /// Static, from `@errorName`.
     error_name: []const u8 = "",
     id: [64]u8 = undefined,
 };
 
-const Entry = struct { start: usize, len: usize, too_long: bool };
+const Entry = struct { start: usize, len: usize, too_long: bool, line: usize };
 
 /// A batch of records and, once processed, what became of each.
 const Chunk = struct {
@@ -165,13 +171,13 @@ const Chunk = struct {
         self.outcomes.clearRetainingCapacity();
     }
 
-    fn add(self: *Chunk, json: []const u8) !void {
-        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = json.len, .too_long = false });
+    fn add(self: *Chunk, json: []const u8, line: usize) !void {
+        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = json.len, .too_long = false, .line = line });
         try self.bytes.appendSlice(self.gpa, json);
     }
 
-    fn addTooLong(self: *Chunk) !void {
-        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = 0, .too_long = true });
+    fn addTooLong(self: *Chunk, line: usize) !void {
+        try self.entries.append(self.gpa, .{ .start = self.bytes.items.len, .len = 0, .too_long = true, .line = line });
     }
 };
 
@@ -185,7 +191,7 @@ const Ctx = struct {
     pub fn process(self: *Ctx, chunk: *Chunk) void {
         const a = chunk.arena.allocator();
         for (chunk.entries.items, chunk.outcomes.items) |entry, *out| {
-            out.* = .{};
+            out.* = .{ .line = entry.line };
             if (entry.too_long) {
                 out.tag = .too_long;
                 continue;
@@ -210,23 +216,33 @@ const Ctx = struct {
         }
     }
 
+    fn where(self: *Ctx, line: usize) !void {
+        if (line > 0) try self.err.print("line {d}: ", .{line});
+    }
+
     /// Reports the chunk's failures, in record order, on the caller's thread.
     pub fn deliver(self: *Ctx, chunk: *Chunk) !void {
         for (chunk.outcomes.items) |out| switch (out.tag) {
             .ok => {},
             .too_long => {
+                try self.err.writeAll("deed verify: ");
+                try self.where(out.line);
                 try self.err.print(
-                    "deed verify: skipped an event longer than {d} bytes\n",
+                    "skipped an event longer than {d} bytes\n",
                     .{max_record_bytes},
                 );
                 self.failures += 1;
             },
             .not_event => {
-                try self.err.print("deed verify: not an event: {s}\n", .{out.error_name});
+                try self.err.writeAll("deed verify: ");
+                try self.where(out.line);
+                try self.err.print("not an event: {s}\n", .{out.error_name});
                 self.failures += 1;
             },
             .bad_signature => {
-                try self.err.print("deed verify: bad signature: {s}\n", .{out.id});
+                try self.err.writeAll("deed verify: ");
+                try self.where(out.line);
+                try self.err.print("bad signature: {s}\n", .{out.id});
                 self.failures += 1;
             },
             .out_of_memory => return error.OutOfMemory,
@@ -433,7 +449,7 @@ test "ten thousand mixed records report in input order and match one thread" {
     defer chunk.deinit();
     for (records) |rec| {
         chunk.reset();
-        try chunk.add(rec);
+        try chunk.add(rec, 0);
         try chunk.outcomes.resize(gpa, 1);
         ctx.process(&chunk);
         try ctx.deliver(&chunk);
@@ -450,9 +466,9 @@ test "an over-long record is attributed among its neighbours" {
     defer ctx.signer.deinit();
     var chunk = Chunk.init(std.testing.allocator);
     defer chunk.deinit();
-    try chunk.add(f.signed);
-    try chunk.addTooLong();
-    try chunk.add(f.content_tampered);
+    try chunk.add(f.signed, 0);
+    try chunk.addTooLong(0);
+    try chunk.add(f.content_tampered, 0);
     try chunk.outcomes.resize(std.testing.allocator, 3);
     ctx.process(&chunk);
     try ctx.deliver(&chunk);
@@ -460,4 +476,95 @@ test "an over-long record is attributed among its neighbours" {
     try std.testing.expect(std.mem.startsWith(u8, lines, "deed verify: skipped an event longer than"));
     try std.testing.expect(std.mem.indexOf(u8, lines, "bad signature") != null);
     try std.testing.expectEqual(@as(usize, 2), ctx.failures);
+}
+
+/// Runs the stdin path over `data` through a reader whose window is `window`
+/// bytes, which is also the longest value it can hold.
+fn verifyBytes(data: []const u8, window: []u8, eb: []u8) !Run {
+    var source: std.Io.Reader = .fixed(data);
+    var limited = source.limited(.unlimited, window);
+    var input = cli.Input.initJson(&.{}, &limited.interface);
+    var err: std.Io.Writer = .fixed(eb);
+    const code = try verifyStream(std.testing.allocator, std.testing.io, &input, &err);
+    return .{ .code = code, .out = "", .err = err.buffered() };
+}
+
+fn pretty(a: std.mem.Allocator, compact: []const u8) ![]const u8 {
+    const v = try std.json.parseFromSlice(std.json.Value, a, compact, .{});
+    return std.json.Stringify.valueAlloc(a, v.value, .{ .whitespace = .indent_2 });
+}
+
+test "a pretty-printed event verifies" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const text = try std.mem.concat(a, u8, &.{ try pretty(a, f.signed), "\n" });
+    var window: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try verifyBytes(text, &window, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expectEqualStrings("", r.err);
+}
+
+test "two pretty events back to back, and several on one line" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const p = try pretty(a, f.signed);
+    var window: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const two = try std.mem.concat(a, u8, &.{ p, "\n", p, "\n" });
+    try std.testing.expectEqual(cli.exit_ok, (try verifyBytes(two, &window, &eb)).code);
+    const glued = try std.mem.concat(a, u8, &.{ f.signed, f.signed, " ", f.signed });
+    try std.testing.expectEqual(cli.exit_ok, (try verifyBytes(glued, &window, &eb)).code);
+}
+
+test "newline-delimited input and CRLF are unchanged" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const nd = try std.mem.concat(a, u8, &.{ f.signed, "\n\n", f.signed, "\n", f.signed });
+    var window: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    try std.testing.expectEqual(cli.exit_ok, (try verifyBytes(nd, &window, &eb)).code);
+    const crlf = try std.mem.concat(a, u8, &.{ f.signed, "\r\n", try pretty(a, f.signed), "\r\n", f.signed, "\r\n" });
+    try std.testing.expectEqual(cli.exit_ok, (try verifyBytes(crlf, &window, &eb)).code);
+}
+
+test "a malformed value in the middle is reported once, with its line" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const p = try pretty(a, f.signed);
+    const lines_in_p: usize = std.mem.count(u8, p, "\n") + 1;
+    // Three kinds of malformed: balanced but not an event, an unclosed brace,
+    // and a bare word. The good events around them are still checked, and the
+    // tampered one after them is still caught.
+    const text = try std.mem.concat(a, u8, &.{
+        p, "\n", "{\"nope\": 1}\n", f.signed, "\n", "{not json\n", f.signed, "\n", "bogus\n", f.content_tampered, "\n",
+    });
+    var window: [4096]u8 = undefined;
+    var eb: [2048]u8 = undefined;
+    const r = try verifyBytes(text, &window, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    const l2 = lines_in_p + 1;
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "line {d}: not an event", .{l2})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "line {d}: not an event", .{l2 + 2})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "line {d}: not an event", .{l2 + 4})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "line {d}: bad signature", .{l2 + 5})) != null);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, r.err, "\n"));
+}
+
+test "a value over the cap is refused without being held" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const huge = try std.mem.concat(a, u8, &.{ "{\"content\":\"", "x" ** 5000, "\"}" });
+    const text = try std.mem.concat(a, u8, &.{ f.signed, "\n", huge, "\n", f.signed, "\n" });
+    var window: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try verifyBytes(text, &window, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expect(std.mem.startsWith(u8, r.err, "deed verify: line 2: skipped an event longer than"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.err, "\n"));
 }
