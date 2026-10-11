@@ -871,6 +871,15 @@ fn serveConn(c: *Conn, registered: *bool) Io.Cancelable!void {
     readFrames(c, &r, &recv) catch |e| return goneOrCanceled(e);
 }
 
+/// The close codes an endpoint may put on the wire.
+fn validCloseCode(code: u16) bool {
+    return switch (code) {
+        1000...1003, 1007...1014 => true,
+        3000...4999 => true,
+        else => false,
+    };
+}
+
 fn originAllowed(allowed: []const []const u8, origin: []const u8) bool {
     for (allowed) |a| {
         if (std.mem.eql(u8, a, "*")) return true;
@@ -961,7 +970,19 @@ fn readFrames(c: *Conn, r: *Io.net.Stream.Reader, recv: *std.ArrayList(u8)) Read
                 },
                 .pong => {},
                 .close => {
-                    const code: u16 = if (f.payload.len >= 2) std.mem.readInt(u16, f.payload[0..2], .big) else 1000;
+                    if (!f.fin or f.payload.len > 125) return c.closeWith(1002, "a control frame was too long or fragmented");
+                    // RFC 6455 5.5.1: nothing, or a two-byte code and a
+                    // UTF-8 reason. One byte is neither.
+                    if (f.payload.len == 1) return c.closeWith(1002, "a close frame cannot carry one byte");
+                    var code: u16 = 1000;
+                    if (f.payload.len >= 2) {
+                        code = std.mem.readInt(u16, f.payload[0..2], .big);
+                        // 1005, 1006 and 1015 are for reporting, never for
+                        // sending, and the rest of the unassigned ranges
+                        // are not codes at all.
+                        if (!validCloseCode(code)) return c.closeWith(1002, "a close frame carried a code that may not be sent");
+                        if (!std.unicode.utf8ValidateSlice(f.payload[2..])) return c.closeWith(1007, "the close reason is not UTF-8");
+                    }
                     var reply: [2]u8 = undefined;
                     std.mem.writeInt(u16, &reply, code, .big);
                     try c.sendPayload(.close, &reply);
@@ -1008,6 +1029,8 @@ fn readFrames(c: *Conn, r: *Io.net.Stream.Reader, recv: *std.ArrayList(u8)) Read
 // -- messages -----------------------------------------------------------------
 
 fn handleText(c: *Conn, text: []const u8) SendError!void {
+    // RFC 6455 8.1: a text message that is not UTF-8 fails the connection.
+    if (!std.unicode.utf8ValidateSlice(text)) return c.closeWith(1007, "a text message is not UTF-8");
     var parsed = message.parseClientMessage(c.gpa, text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidMessage => return refuseUnreadable(c, text),
@@ -2511,4 +2534,45 @@ test "an event both stored and fanned out before EOSE is sent once" {
         events += 1;
     }
     try testing.expectEqual(@as(usize, 1), events);
+}
+
+test "close frames: a reportable code or one byte is a protocol error, a good code is echoed" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const cases = [_]struct { payload: []const u8, want: u16 }{
+        .{ .payload = &.{ 0x03, 0xED }, .want = 1002 }, // 1005
+        .{ .payload = &.{ 0x03, 0xEE }, .want = 1002 }, // 1006
+        .{ .payload = &.{0x03}, .want = 1002 },
+        .{ .payload = &.{ 0x03, 0xE8, 0xFF }, .want = 1007 }, // 1000 and a bad reason
+        .{ .payload = &.{ 0x03, 0xE9, 'b', 'y', 'e' }, .want = 1001 },
+        .{ .payload = "", .want = 1000 },
+    };
+    for (cases) |case| {
+        var cl = try RawClient.connect(ts.da.allocator(), ts.server.port());
+        defer cl.deinit();
+        try cl.sendFrame(.close, case.payload);
+        const f = (try cl.next()).?;
+        try testing.expectEqual(ws.Opcode.close, f.opcode);
+        try testing.expectEqual(case.want, std.mem.readInt(u16, f.payload[0..2], .big));
+    }
+    {
+        var cl = try RawClient.connect(ts.da.allocator(), ts.server.port());
+        defer cl.deinit();
+        try cl.sendFrame(.close, &(.{ 0x03, 0xE8 } ++ .{'x'} ** 124));
+        const f = (try cl.next()).?;
+        try testing.expectEqual(@as(u16, 1002), std.mem.readInt(u16, f.payload[0..2], .big));
+    }
+}
+
+test "a text message that is not UTF-8 closes the connection with 1007" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    var cl = try RawClient.connect(ts.da.allocator(), ts.server.port());
+    defer cl.deinit();
+    try cl.sendFrame(.text, "[\"REQ\",\"\xff\",{}]");
+    const f = (try cl.next()).?;
+    try testing.expectEqual(ws.Opcode.close, f.opcode);
+    try testing.expectEqual(@as(u16, 1007), std.mem.readInt(u16, f.payload[0..2], .big));
 }
