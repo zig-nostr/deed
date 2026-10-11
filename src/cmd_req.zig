@@ -49,6 +49,9 @@ pub const usage =
     \\      --store <path>   keep every event this receives in a local store
     \\      --local          answer from the store alone, dialling nothing
     \\      --stream         keep reading after the relays have sent what they hold
+    \\      --outbox         ask each author's own write relays (from their NIP-65 list)
+    \\  -n, --outbox-relays-per-pubkey <n>  how many of an author's write relays to ask (default 3)
+    \\  -r, --relay <url>    where to look up relay lists, repeatable (else $DEED_RELAYS)
     \\      --timeout <ms>   give up on relays still answering (default 30000)
 ++ auth.usage_lines ++
     \\
