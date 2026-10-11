@@ -177,6 +177,13 @@ fn parseListLine(line: []const u8) ?Item {
     return .{ .number = number, .title = std.mem.trim(u8, rest[colon + 1 .. close], " ") };
 }
 
+/// The name `file` is kept under: the base address is part of it, so a copy
+/// fetched from one base is never served for another.
+fn cacheName(buf: []u8, base: []const u8, file: []const u8) ![]const u8 {
+    const h = std.hash.Wyhash.hash(0, std.mem.trimEnd(u8, base, "/"));
+    return std.fmt.bufPrint(buf, "{x:0>16}-{s}", .{ h, file });
+}
+
 /// The text of `file`: from the cache when it is recent, otherwise from the
 /// network, otherwise from an old copy. Null after saying why there is none.
 fn load(
@@ -194,7 +201,9 @@ fn load(
 
     if (cfg.cache_dir) |dir| {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, file })) |path| {
+        var name_buf: [64]u8 = undefined;
+        const name = cacheName(&name_buf, cfg.base, file) catch "";
+        if (std.fmt.bufPrint(&path_buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, name })) |path| {
             const cwd = Io.Dir.cwd();
             if (cwd.statFile(io, path, .{})) |st| {
                 if (cwd.readFileAlloc(io, path, gpa, .limited(max_bytes))) |text| {
@@ -246,7 +255,9 @@ fn keep(gpa: std.mem.Allocator, io: Io, cfg: Config, file: []const u8, body: []c
     const dir = cfg.cache_dir orelse return;
     const cwd = Io.Dir.cwd();
     cwd.createDirPath(io, dir) catch return;
-    const path = std.fmt.allocPrint(gpa, "{s}{c}{s}", .{ dir, std.fs.path.sep, file }) catch return;
+    var name_buf: [64]u8 = undefined;
+    const name = cacheName(&name_buf, cfg.base, file) catch return;
+    const path = std.fmt.allocPrint(gpa, "{s}{c}{s}", .{ dir, std.fs.path.sep, name }) catch return;
     defer gpa.free(path);
     const tmp = std.fmt.allocPrint(gpa, "{s}.tmp", .{path}) catch return;
     defer gpa.free(tmp);
@@ -388,11 +399,11 @@ test "--refresh fetches again, and an unreachable server falls back to the old c
     var fx: Fixture = undefined;
     try fx.init();
     defer fx.tmp.cleanup();
-    try fx.tmp.dir.writeFile(io, .{ .sub_path = "29.md", .data = "old text\n" });
-
     var base_buf: [64]u8 = undefined;
     const base = try gpa.dupe(u8, try srv.url(&base_buf, ""));
     defer gpa.free(base);
+    var name_buf: [64]u8 = undefined;
+    try fx.tmp.dir.writeFile(io, .{ .sub_path = try cacheName(&name_buf, base, "29.md"), .data = "old text\n" });
     const cfg: Config = .{ .base = base, .cache_dir = fx.cache(), .timeout_ms = 2_000 };
 
     {
@@ -436,4 +447,35 @@ test "a NIP that does not exist fails, and a bad number is a usage error" {
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "no 999.md") != null);
     try std.testing.expectEqual(cli.exit_usage, try runWith(gpa, io, &.{"../etc"}, &out.writer, &err.writer, cfg));
     try std.testing.expectEqualStrings("", out.written());
+}
+
+test "changing the base address does not serve the copy kept for the old one" {
+    const io = std.testing.io;
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var one: http.TestServer = undefined;
+    try one.start(io, &.{.{ .path = "/29.md", .body = "from one\n" }}, 1);
+    defer one.stop(io);
+    var two: http.TestServer = undefined;
+    try two.start(io, &.{.{ .path = "/29.md", .body = "from two\n" }}, 1);
+    defer two.stop(io);
+    var fx: Fixture = undefined;
+    try fx.init();
+    defer fx.tmp.cleanup();
+
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    const bases = [_][]const u8{ try one.url(&b1, ""), try two.url(&b2, "") };
+    const want = [_][]const u8{ "from one\n", "from two\n" };
+    for (bases, want) |base, text| {
+        var out: Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var err: Io.Writer.Allocating = .init(gpa);
+        defer err.deinit();
+        const code = try runWith(gpa, io, &.{"29"}, &out.writer, &err.writer, .{ .base = base, .cache_dir = fx.cache(), .timeout_ms = 2_000 });
+        try std.testing.expectEqual(cli.exit_ok, code);
+        try std.testing.expectEqualStrings(text, out.written());
+    }
 }
