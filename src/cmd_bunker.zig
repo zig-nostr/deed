@@ -1055,7 +1055,7 @@ fn serveOnce(d: *Daemon, index: usize, bunker: *nip46.Bunker) Ended {
         .connected => |r| r,
         .failed => |e| {
             if (isCancel(e)) return .stopped;
-            d.log("{s}: could not connect: {s}", .{ url, @errorName(e) });
+            d.log("{s}: could not connect: {s}", .{ url, dial.describe(e) });
             return .dropped;
         },
         .timed_out => {

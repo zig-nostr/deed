@@ -264,6 +264,7 @@ fn cmdRefresh(
 ) !u8 {
     var lists = try outbox.lookupMany(gpa, io, people, .{
         .bootstrap = relays,
+        .verb = "outbox",
         .store = store,
         .refresh = true,
         .timeout_ms = timeout_ms,

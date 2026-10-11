@@ -561,6 +561,7 @@ fn fetch(rc: *Run, urls: []const []const u8, f: filter.Filter) !Fetched {
     const o = try relayset.query(rc.gpa, rc.io, take, &.{f}, &buf.writer, rc.err, .{
         .until_eose = true,
         .deadline_ms = rc.o.timeout_ms,
+        .verb = rc.verb,
     });
     var list: std.ArrayList(event.Parsed) = .empty;
     errdefer {

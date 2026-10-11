@@ -47,6 +47,8 @@ pub const Options = struct {
     /// list replaces the cached one.
     refresh: bool = false,
     timeout_ms: i64 = 10_000,
+    /// The verb asking, to name on what is said about a relay.
+    verb: []const u8 = "",
 };
 
 pub const Entry = struct {
@@ -127,7 +129,7 @@ pub fn followWriteRelays(
         try err.print("deed {s}: name a relay, or name one to find the relays in use through (with --relay, or DEED_RELAYS)\n", .{verb});
         return null;
     }
-    var found = try writeRelays(gpa, io, pubkey, .{ .bootstrap = bootstrap.items, .store = store, .timeout_ms = timeout_ms }, err);
+    var found = try writeRelays(gpa, io, pubkey, .{ .bootstrap = bootstrap.items, .store = store, .timeout_ms = timeout_ms, .verb = verb }, err);
     if (found.urls.len == 0) {
         found.deinit();
         try err.print("deed {s}: found no relay list to follow, so name a relay\n", .{verb});
@@ -236,6 +238,7 @@ fn fill(
         .until_eose = true,
         .deadline_ms = opts.timeout_ms,
         .store = opts.store,
+        .verb = opts.verb,
     });
 
     var lines = std.mem.splitScalar(u8, out.written(), '\n');

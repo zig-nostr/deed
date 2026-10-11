@@ -541,10 +541,10 @@ const Set = struct {
         };
         for (outcomes[0..which.len], which) |o, i| switch (o) {
             .connected => self.startReader(i) catch |e| {
-                try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], @errorName(e) });
+                try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], dial.describe(e) });
                 try self.drop(i, .gone, err);
             },
-            .failed => |e| try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], @errorName(e) }),
+            .failed => |e| try err.print("deed {s}: {s}: {s}\n", .{ self.verb, self.urls[i], dial.describe(e) }),
             .timed_out => try err.print("deed {s}: {s}: no answer within {d} ms\n", .{ self.verb, self.urls[i], bound_ms }),
         };
     }
@@ -651,7 +651,7 @@ const Set = struct {
                     f[i] = e;
                     try self.drop(i, .closed, err);
                 } else {
-                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], @errorName(e) });
+                    try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], dial.describe(e) });
                     try self.drop(i, .closed, err);
                 }
             }
@@ -697,7 +697,7 @@ const Set = struct {
                     continue;
                 }
             }
-            try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], @errorName(e) });
+            try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, self.urls[i], dial.describe(e) });
         }
 
         self.seq += 1;
@@ -796,7 +796,7 @@ const Set = struct {
                         }
                     }
                     if (why) |e| {
-                        try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, url, @errorName(e) });
+                        try err.print("deed {s}: {s}: {s}: {s}\n", .{ self.verb, id, url, dial.describe(e) });
                     } else {
                         try err.print("deed {s}: {s}: {s}: closed before answering\n", .{ self.verb, id, url });
                     }

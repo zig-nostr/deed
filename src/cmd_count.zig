@@ -399,7 +399,7 @@ pub fn run(
     for (req.relays, 0..) |url, i| {
         const ans = answers[i] orelse {
             switch (outcomes[i]) {
-                .failed => |e| try err.print("deed count: {s}: could not connect: {s}\n", .{ url, @errorName(e) }),
+                .failed => |e| try err.print("deed count: {s}: could not connect: {s}\n", .{ url, dial.describe(e) }),
                 else => try err.print("deed count: {s}: no answer within {d} ms\n", .{ url, req.timeout_ms }),
             }
             continue;

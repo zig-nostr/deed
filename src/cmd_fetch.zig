@@ -166,6 +166,7 @@ pub fn run(
         }
         followed = try outbox.writeRelays(gpa, io, target.filter.authors.?[0], .{
             .bootstrap = bootstrap.items,
+            .verb = "fetch",
             .store = if (store) |*st| st else null,
         }, err);
         if (followed.?.urls.len == 0) {
@@ -178,6 +179,7 @@ pub fn run(
     const outcome = try relayset.query(gpa, io, urls.items, &.{target.filter}, out, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
+        .verb = "fetch",
         .store = if (store) |*st| st else null,
         .auth = auth_opts,
     });

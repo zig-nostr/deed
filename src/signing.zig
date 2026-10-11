@@ -412,7 +412,7 @@ pub fn start(
         } else if (describe(e)) |why| {
             try err.print("deed {s}: {s}\n", .{ verb, why });
         } else {
-            try err.print("deed {s}: cannot connect to the remote signer: {s}\n", .{ verb, @errorName(e) });
+            try err.print("deed {s}: cannot connect to the remote signer: {s}\n", .{ verb, dial.describe(e) });
         }
         return null;
     };

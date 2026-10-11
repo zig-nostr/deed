@@ -236,7 +236,7 @@ const Ctx = struct {
         dial.all(self.gpa, self.io, &.{url}, @min(dial.default_timeout_ms, self.remainingMs()), &outcome);
         switch (outcome[0]) {
             .connected => |r| return r,
-            .failed => |e| try self.err.print("deed sync: {s}: could not connect: {s}\n", .{ url, @errorName(e) }),
+            .failed => |e| try self.err.print("deed sync: {s}: could not connect: {s}\n", .{ url, dial.describe(e) }),
             .timed_out => try self.err.print("deed sync: {s}: did not answer in time\n", .{url}),
         }
         self.stats.unreachable_relay = true;

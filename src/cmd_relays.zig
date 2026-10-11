@@ -157,6 +157,7 @@ pub fn run(
 
     var lists = try outbox.lookup(gpa, io, pubkey, .{
         .bootstrap = bootstrap.items,
+        .verb = "relays",
         .store = if (store) |*st| st else null,
         .refresh = refresh,
         .timeout_ms = timeout_ms,

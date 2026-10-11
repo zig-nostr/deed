@@ -151,3 +151,31 @@ test "a silent relay times out, a closed port fails, and a live relay connects, 
     // Bounded by the deadline, not by the slowest relay.
     try std.testing.expect(took < 3_000);
 }
+
+/// A dial error in words a person can act on. Errors without a better
+/// description keep their name.
+pub fn describe(e: anyerror) []const u8 {
+    const name = @errorName(e);
+    const eql = std.mem.eql;
+    const starts = std.mem.startsWith;
+    if (eql(u8, name, "ConnectionRefused")) return "connection refused";
+    if (eql(u8, name, "UnknownHostName") or eql(u8, name, "HostLacksNetworkAddresses") or
+        eql(u8, name, "NameServerFailure") or eql(u8, name, "TemporaryNameServerFailure") or
+        eql(u8, name, "NoAddressFound")) return "host not found";
+    if (eql(u8, name, "NetworkUnreachable") or eql(u8, name, "HostUnreachable") or
+        eql(u8, name, "AddressUnavailable")) return "network unreachable";
+    if (eql(u8, name, "ConnectionTimedOut") or eql(u8, name, "Timeout")) return "timed out";
+    if (eql(u8, name, "ConnectionResetByPeer") or eql(u8, name, "EndOfStream") or eql(u8, name, "BrokenPipe")) return "connection closed by the relay";
+    if (eql(u8, name, "HandshakeFailed")) return "not a websocket relay (the upgrade was refused)";
+    if (eql(u8, name, "SyntaxError") or eql(u8, name, "InvalidResponse") or eql(u8, name, "UnexpectedFrame")) return "the relay's reply was not understood";
+    if (eql(u8, name, "InvalidUrl") or eql(u8, name, "UnsupportedScheme")) return "not a usable relay URL";
+    if (starts(u8, name, "Tls") or starts(u8, name, "Certificate")) return "could not set up a secure connection";
+    return name;
+}
+
+test "common dial errors are put in words" {
+    try std.testing.expectEqualStrings("connection refused", describe(error.ConnectionRefused));
+    try std.testing.expectEqualStrings("the relay's reply was not understood", describe(error.SyntaxError));
+    try std.testing.expectEqualStrings("could not set up a secure connection", describe(error.TlsAlertBadCertificate));
+    try std.testing.expectEqualStrings("OutOfMemory", describe(error.OutOfMemory));
+}
