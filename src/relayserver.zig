@@ -2659,3 +2659,114 @@ test "a text message that is not UTF-8 closes the connection with 1007" {
     try testing.expectEqual(ws.Opcode.close, f.opcode);
     try testing.expectEqual(@as(u16, 1007), std.mem.readInt(u16, f.payload[0..2], .big));
 }
+
+const Stress = struct {
+    const full = 24;
+    const per = 6;
+    const total = full * per;
+
+    ids: std.AutoHashMapUnmanaged([32]u8, usize) = .empty,
+    frames: [full * per][]const u8 = undefined,
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn fail(self: *Stress) void {
+        _ = self.failures.fetchAdd(1, .monotonic);
+    }
+
+    /// Reads until every event has been seen, or the connection ends.
+    /// Counts into `got` by event number and reports whether any came twice.
+    fn drain(self: *Stress, cl: *RawClient, got: *[total]u8) void {
+        var have: usize = 0;
+        while (have < total) {
+            const t = cl.text() catch return;
+            if (!std.mem.startsWith(u8, t, "[\"EVENT\"")) continue;
+            const at = std.mem.indexOf(u8, t, "\"id\":\"") orelse return self.fail();
+            var id: [32]u8 = undefined;
+            if (t.len < at + 6 + 64) return self.fail();
+            _ = std.fmt.hexToBytes(&id, t[at + 6 ..][0..64]) catch return self.fail();
+            const n = self.ids.get(id) orelse return self.fail();
+            got[n] += 1;
+            if (got[n] > 1) self.fail();
+            if (got[n] == 1) have += 1;
+        }
+    }
+
+    fn subscriber(self: *Stress, cl: *RawClient, i: usize) void {
+        var got: [total]u8 = @splat(0);
+        // Two overlapping filters, so an event matching both must still come once.
+        var buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "[\"REQ\",\"s\",{{\"kinds\":[1]}},{{\"kinds\":[1],\"since\":1}},{{\"kinds\":[1],\"limit\":{d}}}]", .{10 + i}) catch unreachable;
+        cl.send(req) catch return self.fail();
+        for (0..per) |j| cl.send(self.frames[i * per + j]) catch return self.fail();
+        self.drain(cl, &got);
+        for (got) |n| if (n != 1) return self.fail();
+    }
+
+    fn hangup(self: *Stress, cl: *RawClient, i: usize) void {
+        cl.send("[\"REQ\",\"s\",{\"kinds\":[1]}]") catch return self.fail();
+        if (i % 2 == 0) {
+            // Leave part way through the stored answer.
+            var n: usize = 0;
+            while (n < 3) : (n += 1) _ = cl.text() catch break;
+        }
+        cl.stream.shutdown(cl.io, .both) catch {};
+    }
+};
+
+test "serve under concurrent publishers, slow readers and disconnects" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const io = testing.io;
+    const now = nowSeconds(io);
+
+    var st: Stress = .{};
+    defer st.ids.deinit(arena);
+    for (0..Stress.full) |i| {
+        const kp = try testKey(signer, @intCast(40 + i));
+        for (0..Stress.per) |j| {
+            const n = i * Stress.per + j;
+            const ev = try makeEvent(arena, signer, kp, 1, now - 100 + @as(i64, @intCast(n)), "stress");
+            try st.ids.put(arena, ev.id, n);
+            st.frames[n] = try message.encodeEvent(arena, ev);
+        }
+    }
+
+    const conns = 32;
+    var cls: [conns]*RawClient = undefined;
+    var made: usize = 0;
+    defer for (cls[0..made]) |cl| cl.deinit();
+    for (0..conns) |i| {
+        cls[i] = try RawClient.connect(gpa, ts.server.port());
+        made += 1;
+    }
+
+    // Ends every read if something stops making progress.
+    var dog = try io.concurrent(stressWatchdog, .{ io, &cls });
+    defer dog.cancel(io);
+
+    // Connection 24 reads nothing until the rest are done.
+    cls[Stress.full].send("[\"REQ\",\"s\",{\"kinds\":[1]}]") catch return error.TestUnexpectedResult;
+
+    var group: Io.Group = .init;
+    for (0..Stress.full) |i| try group.concurrent(io, Stress.subscriber, .{ &st, cls[i], i });
+    for (Stress.full + 1..conns) |i| try group.concurrent(io, Stress.hangup, .{ &st, cls[i], i });
+    try group.await(io);
+
+    var got: [Stress.total]u8 = @splat(0);
+    st.drain(cls[Stress.full], &got);
+    for (got) |n| try testing.expectEqual(@as(u8, 1), n);
+    try testing.expectEqual(@as(u32, 0), st.failures.load(.acquire));
+    try testing.expectEqual(@as(usize, Stress.total), try ts.ts.store.eventCount());
+}
+
+fn stressWatchdog(io: Io, cls: []const *RawClient) void {
+    io.sleep(.fromSeconds(20), .awake) catch return;
+    for (cls) |cl| cl.stream.shutdown(io, .both) catch {};
+}
