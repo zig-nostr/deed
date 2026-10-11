@@ -644,23 +644,28 @@ fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u
         try err.print("deed nsite deploy: cannot read {s}: {s}\n", .{ dir, @errorName(e) });
         return null;
     }) |entry| {
+        // Names on stderr use '/', as the site does, on every system.
+        const shown = try arena.dupe(u8, entry.path);
+        for (shown) |*c| if (c.* == '\\') {
+            c.* = '/';
+        };
         if (!include_hidden) {
             if (hiddenAt(entry.path)) |top| {
                 // Said once, for the dot-file or dot-directory itself, and not
                 // again for everything inside it.
-                if (top) try err.print("deed nsite deploy: skipping the hidden {s} {s} (--include-hidden publishes it)\n", .{ if (entry.kind == .directory) "directory" else "file", entry.path });
+                if (top) try err.print("deed nsite deploy: skipping the hidden {s} {s} (--include-hidden publishes it)\n", .{ if (entry.kind == .directory) "directory" else "file", shown });
                 continue;
             }
         }
         switch (entry.kind) {
             .directory => continue,
             .sym_link => {
-                try err.print("deed nsite deploy: skipping the symbolic link {s}\n", .{entry.path});
+                try err.print("deed nsite deploy: skipping the symbolic link {s}\n", .{shown});
                 continue;
             },
             .file => {},
             else => {
-                try err.print("deed nsite deploy: skipping {s}: not a regular file\n", .{entry.path});
+                try err.print("deed nsite deploy: skipping {s}: not a regular file\n", .{shown});
                 continue;
             },
         }
@@ -672,13 +677,13 @@ fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u
         try site_path.append(arena, '/');
         for (entry.path) |c| try site_path.append(arena, if (c == std.fs.path.sep) '/' else c);
         if (!safePath(site_path.items)) {
-            try err.print("deed nsite deploy: {s}: a site path cannot hold that name\n", .{entry.path});
+            try err.print("deed nsite deploy: {s}: a site path cannot hold that name\n", .{shown});
             return null;
         }
         const disk = try std.fmt.allocPrint(arena, "{s}{c}{s}", .{ std.mem.trimEnd(u8, dir, "/\\"), std.fs.path.sep, entry.path });
         const h = hashFile(io, disk) catch |e| {
             if (e == error.FileTooLarge) {
-                try err.print("deed nsite deploy: {s}: larger than {d} MiB\n", .{ entry.path, max_file_bytes / (1024 * 1024) });
+                try err.print("deed nsite deploy: {s}: larger than {d} MiB\n", .{ shown, max_file_bytes / (1024 * 1024) });
             } else {
                 try err.print("deed nsite deploy: cannot read {s}: {s}\n", .{ disk, @errorName(e) });
             }

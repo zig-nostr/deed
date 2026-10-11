@@ -1737,7 +1737,10 @@ test "an unreachable relay is named with the verb and a plain reason" {
     var eb: [2048]u8 = undefined;
     const r = try runReq(&.{ "-k", "1", "ws://127.0.0.1:1" }, &ob, &eb);
     try std.testing.expectEqual(cli.exit_fail, r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "deed req: ws://127.0.0.1:1: connection refused") != null);
+    // Windows lets a connect to a closed port run into the deadline rather
+    // than refusing it at once, so the plain reason there is a timeout.
+    const reason = if (@import("builtin").os.tag == .windows) "deed req: ws://127.0.0.1:1: " else "deed req: ws://127.0.0.1:1: connection refused";
+    try std.testing.expect(std.mem.indexOf(u8, r.err, reason) != null);
 }
 
 test "events come back through a CONNECT proxy and a SOCKS5 proxy" {
