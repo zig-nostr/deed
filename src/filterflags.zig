@@ -51,7 +51,7 @@ pub fn CollectedN(comptime T: type, comptime n: usize) type {
     };
 }
 
-/// A 32-byte key or id, as `npub1…`/`note1…`/`nsec1…` or 64 hex characters.
+/// A 32-byte key or id, as `npub1...`/`note1...`/`nsec1...` or 64 hex characters.
 pub fn idOrKey(gpa: std.mem.Allocator, s: []const u8) ?[32]u8 {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (t.len == 64) return hex.decodeFixed(32, t) catch null;

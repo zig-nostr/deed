@@ -51,8 +51,8 @@ pub const usage =
     \\             [--envelope] [--nevent] [--confirm]
     \\
     \\Options:
-    \\  --sec <key>          secret key, as nsec1…, ncryptsec1… or 64 hex
-    \\                       characters, or a remote signer as bunker://…
+    \\  --sec <key>          secret key, as nsec1..., ncryptsec1... or 64 hex
+    \\                       characters, or a remote signer as bunker://...
     \\                       Falls back to $NOSTR_SECRET_KEY.
     \\  -c, --content <text> event content (default: empty). `@path` reads the
     \\                       content from that file; `@@text` is a literal
@@ -63,11 +63,11 @@ pub const usage =
     \\                       tag with more than two elements:
     \\                         -t 'e=<id>;wss://relay.example;reply'
     \\                       A bare name with no '=' makes a one-element tag.
-    \\  -e <id>              add an e tag: a hex id, note1… or nevent1…
-    \\  -p <pubkey>          add a p tag: hex, npub1… or nprofile1…
+    \\  -e <id>              add an e tag: a hex id, note1... or nevent1...
+    \\  -p <pubkey>          add a p tag: hex, npub1... or nprofile1...
     \\  -d <d>               add a d tag
     \\  -h <h>               add an h tag
-    \\  -a <address>         add an a tag: kind:pubkey:d, an naddr1…, or a bare
+    \\  -a <address>         add an a tag: kind:pubkey:d, an naddr1..., or a bare
     \\                       pubkey (taken as <kind>:<pubkey>:<-d value>)
     \\  --created-at <n>     unix seconds (default: now)
     \\  --pow <bits>         proof of work (NIP-13): search for a nonce until the
@@ -80,8 +80,8 @@ pub const usage =
     \\  --pow-timeout <s>    give up on an event after <s> seconds, sign nothing
     \\                       for it, and exit 1. Applies to each event separately.
     \\                       Default: no limit.
-    \\  --envelope           print ["EVENT",{…}] instead of the bare event
-    \\  --nevent             print an nevent1… line after each event
+    \\  --envelope           print ["EVENT",{...}] instead of the bare event
+    \\  --nevent             print an nevent1... line after each event
     \\  --confirm            ask on the terminal before publishing; refuses when
     \\                       there is no terminal
     \\
@@ -102,9 +102,9 @@ pub const usage =
     \\input; this one has a complete default, so guessing at stdin would let a
     \\script sign whatever happened to be on the other end of the pipe.
     \\
-    \\  deed event -c "hello" --sec nsec1…
+    \\  deed event -c "hello" --sec nsec1...
     \\  deed event -k reaction -e <id> -p <pubkey> -c "+" wss://relay.example
-    \\  echo '{"kind":1,"content":"hi"}' | deed event - --sec nsec1…
+    \\  echo '{"kind":1,"content":"hi"}' | deed event - --sec nsec1...
     \\
 ;
 
@@ -472,9 +472,9 @@ const ShortcutError = error{ BadId, BadPubkey, BadAddress, OutOfMemory };
 
 fn shortcutReason(e: ShortcutError) []const u8 {
     return switch (e) {
-        error.BadId => "not an event id (want 64 hex characters, note1… or nevent1…)",
-        error.BadPubkey => "not a public key (want 64 hex characters, npub1… or nprofile1…)",
-        error.BadAddress => "not an address (want kind:pubkey:d, naddr1… or a public key)",
+        error.BadId => "not an event id (want 64 hex characters, note1... or nevent1...)",
+        error.BadPubkey => "not a public key (want 64 hex characters, npub1... or nprofile1...)",
+        error.BadAddress => "not an address (want kind:pubkey:d, naddr1... or a public key)",
         error.OutOfMemory => "out of memory",
     };
 }

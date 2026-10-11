@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr = std.Io.File.stderr().writerStreaming(io, &err_buf);
 
     const code = run(gpa, io, argv.items, &stdout.interface, &stderr.interface) catch |e| blk: {
-        // `deed decode … | head -1` closes the pipe on purpose, and every other
+        // `deed decode ... | head -1` closes the pipe on purpose, and every other
         // filter goes quiet when its reader leaves rather than complaining that
         // it did. deed cannot die of SIGPIPE the way they do, because the I/O
         // implementation underneath installs a handler of its own, so it

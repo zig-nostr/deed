@@ -36,14 +36,14 @@ pub const usage =
     \\  deed gift dm     --to <pubkey>... [--sec <key>] [<message>...]
     \\
     \\Options:
-    \\  --to <pubkey>   recipient, as npub1… or 64 hex characters. dm takes it
+    \\  --to <pubkey>   recipient, as npub1... or 64 hex characters. dm takes it
     \\                  more than once.
-    \\  --sec <key>     your secret key, as nsec1…, ncryptsec1… or 64 hex
-    \\                  characters, or a remote signer as bunker://… (it
+    \\  --sec <key>     your secret key, as nsec1..., ncryptsec1... or 64 hex
+    \\                  characters, or a remote signer as bunker://... (it
     \\                  signs and encrypts the seal; the wrap is signed by a
     \\                  one-time key made here, as always).
     \\                  Falls back to $NOSTR_SECRET_KEY.
-    \\  --json          unwrap: print {"sender":…,"rumor":…} instead of the
+    \\  --json          unwrap: print {"sender":...,"rumor":...} instead of the
     \\                  rumor alone
     \\
     \\wrap reads one event per line on stdin and treats its kind, tags, content
@@ -60,7 +60,7 @@ pub const usage =
     \\Messages are read one per line on stdin when none are given as arguments.
     \\Nothing is sent: pipe the output into deed publish.
     \\
-    \\  deed gift dm --to npub1… --sec nsec1… "see you at six" | deed publish wss://relay.example
+    \\  deed gift dm --to npub1... --sec nsec1... "see you at six" | deed publish wss://relay.example
     \\
 ;
 
@@ -175,7 +175,7 @@ fn runWith(
     for (tos.items) |t| {
         const pk = keyinput.publicKey(gpa, t) catch {
             try err.print(
-                "deed gift {s}: --to is not a public key (want npub1… or 64 hex characters)\n",
+                "deed gift {s}: --to is not a public key (want npub1... or 64 hex characters)\n",
                 .{name},
             );
             return cli.exit_fail;

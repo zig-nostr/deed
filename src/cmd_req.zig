@@ -30,8 +30,8 @@ pub const usage =
     \\
     \\Options:
     \\  -k, --kind <n>       event kind, repeatable
-    \\  -a, --author <key>   author, as npub1… or 64 hex characters, repeatable
-    \\  -i, --id <id>        event id, as note1… or 64 hex characters, repeatable
+    \\  -a, --author <key>   author, as npub1... or 64 hex characters, repeatable
+    \\  -i, --id <id>        event id, as note1... or 64 hex characters, repeatable
     \\  -e <id>              an `e` tag value, repeatable
     \\  -p <key>             a `p` tag value, repeatable
     \\  -t <topic>           a `t` tag value, repeatable

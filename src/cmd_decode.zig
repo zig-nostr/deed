@@ -36,9 +36,9 @@ pub const usage =
     \\requires. A domain on this machine (localhost, 127.x.x.x, ::1) is asked
     \\over plain http.
     \\
-    \\  deed decode npub1…            {"pubkey":"…"}
-    \\  deed decode nevent1…          {"id":"…","relays":[…],"kind":1}
-    \\  deed decode bob@example.com   {"pubkey":"…","relays":[…]}
+    \\  deed decode npub1...            {"pubkey":"..."}
+    \\  deed decode nevent1...          {"id":"...","relays":[...],"kind":1}
+    \\  deed decode bob@example.com   {"pubkey":"...","relays":[...]}
     \\
 ;
 
@@ -131,7 +131,7 @@ fn reason(e: anyerror) []const u8 {
 
 /// Decodes one code into a JSON object. Caller owns the returned bytes.
 fn decodeOne(gpa: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
-    // `nostr:npub1…` and `npub1…` are the same code wearing different clothes.
+    // `nostr:npub1...` and `npub1...` are the same code wearing different clothes.
     const code = keyinput.stripUri(std.mem.trim(u8, raw, " \t\r\n"));
 
     var buf: std.ArrayList(u8) = .empty;

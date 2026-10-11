@@ -26,7 +26,7 @@ pub const usage =
     \\  deed key mnemonic [--words N]
     \\  deed key from-mnemonic [--account N] [--passphrase] [--public] [--hex] [words...]
     \\
-    \\<secret-key> is a SECRET key, as nsec1…, ncryptsec1… or 64 hex characters. A
+    \\<secret-key> is a SECRET key, as nsec1..., ncryptsec1... or 64 hex characters. A
     \\bare 64-character hex string is read as a secret key, never as a public
     \\one. Pasting a public key here derives a different, wrong npub without
     \\complaining. An ncryptsec asks for its password.
@@ -322,7 +322,7 @@ fn decrypt(
         return cli.exit_usage;
     }, " \t\r\n");
     if (!keyinput.hasPrefix(raw, "ncryptsec1")) {
-        try err.writeAll("deed key decrypt: not an ncryptsec (want ncryptsec1…)\n");
+        try err.writeAll("deed key decrypt: not an ncryptsec (want ncryptsec1...)\n");
         return cli.exit_fail;
     }
 

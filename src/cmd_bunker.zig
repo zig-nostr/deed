@@ -44,7 +44,7 @@ pub const usage =
     \\
     \\Usage:
     \\  deed bunker [options] <relay>...
-    \\  deed bunker connect <nostrconnect://…> [options] [<relay>...]
+    \\  deed bunker connect <nostrconnect://...> [options] [<relay>...]
     \\
     \\Holds a key and signs with it for the clients it trusts, over the relays
     \\given. Prints a bunker:// URI on stdout for a client to connect with, logs
@@ -96,9 +96,9 @@ pub const usage =
     \\  Answers a nostrconnect:// URI shown by a client, on the relays it names
     \\  and any given here, and then serves that client.
     \\
-    \\  NOSTR_SECRET_KEY=ncryptsec1… deed bunker wss://relay.example
+    \\  NOSTR_SECRET_KEY=ncryptsec1... deed bunker wss://relay.example
     \\  deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
-    \\  NOSTR_SECRET_KEY=ncryptsec1… deed bunker connect 'nostrconnect://…'
+    \\  NOSTR_SECRET_KEY=ncryptsec1... deed bunker connect 'nostrconnect://...'
     \\
 ;
 
@@ -240,7 +240,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, out: *Io.Writer
             p.sec = v;
         } else if (cli.isOneOf(a, &.{ "-k", "--authorized-keys" })) {
             const pk = keyinput.publicKey(arena, v) catch {
-                try err.print("deed bunker: '{s}' is not a public key (want npub1… or 64 hex characters)\n", .{v});
+                try err.print("deed bunker: '{s}' is not a public key (want npub1... or 64 hex characters)\n", .{v});
                 return null;
             };
             try appendUnique([32]u8, arena, &p.authorized_keys, pk);

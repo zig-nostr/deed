@@ -45,7 +45,7 @@ const TerminalPassword = struct {
     }
 };
 
-/// A secret key as `nsec1…`, as 64 hex characters, or as an `ncryptsec1…`
+/// A secret key as `nsec1...`, as 64 hex characters, or as an `ncryptsec1...`
 /// (NIP-49), whose password is asked for on the terminal.
 ///
 /// Says nothing: the caller says what went wrong, in one line, and the error
@@ -103,7 +103,7 @@ pub fn secretKeyWith(gpa: std.mem.Allocator, s: []const u8, source: anytype) !ke
     return Error.UnrecognizedKey;
 }
 
-/// A public key as `npub1…` or as 64 hex characters.
+/// A public key as `npub1...` or as 64 hex characters.
 pub fn publicKey(gpa: std.mem.Allocator, s: []const u8) !keys.PublicKey {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (hasPrefix(t, "npub1")) return nip19.decodeNpub(gpa, t);
