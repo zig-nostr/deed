@@ -19,6 +19,7 @@ const outbox = @import("outbox.zig");
 const relayset = @import("relayset.zig");
 
 const nip19 = nostr.nip19;
+const http = @import("http.zig");
 const filter = nostr.filter;
 
 /// Shown beside the name in `deed help`.
@@ -44,6 +45,14 @@ pub const usage =
     \\$me and $contacts in `authors` and `tag` stand for the reader and the people
     \\they follow. Say who the reader is with --pub, or with --sec.
     \\
+    \\The relays a spell lists are the spell author's choice, so they are printed
+    \\to stderr before anything is asked of them. A listed relay at a loopback
+    \\or private network address (localhost, 127.x, 10.x, 192.168.x, a name with
+    \\no dot, and the like) is refused unless --allow-local is given, or the
+    \\address was also named on this command line. NIP-42 challenges are
+    \\answered only at relays named on this command line, never at relays that
+    \\came from the spell or from $outbox.
+    \\
     \\Options:
     \\      --pub <key>      who $me is, as npub1... or 64 hex characters
     \\      --sec <key>      who $me is, from a secret key; with --auth it also
@@ -55,8 +64,10 @@ pub const usage =
     \\      --stream         keep reading after the relays have sent what they hold
     \\                       (it cannot be combined with $outbox)
     \\      --timeout <ms>   give up on relays still answering (default 30000)
+    \\      --allow-local    accept listed relays at loopback or private addresses
     \\      --auth, --force-pre-auth
-    \\                       answer NIP-42 challenges (needs --sec)
+    \\                       answer NIP-42 challenges (needs --sec), at the relays
+    \\                       named on this command line
     \\
     \\A spell without a `close-on-eose` tag still ends once the relays have sent
     \\what they hold, unless --stream is given.
@@ -88,6 +99,7 @@ pub fn run(
     var timeout_arg: []const u8 = "30000";
     var timeout_ms: i64 = cmd_req.default_timeout_ms;
     var stream = false;
+    var allow_local = false;
     var auth_flags: auth.Flags = .{};
 
     var i: usize = 0;
@@ -109,6 +121,10 @@ pub fn run(
             stream = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--allow-local")) {
+            allow_local = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-")) {
             if (!cli.isOneOf(arg, &.{ "--pub", "-n", "--outbox-relays-per-pubkey", "-r", "--relay", "--timeout" })) {
                 try err.print("deed spell: unknown option '{s}'\n", .{arg});
@@ -128,10 +144,11 @@ pub fn run(
                 try bootstrap.append(a, v);
             } else {
                 timeout_arg = v;
-                timeout_ms = std.fmt.parseInt(i64, v, 10) catch {
-                    try err.print("deed spell: '{s}' is not a number of milliseconds\n", .{v});
-                    return cli.exit_fail;
-                };
+                timeout_ms = std.fmt.parseInt(i64, v, 10) catch 0;
+                if (timeout_ms <= 0) {
+                    try err.print("deed spell: --timeout needs a number of milliseconds above zero, not '{s}'\n", .{v});
+                    return cli.exit_usage;
+                }
             }
             continue;
         }
@@ -233,8 +250,7 @@ pub fn run(
 
     // Where to ask.
     var uses_outbox = true;
-    var explicit: std.ArrayList([]const u8) = .empty;
-    try explicit.appendSlice(a, relays.items);
+    var from_spell: std.ArrayList([]const u8) = .empty;
     for (spell.tags) |t| {
         if (t.len == 0 or !std.mem.eql(u8, t[0], "relays")) continue;
         uses_outbox = false;
@@ -242,28 +258,161 @@ pub fn run(
             if (std.mem.eql(u8, v, "$outbox")) {
                 uses_outbox = true;
             } else if (std.mem.startsWith(u8, v, "wss://") or std.mem.startsWith(u8, v, "ws://")) {
-                try explicit.append(a, v);
+                try from_spell.append(a, v);
             }
         }
     }
-    if (explicit.items.len > max_relays_listed) explicit.items.len = max_relays_listed;
+    if (from_spell.items.len > max_relays_listed) {
+        try err.print("deed spell: the spell lists {d} relays; only the first {d} are used\n", .{ from_spell.items.len, max_relays_listed });
+        from_spell.items.len = max_relays_listed;
+    }
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(a, json);
-    try argv.appendSlice(a, &.{ "--timeout", timeout_arg });
-    if (stream) try argv.append(a, "--stream");
-    if (uses_outbox) try argv.appendSlice(a, &.{ "--outbox", "-n", per_pubkey });
-    for (bootstrap.items) |r| try argv.appendSlice(a, &.{ "--relay", r });
-    if (auth_flags.auth) try argv.append(a, "--auth");
-    if (auth_flags.force_pre_auth) try argv.append(a, "--force-pre-auth");
-    if (auth_opts != null) if (auth_flags.sec) |sk| try argv.appendSlice(a, &.{ "--sec", sk });
-    try argv.appendSlice(a, explicit.items);
+    // The ones the spell adds to what was named here.
+    var added: std.ArrayList([]const u8) = .empty;
+    for (from_spell.items) |u| {
+        if (containsUrl(relays.items, u) or containsUrl(bootstrap.items, u) or containsUrl(added.items, u)) continue;
+        try added.append(a, u);
+    }
+    if (from_spell.items.len > 0 or uses_outbox) {
+        try err.writeAll("deed spell: the spell asks ");
+        if (from_spell.items.len == 0) {
+            try err.writeAll("each author's own write relays");
+        } else {
+            for (from_spell.items, 0..) |u, k| {
+                try err.writeAll(if (k == 0) "" else ", ");
+                try relayset.writeEscaped(err, u);
+            }
+            if (uses_outbox) try err.writeAll(", and each author's own write relays");
+        }
+        try err.writeByte('\n');
+    }
+    if (!allow_local) {
+        for (added.items) |u| if (isLocalRelay(u)) {
+            try err.writeAll("deed spell: the spell lists a relay at a loopback or private address, which is not asked: ");
+            try relayset.writeEscaped(err, u);
+            try err.writeAll("\nName it on the command line, or pass --allow-local, to ask it.\n");
+            return cli.exit_fail;
+        };
+    }
 
-    if (!uses_outbox and explicit.items.len == 0) {
+    if (relays.items.len == 0 and from_spell.items.len == 0 and !uses_outbox) {
         try err.writeAll("deed spell: the spell lists no relay: name one\n");
         return cli.exit_usage;
     }
-    return cmd_req.runWith(gpa, io, argv.items, null, out, err);
+
+    // NIP-42 is answered only where the reader named the relay. What the spell
+    // added, and the outbox relays, are asked without it.
+    var trusted: std.ArrayList([]const u8) = .empty;
+    try trusted.appendSlice(a, relays.items);
+    for (from_spell.items) |u| if (containsUrl(relays.items, u) or containsUrl(bootstrap.items, u)) {
+        if (!containsUrl(trusted.items, u)) try trusted.append(a, u);
+    };
+    const authing = auth_opts != null;
+    if (authing and (added.items.len > 0 or uses_outbox)) {
+        try err.writeAll("deed spell: NIP-42 challenges are answered only at relays named on the command line, not at relays from the spell\n");
+    }
+
+    const base = [_][]const u8{ json, "--timeout", timeout_arg };
+    if (!authing or (added.items.len == 0 and !uses_outbox)) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &base);
+        if (stream) try argv.append(a, "--stream");
+        if (uses_outbox) try argv.appendSlice(a, &.{ "--outbox", "-n", per_pubkey });
+        for (bootstrap.items) |r| try argv.appendSlice(a, &.{ "--relay", r });
+        if (authing) try appendAuth(a, &argv, auth_flags);
+        try argv.appendSlice(a, trusted.items);
+        try argv.appendSlice(a, added.items);
+        return cmd_req.runWith(gpa, io, argv.items, null, out, err);
+    }
+
+    // Two passes, so the relays that may be answered and the ones that may not
+    // never share a connection setting.
+    var code1: u8 = cli.exit_fail;
+    if (trusted.items.len > 0) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &base);
+        if (stream) try argv.append(a, "--stream");
+        try appendAuth(a, &argv, auth_flags);
+        try argv.appendSlice(a, trusted.items);
+        code1 = try cmd_req.runWith(gpa, io, argv.items, null, out, err);
+    }
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(a, &base);
+    if (stream) try argv.append(a, "--stream");
+    if (uses_outbox) try argv.appendSlice(a, &.{ "--outbox", "-n", per_pubkey });
+    for (bootstrap.items) |r| try argv.appendSlice(a, &.{ "--relay", r });
+    try argv.appendSlice(a, added.items);
+    const code2 = try cmd_req.runWith(gpa, io, argv.items, null, out, err);
+    return if (code1 == cli.exit_ok or code2 == cli.exit_ok) cli.exit_ok else code2;
+}
+
+fn appendAuth(a: std.mem.Allocator, argv: *std.ArrayList([]const u8), flags: auth.Flags) !void {
+    if (flags.auth) try argv.append(a, "--auth");
+    if (flags.force_pre_auth) try argv.append(a, "--force-pre-auth");
+    if (flags.sec) |sk| try argv.appendSlice(a, &.{ "--sec", sk });
+}
+
+fn containsUrl(list: []const []const u8, url: []const u8) bool {
+    for (list) |u| if (std.mem.eql(u8, u, url)) return true;
+    return false;
+}
+
+/// The host of a ws:// or wss:// URL, without brackets, userinfo or port.
+fn relayHost(url: []const u8) []const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return "";
+    var rest = url[sep + 3 ..];
+    if (std.mem.indexOfAny(u8, rest, "/?#")) |e| rest = rest[0..e];
+    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| rest = rest[at + 1 ..];
+    if (rest.len > 0 and rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return rest;
+        return rest[1..close];
+    }
+    if (std.mem.indexOfScalar(u8, rest, ':')) |c| rest = rest[0..c];
+    return rest;
+}
+
+/// True for a relay at this machine or on a private network: loopback,
+/// RFC 1918, link-local, carrier-grade NAT, unique-local IPv6, and the names
+/// that only mean something inside a network (no dot, .local, .internal, ...).
+/// A name that resolves to such an address is not seen here.
+fn isLocalRelay(url: []const u8) bool {
+    var host = relayHost(url);
+    while (host.len > 0 and host[host.len - 1] == '.') host = host[0 .. host.len - 1];
+    if (host.len == 0) return true;
+    if (http.isLoopbackHost(host)) return true;
+    if (std.Io.net.IpAddress.parse(host, 0)) |addr| {
+        return switch (addr) {
+            .ip4 => |v4| isPrivateV4(v4.bytes),
+            .ip6 => |v6| isPrivateV6(v6.bytes),
+        };
+    } else |_| {}
+    // 2130706433, 0x7f.1 and the like are addresses spelled oddly.
+    var digits_only = true;
+    for (host) |c| if (!std.ascii.isDigit(c) and c != '.') {
+        digits_only = false;
+    };
+    if (digits_only or std.ascii.startsWithIgnoreCase(host, "0x")) return true;
+    if (std.mem.indexOfScalar(u8, host, '.') == null) return true;
+    const suffixes = [_][]const u8{ ".localhost", ".local", ".internal", ".lan", ".home", ".corp", ".intranet", ".private" };
+    for (suffixes) |suf| if (std.ascii.endsWithIgnoreCase(host, suf)) return true;
+    return false;
+}
+
+fn isPrivateV4(b: [4]u8) bool {
+    if (b[0] == 0 or b[0] == 10 or b[0] == 127) return true;
+    if (b[0] == 169 and b[1] == 254) return true;
+    if (b[0] == 172 and b[1] >= 16 and b[1] <= 31) return true;
+    if (b[0] == 192 and b[1] == 168) return true;
+    if (b[0] == 100 and b[1] >= 64 and b[1] <= 127) return true;
+    return false;
+}
+
+fn isPrivateV6(b: [16]u8) bool {
+    if (std.mem.eql(u8, b[0..15], &[_]u8{0} ** 15) and (b[15] == 0 or b[15] == 1)) return true;
+    if ((b[0] & 0xfe) == 0xfc) return true;
+    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true;
+    if (std.mem.eql(u8, b[0..10], &[_]u8{0} ** 10) and b[10] == 0xff and b[11] == 0xff) return isPrivateV4(b[12..16].*);
+    return false;
 }
 
 fn badCode(err: *std.Io.Writer, raw: []const u8) !u8 {
@@ -404,8 +553,10 @@ fn buildFilter(ctx: *Ctx, tags: []const nostr.event.Tag, now: i64) !?[]const u8 
             }
         } else if (std.mem.eql(u8, name, "tag")) {
             if (t.len < 3) continue;
-            if (t[1].len != 1) {
-                try err.print("deed spell: '{s}' is not a one-letter tag name\n", .{t[1]});
+            if (t[1].len != 1 or !std.ascii.isAlphabetic(t[1][0])) {
+                try err.writeAll("deed spell: the tag name '");
+                try relayset.writeEscaped(err, t[1]);
+                try err.writeAll("' is not a single letter\n");
                 return null;
             }
             var tv: TagValues = .{ .name = t[1] };
@@ -443,7 +594,7 @@ fn buildFilter(ctx: *Ctx, tags: []const nostr.event.Tag, now: i64) !?[]const u8 
     }
     for (tagged.items) |tv| {
         if (tv.values.items.len == 0) continue;
-        var key: [2]u8 = .{ '#', tv.name[0] };
+        const key: [2]u8 = .{ '#', tv.name[0] };
         first = try writeStrings(w, first, &key, tv.values.items);
     }
     if (since) |v| {
@@ -473,7 +624,8 @@ fn buildFilter(ctx: *Ctx, tags: []const nostr.event.Tag, now: i64) !?[]const u8 
 
 fn writeStrings(w: *std.Io.Writer, first: bool, key: []const u8, values: []const []const u8) !bool {
     if (!first) try w.writeByte(',');
-    try w.print("\"{s}\":[", .{key});
+    try std.json.Stringify.encodeJsonString(key, .{}, w);
+    try w.writeAll(":[");
     for (values, 0..) |v, i| {
         if (i > 0) try w.writeByte(',');
         try std.json.Stringify.encodeJsonString(v, .{}, w);
@@ -583,3 +735,193 @@ test "a spell is fetched, checked and run against the relays it lists" {
 }
 
 const spell_tags_kind: u16 = spell_kind;
+
+test "loopback, private and bare-name relays are told apart from public ones" {
+    const local = [_][]const u8{
+        "ws://localhost:7777",
+        "ws://127.0.0.1",
+        "ws://127.5.5.5:1",
+        "wss://10.1.2.3",
+        "wss://172.16.0.1/x",
+        "wss://172.31.255.255",
+        "ws://192.168.1.10:80",
+        "ws://169.254.169.254",
+        "ws://100.64.0.1",
+        "ws://0.0.0.0",
+        "ws://[::1]:9",
+        "ws://[fd00::1]",
+        "ws://[fe80::1]",
+        "ws://[::ffff:10.0.0.1]",
+        "ws://nas",
+        "ws://printer.local",
+        "ws://x.internal",
+        "ws://2130706433",
+        "ws://0x7f.1",
+        "ws://user@localhost",
+        "ws://localhost.",
+    };
+    for (local) |u| testing.expect(isLocalRelay(u)) catch |e| {
+        std.debug.print("expected local: {s}\n", .{u});
+        return e;
+    };
+    const public = [_][]const u8{
+        "wss://relay.damus.io",
+        "wss://nos.lol/",
+        "wss://8.8.8.8",
+        "wss://172.32.0.1",
+        "wss://100.128.0.1",
+        "wss://[2606:4700::1111]",
+    };
+    for (public) |u| testing.expect(!isLocalRelay(u)) catch |e| {
+        std.debug.print("expected public: {s}\n", .{u});
+        return e;
+    };
+}
+
+test "a tag name that is not a letter is refused, and the key is written as JSON" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var err: std.Io.Writer.Allocating = .init(a);
+    var ctx: Ctx = .{ .a = a, .gpa = testing.allocator, .io = testing.io, .me = null, .relays = &.{}, .timeout_ms = 1000, .auth = null, .err = &err.writer };
+    const quote = [_]nostr.event.Tag{&.{ "tag", "\"", "x" }};
+    try testing.expect((try buildFilter(&ctx, &quote, 0)) == null);
+    const digit = [_]nostr.event.Tag{&.{ "tag", "1", "x" }};
+    try testing.expect((try buildFilter(&ctx, &digit, 0)) == null);
+    const ok = [_]nostr.event.Tag{&.{ "tag", "p", "x" }};
+    try testing.expectEqualStrings("{\"#p\":[\"x\"]}", (try buildFilter(&ctx, &ok, 0)).?);
+}
+
+test "a --timeout that is not a number exits 2" {
+    const gpa = testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    try testing.expectEqual(cli.exit_usage, try run(gpa, testing.io, &.{ "--timeout", "soon", "ab" ** 32 }, &out.writer, &err.writer));
+    try testing.expectEqual(cli.exit_usage, try run(gpa, testing.io, &.{ "--timeout", "0", "ab" ** 32 }, &out.writer, &err.writer));
+}
+
+/// A relay that answers every REQ with `serving` and counts the AUTH frames
+/// it is sent, after greeting each connection with a challenge.
+const Counting = struct {
+    serving: []const []const u8 = &.{},
+    auths: usize = 0,
+
+    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *std.Io.Writer) anyerror!void {
+        const self: *Counting = @ptrCast(@alignCast(ctx.?));
+        const a = std.heap.page_allocator;
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        const verb = items[0].string;
+        if (std.mem.eql(u8, verb, "AUTH")) {
+            self.auths += 1;
+            const id = items[1].object.get("id").?.string;
+            const ok = try std.fmt.allocPrint(a, "[\"OK\",\"{s}\",true,\"\"]", .{id});
+            defer a.free(ok);
+            try testrelay.sendText(w, ok);
+        } else if (std.mem.eql(u8, verb, "REQ")) {
+            for (self.serving) |ev| {
+                const m = try std.fmt.allocPrint(a, "[\"EVENT\",\"{s}\",{s}]", .{ items[1].string, ev });
+                defer a.free(m);
+                try testrelay.sendText(w, m);
+            }
+            const eose = try std.fmt.allocPrint(a, "[\"EOSE\",\"{s}\"]", .{items[1].string});
+            defer a.free(eose);
+            try testrelay.sendText(w, eose);
+        }
+    }
+};
+
+const Fixture = struct {
+    da: testrelay.DialAllocator = .init,
+    arena_state: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    home: testrelay.Relay = undefined,
+    far: testrelay.Relay = undefined,
+    home_state: Counting = .{},
+    far_state: Counting = .{},
+    home_buf: [40]u8 = undefined,
+    far_buf: [40]u8 = undefined,
+    home_url: []const u8 = "",
+    far_url: []const u8 = "",
+    spell_id: []const u8 = "",
+
+    /// `home` holds the spell, which lists `far` and nothing else.
+    fn start(self: *Fixture, io: std.Io, home_conns: usize, far_conns: usize) !void {
+        const arena = self.arena_state.allocator();
+        try self.home.startFor(io, .custom, home_conns);
+        try self.far.startFor(io, .custom, far_conns);
+        self.home.custom = Counting.handle;
+        self.home.custom_ctx = &self.home_state;
+        self.far.custom = Counting.handle;
+        self.far.custom_ctx = &self.far_state;
+        self.home.greeting = "[\"AUTH\",\"chal-home\"]";
+        self.far.greeting = "[\"AUTH\",\"chal-far\"]";
+        self.home_url = try testrelay.url(&self.home_buf, self.home.port());
+        self.far_url = try testrelay.url(&self.far_buf, self.far.port());
+
+        var signer = try nostr.keys.Signer.initRandomized(io);
+        defer signer.deinit();
+        const author = try signer.keyPairFromSecretKey([_]u8{0x72} ** 32);
+        const tags = [_]nostr.event.Tag{
+            &.{ "cmd", "REQ" },
+            &.{ "k", "1" },
+            &.{ "relays", self.far_url },
+            &.{"close-on-eose"},
+        };
+        const spell = try nostr.event.create(arena, signer, author, 1_700_000_300, spell_kind, &tags, "", null);
+        const note = try nostr.event.create(arena, signer, author, 1_700_000_400, 1, &.{}, "from far", null);
+        self.home_state.serving = try arena.dupe([]const u8, &.{try nostr.event.toJson(arena, spell)});
+        self.far_state.serving = try arena.dupe([]const u8, &.{try nostr.event.toJson(arena, note)});
+        self.spell_id = try nostr.hex.encode(arena, &spell.id);
+    }
+
+    fn finish(self: *Fixture, io: std.Io) void {
+        self.far.stop(io);
+        self.home.stop(io);
+        self.arena_state.deinit();
+        if (self.da.deinit() == .leak) @panic("the spell verb leaked");
+    }
+};
+
+test "a relay the spell lists at a local address is not asked without --allow-local" {
+    const io = testing.io;
+    var f: Fixture = .{};
+    try f.start(io, 1, 0);
+    defer f.finish(io);
+    const gpa = f.da.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    const code = try run(gpa, io, &.{ f.spell_id, "--timeout", "3000", f.home_url }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_fail, code);
+    try testing.expectEqualStrings("", out.written());
+    // The spell's relays were shown, and the refusal says how to go on.
+    try testing.expect(std.mem.indexOf(u8, err.written(), f.far_url) != null);
+    try testing.expect(std.mem.indexOf(u8, err.written(), "--allow-local") != null);
+}
+
+test "with --allow-local the listed relay is asked, and NIP-42 is answered only where I named the relay" {
+    const io = testing.io;
+    var f: Fixture = .{};
+    try f.start(io, 2, 1);
+    defer f.finish(io);
+    const gpa = f.da.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    const code = try run(gpa, io, &.{
+        f.spell_id, "--allow-local",                                                    "--auth",    "--force-pre-auth",
+        "--sec",    "3131313131313131313131313131313131313131313131313131313131313131", "--timeout", "3000",
+        f.home_url,
+    }, &out.writer, &err.writer);
+    try testing.expectEqual(cli.exit_ok, code);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "from far") != null);
+    try testing.expect(f.home_state.auths > 0);
+    try testing.expectEqual(@as(usize, 0), f.far_state.auths);
+}

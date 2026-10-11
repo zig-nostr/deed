@@ -8,8 +8,8 @@
 //! answers with a kind 4455 event (`p`: the new device, `P`: itself) holding
 //! the key encrypted with NIP-44 between the two device keys.
 //!
-//! This follows `nak dekey`. It prints the public half of the key on stdout.
-//! It does not encrypt or decrypt messages: nak's verb does not either.
+//! It prints the public half of the key on stdout. It does not encrypt or
+//! decrypt messages.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -74,8 +74,8 @@ pub const usage =
     \\      --timeout <ms>     give up on relays still answering (default 30000)
     \\
     \\Files in --dir hold secret keys, and are created readable by you only.
-    \\Unlike nak, which accepts a key message from any author, this reads only
-    \\the announcements and key messages your own key published.
+    \\Only the announcements and key messages your own key published are read;
+    \\a key message from any other author is ignored.
     \\
 ;
 
@@ -431,8 +431,8 @@ fn go(self: *Session, out: *Io.Writer) !u8 {
             return cli.exit_fail;
         };
     }
-    // Events newer than this are the ones that count: nak's `since`, which is
-    // the previous announcement, so a rotation reaches devices that asked
+    // Events newer than this are the ones that count: the previous
+    // announcement's time, so a rotation reaches devices that asked
     // under the old key.
     const since: i64 = if (announcement) |a| a.created_at else 0;
 

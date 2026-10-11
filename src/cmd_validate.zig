@@ -2,15 +2,16 @@
 //!
 //! The schema is the YAML file nostr-protocol/registry-of-kinds publishes:
 //! for each kind, what the content must be, which tags are required, and what
-//! each tag's items must look like. This follows the validator `nak validate`
-//! uses, rule for rule, over the small slice of YAML that file is written in.
-//! See `usage` for what is and is not checked.
+//! each tag's items must look like. The rules are applied over the small
+//! slice of YAML that file is written in. See `usage` for what is and is not
+//! checked.
 
 const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const http = @import("http.zig");
 const relayset = @import("relayset.zig");
+const cmd_nip = @import("cmd_nip.zig");
 
 pub const summary = "check events against a registry-of-kinds schema";
 
@@ -22,7 +23,7 @@ pub const usage =
     \\deed validate: check events against a registry-of-kinds schema
     \\
     \\Usage:
-    \\  deed validate [--schema <url|path>] [<event-json>...]
+    \\  deed validate [--refresh] [--schema <url|path>] [<event-json>...]
     \\
     \\Reads events as newline-delimited JSON on stdin when given no arguments.
     \\An event that passes is printed to stdout as it was given. One that fails
@@ -32,12 +33,19 @@ pub const usage =
     \\  deed event -k 1 -p not_a_pubkey | deed validate
     \\
     \\Options:
-    \\      --schema <url|path>   the schema to use: an http(s) URL or a file
-    \\                            (default: the registry-of-kinds schema.yaml
-    \\                            on raw.githubusercontent.com, downloaded
-    \\                            every run)
+    \\      --schema <url|path>   the schema to use: an http(s) URL or a file. A
+    \\                            file is read from disk and needs no network.
+    \\                            The default is the registry-of-kinds
+    \\                            schema.yaml, fetched from
+    \\                            raw.githubusercontent.com
+    \\      --refresh             fetch a schema URL again even if a copy kept
+    \\                            less than 24 hours ago exists
     \\
-    \\What is checked, for the event's kind, as `nak validate` does:
+    \\A schema fetched from a URL is kept in the user cache directory for 24
+    \\hours. If the URL cannot be reached, an older kept copy is used with a
+    \\warning, so a copy fetched once keeps working offline.
+    \\
+    \\What is checked, for the event's kind:
     \\  content   by the kind's content type
     \\  tags      each tag against the specs with its name or prefix; one spec
     \\            must accept it. Tags with no spec for the kind fall back to
@@ -48,9 +56,9 @@ pub const usage =
     \\A kind the schema does not list passes.
     \\
     \\Value types checked: id, pubkey, addr, kind, relay, json, constrained,
-    \\hex (with min and max), lowercase, timestamp, imeta, empty, free. Like
-    \\nak, the types url, giturl, date and geohash are not checked, and
-    \\neither are unknown types. `empty` is not enforced either.
+    \\hex (with min and max), lowercase, timestamp, imeta, empty, free. The
+    \\types url, giturl, date and geohash are not checked, and neither are
+    \\unknown types. `empty` is not enforced either.
     \\
     \\The schema is read with a built-in reader for the YAML subset the
     \\registry file uses: block mappings and lists, anchors and aliases on
@@ -489,7 +497,7 @@ fn isTrimmed(s: []const u8) bool {
 }
 
 /// Writes why `value` is not a good `spec.type` and returns false, or returns
-/// true. Types the validator does not know pass, as they do in nak.
+/// true. Types the validator does not know pass.
 fn checkType(gpa: std.mem.Allocator, w: *std.Io.Writer, spec: *const ContentSpec, value: []const u8) !bool {
     const t = spec.type;
     if (std.mem.eql(u8, t, "id")) {
@@ -712,23 +720,75 @@ pub fn validateEvent(gpa: std.mem.Allocator, schema: *const Schema, ev: nostr.ev
 const max_record_bytes = 1 << 20;
 const max_schema_bytes = 16 * 1024 * 1024;
 
-fn loadSchemaText(gpa: std.mem.Allocator, io: std.Io, source: []const u8, err: *std.Io.Writer) !?[]u8 {
+pub const Config = struct {
+    /// Where fetched schemas are kept. Null keeps nothing.
+    cache_dir: ?[]const u8 = null,
+    timeout_ms: u64 = 15_000,
+};
+
+/// A kept copy this old is fetched again.
+const fresh_seconds: i64 = 24 * 60 * 60;
+
+fn cacheFile(gpa: std.mem.Allocator, cfg: Config, source: []const u8) ?[]u8 {
+    const dir = cfg.cache_dir orelse return null;
+    const h = std.hash.Wyhash.hash(0, source);
+    return std.fmt.allocPrint(gpa, "{s}{c}{x:0>16}-schema.yaml", .{ dir, std.fs.path.sep, h }) catch null;
+}
+
+fn loadSchemaText(gpa: std.mem.Allocator, io: std.Io, source: []const u8, cfg: Config, refresh: bool, err: *std.Io.Writer) !?[]u8 {
     if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://")) {
-        var res = http.fetch(gpa, io, source, .{ .max_bytes = max_schema_bytes }) catch |e| {
-            try err.print("deed validate: {s}: {s}\n", .{ source, http.describe(e) });
-            return null;
-        };
-        defer res.deinit(gpa);
-        if (!res.ok()) {
-            try err.print("deed validate: {s}: the server answered {d}\n", .{ source, res.status });
-            return null;
+        const cwd = std.Io.Dir.cwd();
+        const path = cacheFile(gpa, cfg, source);
+        defer if (path) |p| gpa.free(p);
+        var stale: ?[]u8 = null;
+        defer if (stale) |t| gpa.free(t);
+        if (path) |p| {
+            if (cwd.statFile(io, p, .{})) |st| {
+                if (cwd.readFileAlloc(io, p, gpa, .limited(max_schema_bytes))) |text| {
+                    const age = std.Io.Timestamp.now(io, .real).toSeconds() - st.mtime.toSeconds();
+                    if (!refresh and age >= 0 and age < fresh_seconds) return text;
+                    stale = text;
+                } else |_| {}
+            } else |_| {}
         }
-        return try gpa.dupe(u8, res.body);
+
+        var failure_buf: [64]u8 = undefined;
+        var failure: []const u8 = undefined;
+        if (http.fetch(gpa, io, source, .{ .max_bytes = max_schema_bytes, .timeout_ms = cfg.timeout_ms })) |r| {
+            var res = r;
+            defer res.deinit(gpa);
+            if (res.ok()) {
+                if (path) |p| keepCopy(gpa, io, cfg, p, res.body);
+                return try gpa.dupe(u8, res.body);
+            }
+            failure = std.fmt.bufPrint(&failure_buf, "the server answered {d}", .{res.status}) catch "the server refused";
+        } else |e| {
+            if (e == error.OutOfMemory) return e;
+            failure = http.describe(e);
+        }
+        if (stale) |t| {
+            try err.print("deed validate: {s}: {s}; using an older copy\n", .{ source, failure });
+            stale = null;
+            return t;
+        }
+        try err.print("deed validate: {s}: {s}\n", .{ source, failure });
+        return null;
     }
     return std.Io.Dir.cwd().readFileAlloc(io, source, gpa, .limited(max_schema_bytes)) catch |e| {
         try err.print("deed validate: {s}: {s}\n", .{ source, @errorName(e) });
         return null;
     };
+}
+
+/// Writes the copy whole or not at all. A cache that cannot be written is no
+/// reason to fail a run that has its schema.
+fn keepCopy(gpa: std.mem.Allocator, io: std.Io, cfg: Config, path: []const u8, body: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, cfg.cache_dir orelse return) catch return;
+    const tmp = std.fmt.allocPrint(gpa, "{s}.tmp", .{path}) catch return;
+    defer gpa.free(tmp);
+    cwd.writeFile(io, .{ .sub_path = tmp, .data = body }) catch return;
+    cwd.rename(tmp, cwd, path, io) catch cwd.deleteFile(io, tmp) catch {};
 }
 
 /// Validates every record `input` yields. Valid events go to `out` as they
@@ -783,6 +843,20 @@ pub fn run(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
+    const cache = cmd_nip.cacheDirFor(gpa, "schemas") catch null;
+    defer if (cache) |c| gpa.free(c);
+    return runWith(gpa, io, args, out, err, .{ .cache_dir = cache });
+}
+
+pub fn runWith(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+    cfg: Config,
+) !u8 {
+    var refresh = false;
     var source: []const u8 = default_schema_url;
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(gpa);
@@ -794,7 +868,9 @@ pub fn run(
             try out.writeAll(usage);
             return cli.exit_ok;
         }
-        if (std.mem.eql(u8, a, "--schema")) {
+        if (std.mem.eql(u8, a, "--refresh")) {
+            refresh = true;
+        } else if (std.mem.eql(u8, a, "--schema")) {
             i += 1;
             if (i >= args.len) {
                 try err.writeAll("deed validate: '--schema' needs a value\n");
@@ -809,7 +885,7 @@ pub fn run(
         }
     }
 
-    const text = (try loadSchemaText(gpa, io, source, err)) orelse return cli.exit_fail;
+    const text = (try loadSchemaText(gpa, io, source, cfg, refresh, err)) orelse return cli.exit_fail;
     defer gpa.free(text);
     var failure: ParseFailure = .{};
     var schema = parseSchema(gpa, text, &failure) catch |e| switch (e) {
@@ -947,7 +1023,7 @@ test "tags, content and required tags are checked against the schema" {
     try testing.expect(try reason(arena, &schema, try mkEvent(arena, signer, kp, 1, &.{&.{ "p", pk }}, "hi")) == null);
     try testing.expect(try reason(arena, &schema, try mkEvent(arena, signer, kp, 1, &.{&.{ "p", pk, "wss://r.example", "pet" }}, "hi")) == null);
 
-    // The example from nak's usage.
+    // An example event with a malformed pubkey tag.
     const bad_p = (try reason(arena, &schema, try mkEvent(arena, signer, kp, 1, &.{&.{ "p", "not_a_pubkey" }}, ""))).?;
     try testing.expectEqualStrings("tag[0][1]: invalid pubkey value 'not_a_pubkey' at tag 'p', index 1: pubkey should be 64-char hex, got 'not_a_pubkey'", bad_p);
 
@@ -999,7 +1075,7 @@ test "content types, required tags, d tags and unknown kinds" {
     const bad_json = (try reason(arena, &schema, try mkEvent(arena, signer, kp, 0, &.{}, "{nope"))).?;
     try testing.expectEqualStrings("content: invalid json", bad_json);
 
-    // Required tags are reported in the order nak's swap-removal leaves them.
+    // Required tags are reported in the order the checker removes them from the list.
     const none = (try reason(arena, &schema, try mkEvent(arena, signer, kp, 5, &.{}, ""))).?;
     try testing.expectEqualStrings("missing tags: [e k]", none);
     const only_e = (try reason(arena, &schema, try mkEvent(arena, signer, kp, 5, &.{&.{ "e", id }}, ""))).?;
@@ -1082,4 +1158,44 @@ test "the schema is read from a file, and help and bad options are answered" {
     try testing.expectEqual(cli.exit_fail, try run(testing.allocator, testing.io, &.{ "--schema", "no/such/file.yaml", good }, &out.writer, &err.writer));
     try testing.expectEqual(cli.exit_usage, try run(testing.allocator, testing.io, &.{"--bogus"}, &out.writer, &err.writer));
     try testing.expectEqual(cli.exit_usage, try run(testing.allocator, testing.io, &.{"--schema"}, &out.writer, &err.writer));
+}
+
+test "a schema fetched from a URL is kept for a day, refreshed on request, and used offline" {
+    const io = testing.io;
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var srv: http.TestServer = undefined;
+    try srv.start(io, &.{.{ .path = "/schema.yaml", .body = test_schema }}, 2);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &root);
+    const cfg: Config = .{ .cache_dir = root[0..n], .timeout_ms = 2_000 };
+
+    var url_buf: [64]u8 = undefined;
+    const url = try gpa.dupe(u8, try srv.url(&url_buf, "/schema.yaml"));
+    defer gpa.free(url);
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x74} ** 32);
+    const good = try nostr.event.toJson(gpa, try mkEvent(gpa, signer, kp, 1, &.{&.{ "t", "up" }}, ""));
+    defer gpa.free(good);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    // Two fetches are possible; the second run must not use one.
+    try testing.expectEqual(cli.exit_ok, try runWith(gpa, io, &.{ "--schema", url, good }, &out.writer, &err.writer, cfg));
+    try testing.expectEqual(cli.exit_ok, try runWith(gpa, io, &.{ "--schema", url, good }, &out.writer, &err.writer, cfg));
+    try testing.expectEqualStrings("", err.written());
+    // --refresh uses the second connection.
+    try testing.expectEqual(cli.exit_ok, try runWith(gpa, io, &.{ "--refresh", "--schema", url, good }, &out.writer, &err.writer, cfg));
+    srv.stop(io);
+    // The server is gone: the kept copy still works, with a warning.
+    try testing.expectEqual(cli.exit_ok, try runWith(gpa, io, &.{ "--refresh", "--schema", url, good }, &out.writer, &err.writer, cfg));
+    try testing.expect(std.mem.indexOf(u8, err.written(), "older copy") != null);
 }
