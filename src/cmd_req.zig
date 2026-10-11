@@ -498,6 +498,7 @@ pub fn runWith(
         for (filters.items) |*f| f.* = try filterflags.overlay(arena, f.*, req.filter);
     }
     // A long list of ids goes out as several filters in the one REQ, never cut.
+    const unsplit = filters.items;
     filters.items = try filterflags.splitLarge(arena, filters.items);
 
     // Answered from what is already kept, without dialling. This is the half
@@ -510,24 +511,48 @@ pub fn runWith(
         var st = (try storepath.open(gpa, io, "req", path, .existing, err)) orelse return cli.exit_fail;
         defer st.deinit();
 
+        // Each filter the caller wrote is answered whole: its pieces are run,
+        // merged newest first, and cut to that filter's own limit.
+        var results: std.ArrayList(nostr.store.QueryResult) = .empty;
+        defer {
+            for (results.items) |*r| r.deinit();
+            results.deinit(gpa);
+        }
+        var merged: std.ArrayList(nostr.event.Event) = .empty;
+        defer merged.deinit(gpa);
         var seen = std.AutoHashMap([32]u8, void).init(gpa);
         defer seen.deinit();
-        for (filters.items) |f| {
-            var result = st.query(gpa, f) catch |e| {
-                try err.print("deed req: the store could not answer: {s}\n", .{@errorName(e)});
-                return cli.exit_fail;
-            };
-            defer result.deinit();
-            for (result.events) |ev| {
-                if ((try seen.fetchPut(ev.id, {})) != null) continue;
-                if (req.ids_only) {
-                    try printId(gpa, out, ev.id);
-                    continue;
+        for (unsplit) |whole| {
+            const pieces = try filterflags.splitLarge(arena, &.{whole});
+            const first = merged.items.len;
+            var mark = std.AutoHashMap([32]u8, void).init(gpa);
+            defer mark.deinit();
+            for (pieces) |f| {
+                const result = st.query(gpa, f) catch |e| {
+                    try err.print("deed req: the store could not answer: {s}\n", .{@errorName(e)});
+                    return cli.exit_fail;
+                };
+                try results.append(gpa, result);
+                for (result.events) |ev| {
+                    if ((try mark.fetchPut(ev.id, {})) != null) continue;
+                    try merged.append(gpa, ev);
                 }
-                const json = try nostr.event.toJson(gpa, ev);
-                defer gpa.free(json);
-                try out.print("{s}\n", .{json});
             }
+            std.mem.sort(nostr.event.Event, merged.items[first..], {}, newestFirst);
+            if (whole.limit) |lim| {
+                if (merged.items.len - first > lim) merged.shrinkRetainingCapacity(first + lim);
+            }
+        }
+        std.mem.sort(nostr.event.Event, merged.items, {}, newestFirst);
+        for (merged.items) |ev| {
+            if ((try seen.fetchPut(ev.id, {})) != null) continue;
+            if (req.ids_only) {
+                try printId(gpa, out, ev.id);
+                continue;
+            }
+            const json = try nostr.event.toJson(gpa, ev);
+            defer gpa.free(json);
+            try out.print("{s}\n", .{json});
         }
         return cli.exit_ok;
     }
@@ -592,6 +617,11 @@ pub fn runWith(
         return cli.exit_fail;
     }
     return cli.exit_ok;
+}
+
+fn newestFirst(_: void, a: nostr.event.Event, b: nostr.event.Event) bool {
+    if (a.created_at != b.created_at) return a.created_at > b.created_at;
+    return std.mem.lessThan(u8, &a.id, &b.id);
 }
 
 /// One relay, and the part of the question it is asked.
@@ -1101,6 +1131,69 @@ fn runReqStdin(args: []const []const u8, stdin: []const u8, out_buf: []u8, err_b
     var reader: std.Io.Reader = .fixed(stdin);
     const code = try runWith(std.testing.allocator, std.testing.io, args, &reader, &out, &err);
     return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
+}
+
+test "--local with a split filter is cut to the limit and printed newest first" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s.mdb", .{root[0..root_len]});
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp_a = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    const kp_b = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    {
+        var err_buf: [256]u8 = undefined;
+        var err: std.Io.Writer = .fixed(&err_buf);
+        var st = (try storepath.open(std.testing.allocator, io, "req", path, .create, &err)).?;
+        defer st.deinit();
+        for (0..15) |i| {
+            const t: i64 = @intCast(1000 + 2 * i);
+            _ = try st.putEvent(std.testing.allocator, try nostr.event.create(a, signer, kp_a, t, 1, &.{}, "a", null));
+            _ = try st.putEvent(std.testing.allocator, try nostr.event.create(a, signer, kp_b, t + 1, 1, &.{}, "b", null));
+        }
+    }
+
+    // A is in the first chunk of authors, B in the second.
+    var json: std.ArrayList(u8) = .empty;
+    try json.appendSlice(a, "{\"kinds\":[1],\"authors\":[");
+    for (0..600) |i| {
+        if (i > 0) try json.append(a, ',');
+        var pk: [32]u8 = [_]u8{0} ** 32;
+        if (i == 0) pk = kp_a.public_key else if (i == 550) pk = kp_b.public_key else {
+            pk[30] = @truncate(i >> 8);
+            pk[31] = @truncate(i);
+            pk[0] = 0x77;
+        }
+        try json.print(a, "\"{x}\"", .{&pk});
+    }
+    try json.appendSlice(a, "]}");
+
+    var ob: [16384]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try runReqStdin(&.{ "-l", "10", "--store", path, "--local", "-" }, json.items, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    var lines = std.mem.splitScalar(u8, r.out, '\n');
+    var count: usize = 0;
+    var prev: i64 = std.math.maxInt(i64);
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try nostr.event.fromJson(std.testing.allocator, line);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.created_at < prev);
+        prev = parsed.value.created_at;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 10), count);
+    try std.testing.expectEqual(@as(i64, 1020), prev);
 }
 
 test "search, generic tags, d and h land in the filter" {
