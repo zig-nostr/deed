@@ -121,6 +121,14 @@ pub const Server = struct {
     test_req_hook: ?*const fn (*Server) void = null,
     /// Commits made, and events in them, for tests.
     commits: std.atomic.Value(u64) = .init(0),
+    /// Numbers the writer's batches. A batch takes its number before it
+    /// touches the store, and `batches_done` catches up once the batch has
+    /// been fanned out, so a REQ can tell which commits its query may
+    /// already contain.
+    batches_begun: std.atomic.Value(u64) = .init(0),
+    batches_done: std.atomic.Value(u64) = .init(0),
+    /// Test hook: runs right after a REQ's EOSE has been queued.
+    test_eose_hook: ?*const fn (*Server) void = null,
     committed: std.atomic.Value(u64) = .init(0),
 
     /// Starts listening and accepting in the background. `self` must not move
@@ -287,7 +295,9 @@ pub const Server = struct {
 
     /// Offers `ev` to every subscription that matches it, on every
     /// connection. Never waits on a client.
-    fn fanout(self: *Server, ev: Event) void {
+    /// `batch` is the writer's batch number, or 0 for an event that was
+    /// never stored.
+    fn fanout(self: *Server, ev: Event, batch: u64) void {
         const json = event.toJson(self.gpa, ev) catch return;
         defer self.gpa.free(json);
         self.mu.lockUncancelable(self.io);
@@ -297,10 +307,18 @@ pub const Server = struct {
             defer c.sub_mu.unlock(self.io);
             var it = c.subs.iterator();
             while (it.next()) |entry| {
-                if (!anyMatches(entry.value_ptr.filters, ev)) continue;
-                if (!entry.value_ptr.live) {
-                    const gop = entry.value_ptr.seen.getOrPut(self.gpa, ev.id) catch continue;
+                const sub = entry.value_ptr;
+                if (!anyMatches(sub.filters, ev)) continue;
+                if (!sub.live) {
+                    const gop = sub.seen.getOrPut(self.gpa, ev.id) catch continue;
                     if (gop.found_existing) continue;
+                } else if (sub.gate != 0) {
+                    if (batch > sub.gate) {
+                        // Every commit the query could have seen is out.
+                        sub.seen.deinit(self.gpa);
+                        sub.seen = .empty;
+                        sub.gate = 0;
+                    } else if (sub.seen.contains(ev.id)) continue;
                 }
                 const frame = eventFrame(self.gpa, entry.key_ptr.*, json) catch continue;
                 _ = self.fanned.fetchAdd(1, .monotonic);
@@ -320,6 +338,11 @@ const Sub = struct {
     /// and arriving live is delivered once. Under `sub_mu`.
     live: bool = false,
     seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    /// Non-zero once live while `seen` is kept: the last batch number whose
+    /// commit the stored answer may contain. A fan-out of such a batch can
+    /// still arrive after EOSE, so those are checked against `seen`; the
+    /// first later batch proves they are all out and frees it.
+    gate: u64 = 0,
 
     fn deinit(s: *Sub, gpa: std.mem.Allocator) void {
         s.seen.deinit(gpa);
@@ -629,6 +652,8 @@ fn commitBatch(
     for (jobs) |job| if (job.parsed) |p| evs.appendAssumeCapacity(p.value.event);
     results.resize(gpa, evs.items.len) catch unreachable; // capacity was reserved
     var failed: ?[]const u8 = null;
+    const batch = server.batches_begun.fetchAdd(1, .acq_rel) + 1;
+    defer server.batches_done.store(batch, .release);
     if (evs.items.len > 0) {
         const injected = server.fail_commits.load(.acquire) > 0 and
             server.fail_commits.fetchSub(1, .acq_rel) > 0;
@@ -652,7 +677,7 @@ fn commitBatch(
             if (failed) |f| break :blk .{ f, false };
             switch (results.items[k]) {
                 .added, .replaced, .ephemeral => {
-                    server.fanout(evs.items[k]);
+                    server.fanout(evs.items[k], batch);
                     break :blk .{ "", true };
                 },
                 .duplicate => break :blk .{ "duplicate: already have this event", true },
@@ -1204,11 +1229,16 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
         defer c.sub_mu.unlock(c.io);
         if (c.subs.getPtr(sub_id)) |sub| {
             sub.live = true;
-            sub.seen.deinit(c.gpa);
-            sub.seen = .empty;
+            // Any commit the query saw took its number before this read.
+            const upto = c.server.batches_begun.load(.acquire);
+            if (c.server.batches_done.load(.acquire) >= upto) {
+                sub.seen.deinit(c.gpa);
+                sub.seen = .empty;
+            } else sub.gate = upto;
         }
     }
     try c.sendOwned(try message.encodeEose(c.gpa, sub_id));
+    if (c.server.test_eose_hook) |hook| hook(c.server);
 }
 
 /// Records that `id` is going to the subscription before its EOSE, and says
@@ -2507,7 +2537,7 @@ fn dedupHook(server: *Server) void {
     // The event is stored and announced while the REQ is between its
     // registration and its query, so both the query and fan-out carry it.
     _ = server.store.ingest(server.gpa, dedup_hook_event, .{}) catch return;
-    server.fanout(dedup_hook_event);
+    server.fanout(dedup_hook_event, 0);
 }
 
 test "an event both stored and fanned out before EOSE is sent once" {
@@ -2534,6 +2564,59 @@ test "an event both stored and fanned out before EOSE is sent once" {
         events += 1;
     }
     try testing.expectEqual(@as(usize, 1), events);
+}
+
+fn lateReqHook(server: *Server) void {
+    // The writer has committed the event, and its fan-out has not run yet.
+    _ = server.batches_begun.fetchAdd(1, .acq_rel);
+    _ = server.store.ingest(server.gpa, dedup_hook_event, .{}) catch return;
+}
+
+fn lateEoseHook(server: *Server) void {
+    // The writer's fan-out arrives after the REQ has been answered.
+    server.fanout(dedup_hook_event, 1);
+    server.batches_done.store(1, .release);
+}
+
+test "an event committed before the query but fanned out after EOSE is sent once" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 9);
+    const now = nowSeconds(testing.io);
+    dedup_hook_event = try makeEvent(arena, signer, kp, 1, now, "late");
+    ts.server.test_req_hook = lateReqHook;
+    ts.server.test_eose_hook = lateEoseHook;
+
+    var cl = try RawClient.connect(gpa, ts.server.port());
+    defer cl.deinit();
+    try cl.send("[\"REQ\",\"s\",{\"kinds\":[1]}]");
+    var events: usize = 0;
+    while (true) {
+        const t = try cl.text();
+        if (std.mem.startsWith(u8, t, "[\"EOSE\"")) break;
+        events += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), events);
+
+    // Whatever fan-out sent after EOSE is queued ahead of a later event.
+    ts.server.test_req_hook = null;
+    ts.server.test_eose_hook = null;
+    var other = try RawClient.connect(gpa, ts.server.port());
+    defer other.deinit();
+    try other.send(try message.encodeEvent(arena, try makeEvent(arena, signer, kp, 1, now + 1, "marker")));
+    _ = try other.text();
+    while (true) {
+        const t = try cl.text();
+        try testing.expect(std.mem.indexOf(u8, t, "\"late\"") == null);
+        if (std.mem.indexOf(u8, t, "marker") != null) break;
+    }
 }
 
 test "close frames: a reportable code or one byte is a protocol error, a good code is echoed" {
