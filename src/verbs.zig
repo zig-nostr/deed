@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
+const proxy = @import("proxy.zig");
 
 const cmd_decode = @import("cmd_decode.zig");
 const cmd_encode = @import("cmd_encode.zig");
@@ -114,7 +115,7 @@ pub const usage =
     "deed: the nostr command line\n" ++
     "\n" ++
     "Usage:\n" ++
-    "  deed <command> [arguments]\n" ++
+    "  deed [--proxy <url>] <command> [arguments]\n" ++
     "\n" ++
     "Commands:\n" ++
     commandLines() ++
@@ -126,6 +127,10 @@ pub const usage =
     "stdin when given no positional arguments, so verbs compose:\n" ++
     "\n" ++
     "  cat notes.jsonl | deed verify\n" ++
+    "\n" ++
+    "--proxy <url> sends web requests through an http://, socks5:// or\n" ++
+    "socks5h:// proxy (socks5h for Tor). Without it, DEED_PROXY, then\n" ++
+    "HTTPS_PROXY, HTTP_PROXY and ALL_PROXY are used, minus NO_PROXY.\n" ++
     "\n" ++
     "Exit codes: 0 success, 1 the command ran and failed, 2 the command was\n" ++
     "not understood.\n";
@@ -146,13 +151,39 @@ pub fn dispatch(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
-    if (args.len == 0) {
+    var argv = args;
+    var flag: ?[]const u8 = null;
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "--proxy")) {
+        if (argv.len < 2) {
+            try err.writeAll("deed: --proxy needs a URL, like socks5h://127.0.0.1:9050\n");
+            return cli.exit_usage;
+        }
+        flag = argv[1];
+        argv = argv[2..];
+    } else if (argv.len > 0 and std.mem.startsWith(u8, argv[0], "--proxy=")) {
+        flag = argv[0]["--proxy=".len..];
+        argv = argv[1..];
+    }
+    if (flag) |f| {
+        var buf: [2048]u8 = undefined;
+        var fba: std.heap.FixedBufferAllocator = .init(&buf);
+        _ = proxy.parse(fba.allocator(), f) catch {
+            try err.print("deed: --proxy: '{s}' is not a usable proxy URL (use http://, socks5:// or socks5h:// with a host and port)\n", .{f});
+            return cli.exit_usage;
+        };
+    }
+    // For this run only: a test that dispatches must not leave a proxy behind
+    // for the next one.
+    proxy.global = proxy.Config.fromEnv(flag);
+    defer proxy.global = null;
+
+    if (argv.len == 0) {
         try err.writeAll(usage);
         return cli.exit_usage;
     }
 
-    const name = args[0];
-    const rest = args[1..];
+    const name = argv[0];
+    const rest = argv[1..];
 
     if (cli.isOneOf(name, &.{ "help", "-h", "--help" })) {
         if (rest.len != 0) return helpFor(rest[0], out, err);
@@ -210,4 +241,23 @@ test "every ready verb's usage states its exit codes" {
             return e;
         };
     }
+}
+
+test "--proxy before the verb is checked and then left out of its arguments" {
+    var ob: [4096]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&ob);
+    var err: std.Io.Writer = .fixed(&eb);
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    try std.testing.expectEqual(cli.exit_usage, try dispatch(gpa, io, "0", &.{ "--proxy", "ftp://x:1", "version" }, &out, &err));
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "not a usable proxy URL") != null);
+    try std.testing.expectEqual(cli.exit_usage, try dispatch(gpa, io, "0", &.{"--proxy"}, &out, &err));
+
+    try std.testing.expectEqual(cli.exit_ok, try dispatch(gpa, io, "0", &.{ "--proxy", "socks5h://127.0.0.1:9050", "version" }, &out, &err));
+    try std.testing.expectEqual(cli.exit_ok, try dispatch(gpa, io, "0", &.{ "--proxy=http://proxy.corp:3128", "version" }, &out, &err));
+    try std.testing.expectEqualStrings("deed 0\ndeed 0\n", out.buffered());
+    // Nothing is left set for whatever runs next.
+    try std.testing.expect(proxy.global == null);
 }

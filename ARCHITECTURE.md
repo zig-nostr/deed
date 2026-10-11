@@ -62,6 +62,7 @@ Shared pieces:
 - `filterflags.zig`: the filter flags (`-k -a -i -e -p -t -d -h -T -s -u -l --search`) and the JSON filters, parsed once for `req`, `filter`, `count`, `sync` and `store export`.
 - `auth.zig`: NIP-42, see Authentication.
 - `http.zig`: a bounded HTTP client for the verbs that talk to a web server, see HTTP.
+- `proxy.zig`: which proxy a URL goes through (`--proxy`, `DEED_PROXY`, the usual variables, `NO_PROXY`), and the CONNECT and SOCKS5 tunnels `http.zig` opens through it.
 - `parallel.zig`: an ordered worker pool, see Parallel work.
 - `outbox.zig`: finding and checking a person's relay list, and caching it in the store.
 - `relayserver.zig`: the relay behind `serve`, see Local relay.
@@ -120,6 +121,8 @@ Who signs is `signing.zig`. A `Signer` holds either a key read through `keyinput
 ## HTTP
 
 `http.zig` wraps `std.http.Client` for the verbs that talk to a web server: `relay`, NIP-05 in `decode`, `curl`, `admin` and `blossom`. std has no overall deadline, so a request runs as a concurrent task beside a timer and whichever finishes first wins. The response size is capped as bytes arrive. Redirects are followed by hand so every hop is checked: a hop never leaves https for http, and a hop to another origin drops the credentials. Plain http is allowed for a loopback host or when the caller passes `allow_http`. The status is returned and not turned into an error, because a 404 with a body is an answer, and `curl` wants it. Errors come in one small set, each with a plain sentence.
+
+Behind a proxy, `http.zig` speaks HTTP/1.1 itself over a connection it opened to the proxy, because std's client has no SOCKS and runs no TLS inside its CONNECT tunnel. TLS runs end to end inside the tunnel. With `socks5h://` or an `http://` proxy the proxy resolves the host name, so `deny_private` checks only what needs no lookup (an address in the URL, and `localhost`); with `socks5://` the name is resolved and checked here and the proxy is handed the address. Relay dials cannot use a proxy yet, since `nostr.relay.dial` opens its own TCP connection: `dial.zig` refuses a relay that `--proxy` or `DEED_PROXY` would carry rather than reach it directly.
 
 NIP-98 and NIP-86 sign a kind 27235 event and send it in an `Authorization: Nostr` header. `curl` builds that header and hands the rest to the system curl. Blossom streams files and checks the sha256 of what it sent or received before it reports success.
 

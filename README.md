@@ -350,6 +350,8 @@ A NIP-05 name is looked up over https and a redirect is an error. A domain on th
 
 `curl` signs a kind 27235 event for the request and hands the rest to the system curl, whose exit status becomes its own. `admin` signs each call with your key and prints the relay's result. `blossom` has `list`, `upload`, `download`, `delete`, `check` and `mirror`; an upload is confirmed only when the server's sha256 and size match the file, and a download is written only when its sha256 matches. Plain http is used only for a host on this machine, or with `--allow-http` where the verb has it.
 
+Web requests can go through a proxy: `deed --proxy socks5h://127.0.0.1:9050 relay wss://relay.example` sends the NIP-11 request over Tor. Without `--proxy`, deed reads `DEED_PROXY`, then `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` (lowercase too), skipping hosts listed in `NO_PROXY`. `http://` proxies tunnel https with CONNECT, `socks5h://` has the proxy resolve names (so `.onion` works and nothing is looked up locally), `socks5://` resolves here, and `user:pass@` in the URL is sent to the proxy. Relay connections cannot use a proxy yet: with `--proxy` or `DEED_PROXY` set, a relay is not dialled at all unless `NO_PROXY` names it, and a proxy set only in the other variables gets a warning while relays are reached directly.
+
 ## What is missing
 
 deed has no daemon and no config file, so the relays you want on every run go in `DEED_RELAYS`.
