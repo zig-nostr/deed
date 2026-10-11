@@ -24,6 +24,10 @@ pub const max_keys = 2048;
 /// request with more is sent as several filters of at most this many.
 pub const chunk_size = 500;
 
+/// The most filters one filter is split into. Two lists that both pass
+/// `chunk_size` multiply, so a request needing more than this is refused.
+pub const max_pieces = 16;
+
 /// What a repeated flag collects. Fixed, because a command line naming more
 /// than this many tag values is a file being piped in by the wrong route.
 pub fn Collected(comptime T: type) type {
@@ -277,7 +281,7 @@ pub const Flags = struct {
 /// replaced by several that together name the same ones, so that no relay
 /// refuses the request for its size and no id is dropped. The result lives in
 /// `arena`; filters that need no splitting are copied as they are.
-pub fn splitLarge(arena: std.mem.Allocator, filters: []const filter.Filter) ![]filter.Filter {
+pub fn splitLarge(arena: std.mem.Allocator, filters: []const filter.Filter) error{ OutOfMemory, TooManyFilters }![]filter.Filter {
     var out: std.ArrayList(filter.Filter) = .empty;
     for (filters) |f| {
         const n_ids = if (f.ids) |v| v.len else 0;
@@ -288,6 +292,10 @@ pub fn splitLarge(arena: std.mem.Allocator, filters: []const filter.Filter) ![]f
         }
         const id_chunks = @max(1, (n_ids + chunk_size - 1) / chunk_size);
         const author_chunks = @max(1, (n_authors + chunk_size - 1) / chunk_size);
+        // Ids and authors in one filter are an AND, so a list is split only
+        // into chunks that each stand alone, and the other list is repeated
+        // whole in every piece. When both are long that is a product.
+        if (id_chunks * author_chunks > max_pieces) return error.TooManyFilters;
         for (0..id_chunks) |ci| {
             for (0..author_chunks) |ca| {
                 var piece = f;
@@ -418,6 +426,25 @@ test "more than a relay takes of ids or authors is split across filters, losing 
     try std.testing.expectEqual(@as(?u32, 7), out[3].limit);
     const exact = try splitLarge(arena, &.{.{ .ids = ids[0..500] }});
     try std.testing.expectEqual(@as(usize, 1), exact.len);
+}
+
+test "splitting keeps the other list whole and caps the number of pieces" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ids = try arena.alloc([32]u8, 2048);
+    const authors = try arena.alloc([32]u8, 400);
+    for (ids, 0..) |*id, i| id.* = [_]u8{0} ** 30 ++ [_]u8{ @truncate(i >> 8), @truncate(i) };
+    for (authors, 0..) |*id, i| id.* = [_]u8{1} ** 30 ++ [_]u8{ @truncate(i >> 8), @truncate(i) };
+    // One list over the chunk size: it is split, the other is kept whole.
+    const one = try splitLarge(arena, &.{.{ .ids = ids, .authors = authors }});
+    try std.testing.expectEqual(@as(usize, 5), one.len);
+    for (one) |p| try std.testing.expectEqual(@as(usize, 400), p.authors.?.len);
+    // Both over it: a product of chunks, within the cap.
+    const both = try splitLarge(arena, &.{.{ .ids = ids[0..1200], .authors = ids[0..1200] }});
+    try std.testing.expectEqual(@as(usize, 9), both.len);
+    // 2048 x 2048 would be 25 pieces.
+    try std.testing.expectError(error.TooManyFilters, splitLarge(arena, &.{.{ .ids = ids, .authors = ids }}));
 }
 
 test "filterflags: repeated flags collect and the filter points at them" {
