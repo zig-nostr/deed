@@ -124,6 +124,8 @@ pub const Relay = struct {
     closing: bool = false,
     /// Connections served before the task returns.
     connections: usize = 1,
+    /// Set by `stop` before it wakes `accept` with a connection of its own.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// Event JSON the `serve` mode sends in answer to a REQ.
     serving: []const []const u8 = &.{},
     /// The handler for `Mode.custom`, and the context it is given. `startCustom`
@@ -166,6 +168,14 @@ pub const Relay = struct {
     }
 
     pub fn stop(self: *Relay, io: Io) void {
+        // A task that has already used up its cancel (a read that came back
+        // canceled, swallowed by `handle`) cannot be woken from `accept` by
+        // another one. A connection always wakes it, and `serve` sees the flag
+        // and returns, so `cancel` below finds a task that is finishing.
+        self.stopping.store(true, .release);
+        if (Io.net.IpAddress.parse("127.0.0.1", self.port())) |addr| {
+            if (addr.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        } else |_| {}
         self.task.cancel(io);
         self.server.deinit(io);
     }
@@ -183,6 +193,7 @@ pub const Relay = struct {
         for (0..self.connections) |_| {
             const conn = self.server.accept(io) catch return;
             defer conn.close(io);
+            if (self.stopping.load(.acquire)) return;
             self.handle(io, conn) catch {};
         }
     }
