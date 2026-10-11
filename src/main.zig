@@ -265,6 +265,8 @@ test {
     _ = @import("cmd_serve.zig");
     _ = @import("cmd_store.zig");
     _ = @import("cmd_mcp.zig");
+    _ = @import("cmd_outbox.zig");
+    _ = @import("cmd_nsite.zig");
     _ = @import("cmd_sync.zig");
     _ = @import("kinds.zig");
     _ = @import("outbox.zig");
