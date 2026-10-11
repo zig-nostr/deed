@@ -274,16 +274,21 @@ fn getEnv(name: [*:0]const u8) ?[]const u8 {
 /// The directory this verb keeps files in, owned by the caller. Null when the
 /// system names no home.
 fn cacheDir(gpa: std.mem.Allocator) !?[]u8 {
+    return cacheDirFor(gpa, "nips");
+}
+
+/// Like `cacheDir`, for the verb that keeps its files in `leaf`.
+pub fn cacheDirFor(gpa: std.mem.Allocator, leaf: []const u8) !?[]u8 {
     if (builtin.os.tag == .windows) {
         const base = getEnv("LOCALAPPDATA") orelse return null;
-        return try std.fs.path.join(gpa, &.{ base, "deed", "nips" });
+        return try std.fs.path.join(gpa, &.{ base, "deed", leaf });
     }
     if (getEnv("XDG_CACHE_HOME")) |x| {
-        if (std.fs.path.isAbsolute(x)) return try std.fs.path.join(gpa, &.{ x, "deed", "nips" });
+        if (std.fs.path.isAbsolute(x)) return try std.fs.path.join(gpa, &.{ x, "deed", leaf });
     }
     const home = getEnv("HOME") orelse return null;
-    if (builtin.os.tag == .macos) return try std.fs.path.join(gpa, &.{ home, "Library", "Caches", "deed", "nips" });
-    return try std.fs.path.join(gpa, &.{ home, ".cache", "deed", "nips" });
+    if (builtin.os.tag == .macos) return try std.fs.path.join(gpa, &.{ home, "Library", "Caches", "deed", leaf });
+    return try std.fs.path.join(gpa, &.{ home, ".cache", "deed", leaf });
 }
 
 // ---- tests ---------------------------------------------------------------
