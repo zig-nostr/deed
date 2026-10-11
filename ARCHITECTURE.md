@@ -8,7 +8,7 @@ A command line for nostr, written in Zig 0.16 on top of the [`nostr`](https://gi
 
 Everything with real protocol content comes from the library: keys and signatures, the event model, filters, relay connections, the store. deed is the command line around it: argument parsing, reading and writing records, running a query or a publish under a deadline, and deciding what to say and what to exit with. Nothing in `src/` implements cryptography.
 
-deed is one short-lived process per command. There is no config file and no default location for the store, and no daemon except the verbs whose job is to keep running (`bunker`). State lives in the environment (`NOSTR_SECRET_KEY`, `NOSTR_PASSWORD`, `DEED_RELAYS`), in arguments, and in the store path when one is given.
+deed is one short-lived process per command. There is no config file and no default location for the store, and no daemon except the verbs whose job is to keep running (`bunker`, `serve`, and `mcp` while a client is connected). State lives in the environment (`NOSTR_SECRET_KEY`, `NOSTR_PASSWORD`, `DEED_RELAYS`), in arguments, and in the store path when one is given.
 
 ## Where each command lives
 
@@ -41,7 +41,13 @@ deed is one short-lived process per command. There is no config file and no defa
 | `curl` | `cmd_curl.zig` | NIP-98 signed requests through the system curl |
 | `admin` | `cmd_admin.zig` | NIP-86 relay management |
 | `blossom` | `cmd_blossom.zig` | Blossom blobs: list, upload, download, delete, check, mirror |
-| `serve` | `cmd_serve.zig` | a local relay (not finished) <!-- TODO serve --> |
+| `serve` | `cmd_serve.zig`, `relayserver.zig` | a relay on this machine for development and tests, over a local store |
+| `spell` | `cmd_spell.zig` | fetch a kind 777 spell and run the subscription its tags describe |
+| `mcp` | `cmd_mcp.zig` | deed's tools over the Model Context Protocol on stdio |
+| `outbox` | `cmd_outbox.zig` | list, refresh and clear the relay lists cached in a store |
+| `nsite` | `cmd_nsite.zig` | static sites (NIP-5A): deploy, download, list |
+| `nip` | `cmd_nip.zig` | list the NIPs or print one, cached for a day |
+| `group` | `cmd_group.zig` | NIP-29 groups: read, chat, join, moderation |
 
 Shared pieces:
 
@@ -53,7 +59,8 @@ Shared pieces:
 - `auth.zig`: NIP-42, see Authentication.
 - `http.zig`: a bounded HTTP client for the verbs that talk to a web server, see HTTP.
 - `parallel.zig`: an ordered worker pool, see Parallel work.
-- `outbox.zig`: finding and checking a person's relay list.
+- `outbox.zig`: finding and checking a person's relay list, and caching it in the store.
+- `relayserver.zig`: the relay behind `serve`, see Local relay.
 - `negclient.zig`: NIP-77 negentropy against one relay, plus the plain reads around it.
 - `password.zig`: reading a password with echo off, or from `NOSTR_PASSWORD`.
 - `qr.zig`: a QR encoder for `bunker --qrcode`.
@@ -116,7 +123,17 @@ NIP-98 and NIP-86 sign a kind 27235 event and send it in an `Authorization: Nost
 
 ## Outbox lookup
 
-`outbox.zig` finds a person's relay list: the newest kind 10002 event, signature checked, taken from a named set of relays and nowhere else. The set is the relays on the command line, an nprofile's hints, and `DEED_RELAYS`. There is no built-in default, so deed never contacts a relay the user did not name. With no list published, the relay hints in their kind 3 are used. `relays` prints the result, and with `--store` caches the list and reads it back first unless `--refresh` is given.
+`outbox.zig` finds a person's relay list: the newest kind 10002 event, signature checked, taken from a named set of relays and nowhere else. The set is the relays on the command line, an nprofile's hints, and `DEED_RELAYS`. There is no built-in default, so deed never contacts a relay the user did not name. With no list published, the relay hints in their kind 3 are used. `relays` prints the result, and with `--store` caches the list and reads it back first unless `--refresh` is given. The verbs that follow a person to their own relays (`fetch`, `post`, `profile`, `req --outbox` and `spell`) use the same lookup, with bootstrap relays from `-r` / `--relay` and `DEED_RELAYS`, and keep what they fetched in the store named with `--store`. `cmd_outbox.zig` is the command for that cache: `list` shows it, `refresh` asks the named relays again and keeps the newest list, and `clear` removes the cached lists and nothing else in the store.
+
+## Local relay
+
+`relayserver.zig` is a websocket server over a local event store, and `cmd_serve.zig` is the command around it. Each connection gets two tasks. The reader takes frames off the socket, answers them, and is the only code that changes that connection's subscriptions. The writer drains a queue of frames onto the socket, and nothing else writes to one. An event published on another connection is offered to a queue without waiting, and a queue that grows past its limit gets the connection dropped, so a client that stops reading slows nobody but itself. Every way out of a connection goes through the socket, so a slow consumer, a handshake that never finishes and a server that is stopping all wake whichever task is blocked on it.
+
+Every event's id and signature is checked before it is stored. The relay speaks NIP-01, NIP-09, NIP-11, NIP-40, NIP-42, NIP-45, NIP-70 and NIP-77, and holds limits on message size, subscriptions per connection, filters per REQ and events per answer. With `--store` accepted events are written in groups and synced before they are acknowledged. A websocket request that carries an `Origin` header is refused unless `--allow-origin` names it, so a browser page cannot reach a relay on the machine by default. `testrelay.zig` is still the relay the tests use, since it can misbehave on purpose.
+
+## MCP
+
+`cmd_mcp.zig` speaks JSON-RPC 2.0 on stdio, one message per line, with nothing on stdout but protocol messages. Each tool calls the verb of the same name in this process with an argument list built from the tool's structured arguments, so a tool and the command line cannot disagree about what a filter or a code means. Nothing is spawned. Because the arguments are built there, a caller cannot reach an option a tool does not offer: a value that could be read as a flag is refused, a relay must be a ws:// or wss:// URL, and the store a tool reads is the one named when the server started. Every call has a deadline taken from its `timeout_ms` and clamped to 30 seconds, and a result is capped at 256 KiB. The publishing tools exist only with `--allow-publish`, and the key comes from `--sec` or `NOSTR_SECRET_KEY` and never from a tool argument.
 
 ## Sync
 

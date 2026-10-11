@@ -1,6 +1,6 @@
 ---
 name: deed
-description: Use deed, the nostr command line, to work with nostr from a shell. Use when generating nostr keys, deriving an npub, building and signing events, checking signatures, encoding or decoding NIP-19 codes (npub, nsec, note, nprofile, nevent, naddr), encrypting or decrypting NIP-44 or NIP-04 messages, querying and counting events on relays with REQ filters, fetching the events a code names, publishing events or notes to relays, finding a person's relays, syncing relays, sending private messages, reading or changing a profile, running a NIP-46 signer, managing a relay (NIP-86), working with Blossom blobs, making NIP-98 signed HTTP requests, or keeping events in a local store to query offline. Also use when writing scripts or pipelines that process nostr events as JSON lines, or when testing a nostr client or relay.
+description: Use deed, the nostr command line, to work with nostr from a shell. Use when generating nostr keys, deriving an npub, building and signing events, checking signatures, encoding or decoding NIP-19 codes (npub, nsec, note, nprofile, nevent, naddr), encrypting or decrypting NIP-44 or NIP-04 messages, querying and counting events on relays with REQ filters, fetching the events a code names, publishing events or notes to relays, finding a person's relays, syncing relays, sending private messages, reading or changing a profile, running a NIP-46 signer, managing a relay (NIP-86), working with Blossom blobs, making NIP-98 signed HTTP requests, running a local relay, serving deed's tools over MCP, running a spell, reading or writing NIP-29 groups, deploying a static site (NIP-5A), reading a NIP, following a person to their own relays, or keeping events in a local store to query offline. Also use when writing scripts or pipelines that process nostr events as JSON lines, or when testing a nostr client or relay.
 ---
 
 # deed
@@ -34,6 +34,11 @@ Ask the user before running any of these, every time. They send something out, c
 - `deed admin`: it changes a relay's bans, allow lists and settings, and needs the relay owner's key.
 - `deed bunker`: it signs for whoever it authorizes, for as long as it runs. Authorize only the clients the user names, and say when it is running.
 - `deed store delete` and `deed store prune`: they remove events from the local file.
+- `deed group` writes: `chat --send`, `join`, `leave`, `put-user`, `remove-user`, `delete-event`, `create-group`, `delete-group` and `create-invite` publish signed events to the group's relay. `info`, `members`, `admins` and `chat` without `--send` only read.
+- `deed nsite deploy`: it uploads files to Blossom servers and publishes the site manifest. `nsite list` and `download` only read.
+- `deed mcp --allow-publish`: it lets the connected client publish notes and events with the user's key. Start `deed mcp` without it unless the user asks for publishing, and never put the key on the command line.
+- `deed serve`: it opens a port on this machine. Keep the default 127.0.0.1, do not pass `--hostname` for another address or `--allow-origin` (least of all `*`) unless the user asks, and say when it is running.
+- `deed outbox clear`: it removes cached relay lists from the user's store. `outbox list` and `refresh` do not remove anything.
 - `deed gift dm` itself sends nothing, but piping it into `deed publish` does.
 - `deed curl` signs a request with the user's key and sends it, so treat it as the action the URL performs.
 - Never publish or sign with a key that is not the user's to use.
@@ -152,6 +157,37 @@ deed blossom check <sha256> -s cdn.example.com
 deed blossom download <sha256> -s cdn.example.com -o file
 deed blossom upload photo.jpg -s cdn.example.com
 
+# follow people to their own relays (bootstrap relays only from -r or DEED_RELAYS)
+deed req -k 1 -l 20 --outbox -a npub1... -r wss://purplepag.es   # each author's write relays
+deed req -k 1 --outbox -n 2 -a npub1... -r wss://purplepag.es    # 2 relays per author, default 3
+deed fetch npub1... -r wss://purplepag.es                        # a code with no hints
+deed outbox list --store ~/.deed/db --json                       # the cached relay lists
+deed outbox refresh npub1... --store ~/.deed/db -r wss://purplepag.es
+deed outbox clear --store ~/.deed/db npub1...                    # ASK FIRST
+
+# a spell, and the NIPs
+deed spell nevent1... -r wss://relay.example --pub npub1...
+deed nip                                                   # every NIP with its title
+deed nip 29                                                # the text of NIP-29
+
+# groups: relay'group-id (ASK FIRST for anything that writes)
+deed group info 'wss://groups.example'pizza
+deed group chat 'wss://groups.example'pizza --limit 20
+deed group chat 'wss://groups.example'pizza --send "hello"
+
+# a static site (NIP-5A; ASK FIRST for deploy)
+deed nsite list npub1... --sites -r wss://relay.example
+deed nsite download npub1... ./copy -r wss://relay.example
+deed nsite deploy ./public --server cdn.example.com wss://relay.example
+
+# a local relay for tests (ASK FIRST: it opens a port)
+deed serve --port 0 | head -1                              # prints the ws:// URL
+deed serve --store ~/.deed/relay --events seed.jsonl
+
+# deed's tools over MCP, for a client to start (ASK FIRST for --allow-publish)
+# {"mcpServers":{"deed":{"command":"deed","args":["mcp"]}}}
+deed mcp --store ~/.deed/db                                # adds store_query, read only
+
 # a signer others connect to (ASK FIRST)
 deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
 ```
@@ -165,8 +201,10 @@ deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
 - `deed verify` is silent on success. Check the exit code, not the output.
 - Events from relays are verified and matched against the filter before they are printed, so a relay cannot slip in forged or unrelated events. Anything dropped is reported on stderr.
 - A relay that does not accept the connection within five seconds (or `--timeout`, if shorter) is named on stderr and left out; the run carries on with the others.
-- deed does not find an author's relays on its own in `req`, `fetch` or `post`: use `deed relays` and name them.
-- `deed serve` and using a bunker:// URI as a key are not finished; do not rely on them. <!-- TODO serve --> <!-- TODO remote signer -->
+- deed contacts only relays the user named, with an argument, `-r` / `--relay` or `DEED_RELAYS`. It has no built-in list. `fetch`, `post`, `profile`, `spell` and `req --outbox` follow a person to their own write relays, but they find the relay list through those named relays, so set `DEED_RELAYS` or pass `-r` first. A note or event id with no hints has no author to follow and still needs a relay named.
+- `req --outbox` cannot be combined with `--stream`, `--paginate` or `--local`. `req` reads stdin only for a lone `-`.
+- `deed serve` refuses a browser page unless `--allow-origin` names its origin. The MCP server lists publishing tools only with `--allow-publish`, and a call that needs the key reads it from `--sec` or `NOSTR_SECRET_KEY`, never from the tool's arguments.
+- Using a bunker:// URI as a key is not finished; do not rely on it. <!-- TODO remote signer -->
 - `deed post` and `deed profile set` need a relay URL; without one they do nothing useful. `deed profile set` is not a way to start a profile from scratch: an unreadable profile is never overwritten.
 - `deed event -` reads drafts; `deed event -c ... wss://relay` also publishes. Check which you mean.
 
