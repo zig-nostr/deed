@@ -21,6 +21,7 @@
 //! over, because a relay can send anything.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 
 const Io = std.Io;
@@ -927,7 +928,25 @@ test "a reason a relay wrote cannot carry terminal controls" {
     try testing.expectEqualStrings("NOTICE: a?[2Jb?", n.text());
 }
 
+test "a write that never finishes gives up at the deadline" {
+    const io = testing.io;
+    // Stands in for a write into a full socket: it waits until cancelled.
+    const Stuck = struct {
+        fn write(i: Io) anyerror!void {
+            try i.sleep(.fromSeconds(60), .awake);
+        }
+    };
+    const started = Io.Timestamp.now(io, .awake).toMilliseconds();
+    try testing.expectError(error.Timeout, writeBy(io, deadlineIn(io, 300), Stuck.write, .{io}));
+    const took = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try testing.expect(took < 3_000);
+}
+
 test "a write to a relay that stops reading gives up at the deadline" {
+    // Windows completes a large send on a loopback socket without waiting for
+    // the peer to read, so the write cannot block there. The deadline is
+    // covered everywhere by the test above, which uses no socket.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     const gpa = std.heap.page_allocator;
     var deaf: testrelay.Relay = undefined;
