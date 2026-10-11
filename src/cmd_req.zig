@@ -499,7 +499,13 @@ pub fn runWith(
     }
     // A long list of ids goes out as several filters in the one REQ, never cut.
     const unsplit = filters.items;
-    filters.items = try filterflags.splitLarge(arena, filters.items);
+    filters.items = filterflags.splitLarge(arena, filters.items) catch |e| switch (e) {
+        error.TooManyFilters => {
+            try err.print("deed req: too many ids and authors together: a filter naming more than {d} of both is not sent in more than {d} pieces\n", .{ filterflags.chunk_size, filterflags.max_pieces });
+            return cli.exit_usage;
+        },
+        else => |other| return other,
+    };
 
     // Answered from what is already kept, without dialling. This is the half
     // that makes keeping worth doing: a store nothing reads back is a log.
@@ -523,7 +529,7 @@ pub fn runWith(
         var seen = std.AutoHashMap([32]u8, void).init(gpa);
         defer seen.deinit();
         for (unsplit) |whole| {
-            const pieces = try filterflags.splitLarge(arena, &.{whole});
+            const pieces = filterflags.splitLarge(arena, &.{whole}) catch unreachable;
             const first = merged.items.len;
             var mark = std.AutoHashMap([32]u8, void).init(gpa);
             defer mark.deinit();
