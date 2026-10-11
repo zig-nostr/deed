@@ -11,17 +11,17 @@
 #
 # Options, when the script runs as a file:
 #
-#   .\install.ps1 -Version v0.5.0 -Prefix C:\tools\deed
+#   .\install.ps1 -Version v0.5.1 -Prefix C:\tools\deed
 #
 # A piped run has no command line to put them on, so it reads the same options
 # from the environment:
 #
-#   $env:DEED_VERSION = 'v0.5.0'
+#   $env:DEED_VERSION = 'v0.5.1'
 #   irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1 | iex
 #
 # or takes them when the download is run as a script block:
 #
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1))) -Version v0.5.0
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.ps1))) -Version v0.5.1
 #
 # An option given on the command line wins over the environment.
 #
