@@ -143,7 +143,7 @@ pub fn run(
     const stdin_buf = try gpa.alloc(u8, max_record_bytes);
     defer gpa.free(stdin_buf);
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
-    var input = cli.Input.init(positionals.items, &stdin_reader.interface);
+    var input = cli.Input.initJson(positionals.items, &stdin_reader.interface);
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();

@@ -52,6 +52,20 @@ pub const Input = struct {
     positionals: []const []const u8,
     index: usize = 0,
     stdin: ?*std.Io.Reader,
+    mode: Mode = .lines,
+    /// The line a stdin record started on, counting from 1 and counting empty
+    /// lines. 0 for a positional argument, which has no line.
+    start_line: usize = 0,
+    /// The line the next unread stdin byte is on.
+    line_no: usize = 1,
+
+    pub const Mode = enum {
+        /// One record per line. For verbs whose records are free text.
+        lines,
+        /// One record per JSON value, separated by any whitespace: one per
+        /// line, pretty-printed over many lines, or several on one line.
+        json,
+    };
 
     pub fn init(positionals: []const []const u8, stdin: ?*std.Io.Reader) Input {
         return .{
@@ -60,14 +74,26 @@ pub const Input = struct {
         };
     }
 
+    /// Like `init`, for verbs whose records are JSON values (events, filters,
+    /// drafts). A value may span lines, and values may share one.
+    pub fn initJson(positionals: []const []const u8, stdin: ?*std.Io.Reader) Input {
+        var i = init(positionals, stdin);
+        i.mode = .json;
+        return i;
+    }
+
     /// The next record, or null at the end.
     pub fn next(self: *Input) !?Record {
         if (self.index < self.positionals.len) {
+            self.start_line = 0;
             defer self.index += 1;
             return .{ .line = self.positionals[self.index] };
         }
         const r = self.stdin orelse return null;
+        if (self.mode == .json) return self.nextJson(r);
         while (true) {
+            self.start_line = self.line_no;
+            self.line_no += 1;
             // `takeDelimiter` treats end-of-stream as a final delimiter and
             // returns null only when nothing is left at all. That is exactly
             // the record semantics we want (a last line with no trailing
@@ -110,7 +136,147 @@ pub const Input = struct {
             return .{ .line = body };
         }
     }
+
+    fn nextJson(self: *Input, r: *std.Io.Reader) !?Record {
+        // Whitespace between values separates them and is not one.
+        while (true) {
+            const buf = r.buffered();
+            var i: usize = 0;
+            while (i < buf.len and Scan.isSpace(buf[i])) : (i += 1) {
+                if (buf[i] == '\n') self.line_no += 1;
+            }
+            r.toss(i);
+            if (i < buf.len) break;
+            r.fillMore() catch |e| switch (e) {
+                error.EndOfStream => {
+                    self.stdin = null;
+                    return null;
+                },
+                else => |other| return other,
+            };
+        }
+        self.start_line = self.line_no;
+
+        var st: Scan = .{};
+        var scanned: usize = 0;
+        // Past the buffer a value cannot be held, so the rest of it is read
+        // and thrown away, still tracking where it ends: memory stays at the
+        // buffer size however long the value is.
+        var discarding = false;
+        while (true) {
+            const buf = r.buffered();
+            while (scanned < buf.len) {
+                const end = switch (st.step(buf[scanned])) {
+                    .more => {
+                        scanned += 1;
+                        continue;
+                    },
+                    .end_incl => scanned + 1,
+                    .end_excl => scanned,
+                };
+                self.line_no += countNewlines(buf[0..end]);
+                if (discarding) {
+                    r.toss(end);
+                    return .too_long;
+                }
+                const rec = try r.take(end);
+                return .{ .line = std.mem.trimEnd(u8, rec, "\r\n") };
+            }
+            if (!discarding and buf.len == r.buffer.len) discarding = true;
+            if (discarding) {
+                self.line_no += countNewlines(buf);
+                r.toss(buf.len);
+                scanned = 0;
+            }
+            r.fillMore() catch |e| switch (e) {
+                error.EndOfStream => {
+                    // The stream ended inside the value. A bare scalar at the
+                    // very end is complete; anything else is left for the
+                    // parser to refuse.
+                    if (discarding) {
+                        self.stdin = null;
+                        return .too_long;
+                    }
+                    const rec = try r.take(r.bufferedLen());
+                    return .{ .line = std.mem.trimEnd(u8, rec, "\r\n") };
+                },
+                else => |other| return other,
+            };
+        }
+    }
 };
+
+/// Tracks where one JSON value ends without parsing it, so a value can be
+/// cut out of the stream in bounded memory and handed to the real parser.
+const Scan = struct {
+    depth: u32 = 0,
+    started: bool = false,
+    scalar: bool = false,
+    in_str: bool = false,
+    esc: bool = false,
+    nl: bool = false,
+
+    const Step = enum { more, end_incl, end_excl };
+
+    fn isSpace(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+    }
+
+    fn step(s: *Scan, c: u8) Step {
+        if (!s.started) {
+            s.started = true;
+            switch (c) {
+                '{', '[' => s.depth = 1,
+                '"' => s.in_str = true,
+                else => s.scalar = true,
+            }
+            return .more;
+        }
+        // A bare word runs to the end of its line, so a stray line of prose is
+        // one bad value and not one per word.
+        if (s.scalar) return if (c == '\n' or c == '\r') .end_excl else .more;
+        if (s.in_str) {
+            if (s.esc) {
+                s.esc = false;
+                return .more;
+            }
+            switch (c) {
+                '\\' => s.esc = true,
+                '"' => {
+                    s.in_str = false;
+                    if (s.depth == 0) return .end_incl;
+                },
+                // A raw newline cannot be inside a JSON string, so a string
+                // still open at one is malformed. Ending the value here keeps
+                // one stray quote from swallowing the rest of the stream.
+                '\n' => return .end_excl,
+                else => {},
+            }
+            return .more;
+        }
+        // The same recovery for an unclosed brace: a `{` in the first column
+        // of a line starts a new value, since nesting is indented.
+        if (s.nl) {
+            if (c == '{') return .end_excl;
+            if (c != '\r') s.nl = false;
+        }
+        switch (c) {
+            '"' => s.in_str = true,
+            '{', '[' => s.depth += 1,
+            '}', ']' => {
+                s.depth -|= 1;
+                if (s.depth == 0) return .end_incl;
+            },
+            '\n' => s.nl = true,
+            else => {},
+        }
+        return .more;
+    }
+};
+
+fn countNewlines(bytes: []const u8) usize {
+    return std.mem.count(u8, bytes, "\n");
+}
 
 test "positional arguments win over stdin" {
     var input = Input.init(&.{ "a", "b" }, null);

@@ -808,6 +808,8 @@ pub fn validateRecords(
     var number: usize = 0;
     while (try input.next()) |record| {
         number += 1;
+        // A value can span lines, so report where it began.
+        if (input.start_line > 0) number = input.start_line;
         const line = switch (record) {
             .line => |l| std.mem.trim(u8, l, " \t"),
             .too_long => {
@@ -903,7 +905,7 @@ pub fn runWith(
     const stdin_buf = try gpa.alloc(u8, max_record_bytes);
     defer gpa.free(stdin_buf);
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
-    var input = cli.Input.init(positionals.items, &stdin_reader.interface);
+    var input = cli.Input.initJson(positionals.items, &stdin_reader.interface);
 
     const failures = try validateRecords(gpa, &schema, &input, out, err);
     return if (failures == 0) cli.exit_ok else cli.exit_fail;
