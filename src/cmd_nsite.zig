@@ -400,12 +400,20 @@ fn newerThan(a: event.Event, b: event.Event) bool {
     return std.mem.order(u8, &a.id, &b.id) == .lt;
 }
 
+/// What a fetch found, and how many relays finished answering: none that did
+/// means "no site" cannot be told from "nobody said".
+const Fetched = struct {
+    parsed: ?event.Parsed,
+    /// Relays that sent everything they had before the deadline.
+    complete: usize,
+};
+
 /// The newest event any relay returns for `f`. Every event was verified and
 /// matched against the filter on the way.
-fn fetchNewest(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, f: nostr.filter.Filter, timeout_ms: i64, err: *Io.Writer) !?event.Parsed {
+fn fetchNewest(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, f: nostr.filter.Filter, timeout_ms: i64, err: *Io.Writer) !Fetched {
     var buf: Io.Writer.Allocating = .init(gpa);
     defer buf.deinit();
-    _ = try relayset.query(gpa, io, urls, &.{f}, &buf.writer, err, .{
+    const outcome = try relayset.query(gpa, io, urls, &.{f}, &buf.writer, err, .{
         .until_eose = true,
         .deadline_ms = timeout_ms,
     });
@@ -421,10 +429,10 @@ fn fetchNewest(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, f: nost
             } else p.deinit();
         } else best = p;
     }
-    return best;
+    return .{ .parsed = best, .complete = outcome.complete };
 }
 
-fn fetchSite(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, pk: [32]u8, name: ?[]const u8, timeout_ms: i64, err: *Io.Writer) !?event.Parsed {
+fn fetchSite(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, pk: [32]u8, name: ?[]const u8, timeout_ms: i64, err: *Io.Writer) !Fetched {
     const kinds = [1]u16{if (name == null) kind_root else kind_named};
     const authors = [1][32]u8{pk};
     var values: [1][]const u8 = undefined;
@@ -456,7 +464,7 @@ fn list(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, ou
 
     if (opts.sites) return listSites(gpa, io, relays.urls, pk, opts.timeout_ms, out, err);
 
-    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)) orelse {
+    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)).parsed orelse {
         try err.writeAll("deed nsite list: no site found\n");
         return cli.exit_fail;
     };
@@ -704,13 +712,30 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
     defer relays.deinit();
 
     // What is published now, so what has not changed is not sent again.
+    // It is read even with --force, for the time it was made: a replaceable
+    // event only replaces an older one.
+    var fetched = try fetchSite(gpa, io, relays.urls, kp.public_key, opts.name, opts.timeout_ms, err);
+    defer if (fetched.parsed) |*p| p.deinit();
+    if (fetched.complete == 0) {
+        if (!opts.force) {
+            try err.writeAll("deed nsite deploy: no relay finished answering, so whether a site is already published is not known; try again, or pass --force to publish anyway\n");
+            return cli.exit_fail;
+        }
+        try err.writeAll("deed nsite deploy: no relay finished answering; publishing anyway because of --force\n");
+    }
     var existing: ?Manifest = null;
-    if (!opts.force) {
-        if (try fetchSite(gpa, io, relays.urls, kp.public_key, opts.name, opts.timeout_ms, err)) |found| {
-            var parsed = found;
-            defer parsed.deinit();
-            var bad: []const u8 = "";
-            existing = parseManifest(arena, parsed.value, &bad) catch null;
+    var floor: ?i64 = null;
+    if (fetched.parsed) |p| {
+        floor = p.value.created_at;
+        var bad: []const u8 = "";
+        if (parseManifest(arena, p.value, &bad)) |m| {
+            if (!opts.force) existing = m;
+        } else |e| {
+            try reportManifest(err, "deploy", e, bad);
+            if (!opts.force) {
+                try err.writeAll("deed nsite deploy: the published manifest cannot be read, so it is not replaced; pass --force to replace it\n");
+                return cli.exit_fail;
+            }
         }
     }
 
@@ -774,9 +799,8 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
     if (opts.source) |t| try tags.append(arena, try tag2(arena, "source", t));
 
     var now = Io.Timestamp.now(io, .real).toSeconds();
-    if (existing) |m| {
-        // A replaceable event only replaces an older one.
-        if (now <= m.created_at) now = m.created_at + 1;
+    if (floor) |t| {
+        if (now <= t) now = t + 1;
     }
     const ev = try event.create(arena, signer, kp, now, if (opts.name == null) kind_root else kind_named, tags.items, "", null);
 
@@ -822,7 +846,7 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
 
     var relays = (try resolveRelays(gpa, io, opts, pk, err)) orelse return cli.exit_fail;
     defer relays.deinit();
-    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)) orelse {
+    var found = (try fetchSite(gpa, io, relays.urls, pk, opts.name, opts.timeout_ms, err)).parsed orelse {
         try err.writeAll("deed nsite download: no site found\n");
         return cli.exit_fail;
     };
@@ -1102,6 +1126,8 @@ const SiteRelay = struct {
     stored: [32 * 1024]u8 = undefined,
     stored_len: usize = 0,
     events: std.atomic.Value(usize) = .init(0),
+    /// Reads a REQ and never answers it.
+    mute: bool = false,
     reqs: std.atomic.Value(usize) = .init(0),
     relay: testrelay.Relay = undefined,
 
@@ -1109,6 +1135,7 @@ const SiteRelay = struct {
         const self: *SiteRelay = @ptrCast(@alignCast(ctx.?));
         if (std.mem.startsWith(u8, frame, "[\"REQ\"")) {
             _ = self.reqs.fetchAdd(1, .monotonic);
+            if (self.mute) return;
             if (self.stored_len > 0) {
                 const line = try std.fmt.allocPrint(std.heap.page_allocator, "[\"EVENT\",\"deed\",{s}]", .{self.stored[0..self.stored_len]});
                 defer std.heap.page_allocator.free(line);
@@ -1507,4 +1534,70 @@ test "deploy leaves dot-files and dot-directories out unless asked" {
     try testing.expectEqual(cli.exit_ok, all.code);
     try testing.expectEqual(@as(usize, 5), blobs.puts);
     try testing.expect(std.mem.indexOf(u8, all.out.written(), "/.git/config") != null);
+}
+
+test "deploy will not replace a manifest it cannot read, or publish blind" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    try tmp.tmp.dir.createDirPath(io, "site");
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello</h1>" });
+    const src = try tmp.path(a, "site");
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    const sha = "186ea5fd14e88fd1ac49351759e7ab906fa94892002b60bf7f5a428f28ca1c99";
+    const tags = [_]event.Tag{
+        &.{ "path", "/index.html", sha },
+        &.{ "path", "/../escape.txt", sha },
+    };
+    const old = try event.create(a, signer, kp, 1_700_000_000, kind_root, &tags, "", null);
+
+    var relay: SiteRelay = .{};
+    try relay.start(io, 3);
+    defer relay.stop(io);
+    const json = try event.toJson(a, old);
+    @memcpy(relay.stored[0..json.len], json);
+    relay.stored_len = json.len;
+    var blobs: BlobServer = undefined;
+    try blobs.start(io, 4);
+    defer blobs.stop(io);
+    var rbuf: [64]u8 = undefined;
+    var bbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const server_url = blobs.base(&bbuf);
+
+    var refused = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    defer refused.deinit();
+    try testing.expectEqual(cli.exit_fail, refused.code);
+    try testing.expect(std.mem.indexOf(u8, refused.err.written(), "cannot be read") != null);
+    try testing.expectEqual(@as(usize, 0), relay.events.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), blobs.puts);
+
+    var forced = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--force", relay_url });
+    defer forced.deinit();
+    try testing.expectEqual(cli.exit_ok, forced.code);
+    try testing.expectEqual(@as(usize, 1), relay.events.load(.monotonic));
+
+    // A relay that never finishes answering: whether a site exists is not known.
+    var mute: SiteRelay = .{ .mute = true };
+    try mute.start(io, 2);
+    defer mute.stop(io);
+    var mbuf: [64]u8 = undefined;
+    const mute_url = try mute.url(&mbuf);
+    var blind = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--timeout", "400", mute_url });
+    defer blind.deinit();
+    try testing.expectEqual(cli.exit_fail, blind.code);
+    try testing.expect(std.mem.indexOf(u8, blind.err.written(), "finished answering") != null);
+    try testing.expectEqual(@as(usize, 0), mute.events.load(.monotonic));
 }
