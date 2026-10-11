@@ -74,7 +74,7 @@ jobs:
       # The suite runs on every pull request, but a tag can be pushed at any
       # commit, so it runs again here against the tagged source.
       - name: Test
-        run: zig build test
+        run: zig build test --test-timeout 120s --summary all
 
       - name: Build, sign, package and check every target
         run: |
