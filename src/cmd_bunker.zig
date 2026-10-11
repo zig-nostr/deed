@@ -308,6 +308,15 @@ pub const Config = struct {
 /// Merges the command line with the environment and the persist file. Null
 /// after printing why it could not, with `p.failure` set to the exit code.
 fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, err: *Io.Writer) !?Config {
+    var session = keyinput.terminalSession();
+    defer session.deinit();
+    return resolveWith(arena, io, p, env_sec, err, &session);
+}
+
+/// `resolve` with the password source passed in. Both ncryptsecs it may open
+/// (the one given and the one the persist file keeps) are read through it, so
+/// a run asks for the password once.
+fn resolveWith(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, err: *Io.Writer, source: anytype) !?Config {
     var stored = Stored{};
     var persist_path: ?[]const u8 = null;
     if (p.persist) |raw| {
@@ -338,23 +347,24 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
     };
     var signer = keys.Signer.init();
     defer signer.deinit();
-    const sk = keyinput.secretKeyForVerb(arena, "bunker", sec_text, err) catch |e| switch (e) {
+    var sk = keyinput.secretKeyOrSay(arena, "bunker", sec_text, source, err) catch |e| switch (e) {
         error.BadKey => {
             p.failure = cli.exit_fail;
             return null;
         },
         else => return e,
     };
-    const keypair = signer.keyPairFromSecretKey(sk) catch {
+    var keypair = signer.keyPairFromSecretKey(sk) catch {
         p.failure = cli.exit_fail;
         try err.writeAll("deed bunker: not a valid secret key\n");
         return null;
     };
     if (given != null) {
-        if (stored.sec) |kept| {
+        // The same text is the same key: nothing to open to know it.
+        if (stored.sec) |kept| if (!std.mem.eql(u8, std.mem.trim(u8, kept, " \t\r\n"), std.mem.trim(u8, sec_text, " \t\r\n"))) {
             // A file remembers which clients may use ONE key. Pointing it at
             // another would hand that key to clients nobody authorized for it.
-            const kept_sk = keyinput.secretKey(arena, kept) catch |e| {
+            var kept_sk = keyinput.secretKeyWith(arena, kept, source) catch |e| {
                 p.failure = cli.exit_fail;
                 try err.print("deed bunker: {s} {s}\n", .{ persist_path.?, switch (e) {
                     keyinput.Error.WrongPassword => "holds an ncryptsec that password does not open",
@@ -368,7 +378,7 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
                 try err.print("deed bunker: {s} belongs to a different key; give it the same --sec, or use another file\n", .{persist_path.?});
                 return null;
             }
-        }
+        };
     }
 
     // Relays given on the command line replace the remembered ones.
@@ -1695,4 +1705,49 @@ test "help is printed and nothing starts" {
     defer err.deinit();
     try testing.expectEqual(cli.exit_ok, try run(testing.allocator, testing.io, &.{"--help"}, &out.writer, &err.writer));
     try testing.expect(std.mem.indexOf(u8, out.written(), "deed bunker") != null);
+}
+
+const CountingPassword = struct {
+    n: *usize,
+    pub fn get(self: CountingPassword, out: *@import("password.zig").Secret) @import("password.zig").Error!void {
+        self.n.* += 1;
+        return @import("password.zig").fromText(out, "hunter2");
+    }
+};
+
+test "--sec and a persist file that both hold an ncryptsec ask for the password once" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = [_]u8{0x21} ** 32;
+    // Two encryptions of one key: different salts, so different text.
+    const a = try nostr.nip49.encrypt(arena, io, raw, "hunter2", 4, .unknown);
+    const b = try nostr.nip49.encrypt(arena, io, raw, "hunter2", 4, .unknown);
+    try testing.expect(!std.mem.eql(u8, a, b));
+    try saveStored(arena, io, tmp.dir, "b.json", .{ .sec = b });
+
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root);
+    const path = try std.fmt.allocPrint(arena, "{s}/b.json", .{root[0..root_len]});
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(gpa);
+    defer err.deinit();
+    var p = (try parseArgs(arena, &.{ "--sec", a, "--persist", path, "wss://relay.example" }, &out.writer, &err.writer)) orelse return error.TestUnexpectedResult;
+
+    var asked: usize = 0;
+    var session = keyinput.SessionPassword(CountingPassword).init(.{ .n = &asked });
+    defer session.deinit();
+    var config = (try resolveWith(arena, io, &p, null, &err.writer, &session)) orelse {
+        std.debug.print("{s}\n", .{err.written()});
+        return error.TestUnexpectedResult;
+    };
+    _ = &config;
+    try testing.expectEqual(@as(usize, 1), asked);
 }

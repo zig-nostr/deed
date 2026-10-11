@@ -211,6 +211,22 @@ pub fn run(
 
     // The allocator, not the arena: a remote signer's readers allocate from
     // their own threads.
+    // An ncryptsec is opened here, once, and every reader after this (the
+    // challenge answers, $me, the nested req runs) is handed the plain key.
+    var plain_key: ?keyinput.PlainKey = null;
+    defer if (plain_key) |*k| k.deinit();
+    if (auth_flags.auth or auth_flags.force_pre_auth) {
+        if (auth_flags.sec orelse envSecret()) |raw_key| {
+            var session = keyinput.terminalSession();
+            defer session.deinit();
+            plain_key = keyinput.decryptOnce(gpa, "spell", raw_key, &session, err) catch |e| switch (e) {
+                error.BadKey => return cli.exit_fail,
+                else => return e,
+            };
+            if (plain_key) |*k| auth_flags.sec = k.slice();
+        }
+    }
+    sec_arg = auth_flags.sec;
     const auth_opts = auth.resolve(gpa, io, auth_flags, "spell", err) catch |e| switch (e) {
         error.Usage => return cli.exit_usage,
         error.BadKey => return cli.exit_fail,
@@ -237,8 +253,15 @@ pub fn run(
             try err.print("deed spell: '{s}' is not a public key (want npub1... or 64 hex characters)\n", .{p});
             return cli.exit_fail;
         };
+    } else if (auth_opts) |o| {
+        // The key or remote signer already open for NIP-42 says who the user
+        // is: opening it again would read the key a second time.
+        if (o.remote) |r| {
+            me = r.publicKey();
+        } else if (o.keypair) |kp| {
+            me = kp.public_key;
+        }
     } else if (sec_arg) |sk_raw| {
-        // A key or a remote signer: either one says who the user is.
         var signer = (try signing.open(gpa, io, "spell", sk_raw, err)) orelse return cli.exit_fail;
         defer signer.deinit();
         me = signer.publicKey();
@@ -344,6 +367,12 @@ pub fn run(
     try argv.appendSlice(a, added.items);
     const code2 = try cmd_req.runWith(gpa, io, argv.items, null, out, err);
     return if (code1 == cli.exit_ok or code2 == cli.exit_ok) cli.exit_ok else code2;
+}
+
+fn envSecret() ?[]const u8 {
+    const value = std.c.getenv("NOSTR_SECRET_KEY") orelse return null;
+    const span = std.mem.span(value);
+    return if (span.len == 0) null else span;
 }
 
 fn appendAuth(a: std.mem.Allocator, argv: *std.ArrayList([]const u8), flags: auth.Flags) !void {

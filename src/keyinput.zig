@@ -45,6 +45,71 @@ const TerminalPassword = struct {
     }
 };
 
+/// A password source that asks once. The first `get` goes to `Inner` and keeps
+/// the answer; every later one is given the same text, so a run that reads two
+/// ncryptsecs (or one twice) never asks a person twice. `deinit` wipes it.
+pub fn SessionPassword(comptime Inner: type) type {
+    return struct {
+        const Self = @This();
+        inner: Inner,
+        kept: password.Secret = .{},
+        have: bool = false,
+        asked: usize = 0,
+
+        pub fn init(inner: Inner) Self {
+            return .{ .inner = inner };
+        }
+
+        pub fn get(self: *Self, out: *password.Secret) password.Error!void {
+            if (!self.have) {
+                try self.inner.get(&self.kept);
+                self.have = true;
+                self.asked += 1;
+            }
+            @memcpy(out.buf[0..self.kept.len], self.kept.slice());
+            out.len = self.kept.len;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.kept.wipe();
+            self.have = false;
+        }
+    };
+}
+
+/// The terminal password source, remembered for the run.
+pub fn terminalSession() SessionPassword(TerminalPassword) {
+    return SessionPassword(TerminalPassword).init(.{});
+}
+
+/// A secret key as 64 lowercase hex characters in a buffer the owner wipes.
+/// For a verb that hands one key to several readers (its own signing, a
+/// NIP-42 answer, a nested verb) after decrypting an ncryptsec once.
+pub const PlainKey = struct {
+    text: [64]u8 = undefined,
+
+    pub fn slice(self: *const PlainKey) []const u8 {
+        return &self.text;
+    }
+
+    pub fn deinit(self: *PlainKey) void {
+        std.crypto.secureZero(u8, &self.text);
+    }
+};
+
+/// Decrypts `raw` once when it is an ncryptsec and returns it as plain hex.
+/// Null for any other form (nothing is asked, and `raw` is used as it is) and
+/// after a line on `err` when the ncryptsec cannot be opened.
+pub fn decryptOnce(gpa: std.mem.Allocator, verb: []const u8, raw: []const u8, source: anytype, err: *std.Io.Writer) !?PlainKey {
+    if (!hasPrefix(std.mem.trim(u8, raw, " \t\r\n"), "ncryptsec1")) return null;
+    var sk = try secretKeyOrSayFor(gpa, verb, raw, source, err, true);
+    defer std.crypto.secureZero(u8, &sk);
+    var plain: PlainKey = .{};
+    const h = std.fmt.bytesToHex(sk, .lower);
+    plain.text = h;
+    return plain;
+}
+
 /// A secret key as `nsec1...`, as 64 hex characters, or as an `ncryptsec1...`
 /// (NIP-49), whose password is asked for on the terminal.
 ///
@@ -101,6 +166,7 @@ pub fn secretKeyForRemoteVerb(gpa: std.mem.Allocator, verb: []const u8, s: []con
 }
 
 /// `secretKey` with the password source passed in, so a test can supply one.
+/// The caller owns the returned key and wipes it.
 pub fn secretKeyWith(gpa: std.mem.Allocator, s: []const u8, source: anytype) !keys.SecretKey {
     const t = std.mem.trim(u8, s, " \t\r\n");
     if (hasPrefix(t, "nsec1")) return nip19.decodeNsec(gpa, t);
@@ -234,4 +300,45 @@ test "nsec and hex never ask for a password" {
     defer gpa.free(nsec);
     try std.testing.expectEqual(raw, try secretKeyWith(gpa, nsec, NoTerminal{}));
     try std.testing.expectEqual(raw, try secretKeyWith(gpa, "33" ** 32, NoTerminal{}));
+}
+
+const CountingPassword = struct {
+    n: *usize,
+    fn get(self: CountingPassword, out: *password.Secret) password.Error!void {
+        self.n.* += 1;
+        return password.fromText(out, "nostr");
+    }
+};
+
+test "a session asks for the password once however many keys it opens" {
+    const gpa = std.testing.allocator;
+    var n: usize = 0;
+    var session = SessionPassword(CountingPassword).init(.{ .n = &n });
+    defer session.deinit();
+    var a = try secretKeyWith(gpa, spec_ncryptsec, &session);
+    defer std.crypto.secureZero(u8, &a);
+    var b = try secretKeyWith(gpa, spec_ncryptsec, &session);
+    defer std.crypto.secureZero(u8, &b);
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(usize, 1), session.asked);
+}
+
+test "a key decrypted once is plain hex that needs no password again" {
+    const gpa = std.testing.allocator;
+    var n: usize = 0;
+    var session = SessionPassword(CountingPassword).init(.{ .n = &n });
+    defer session.deinit();
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var plain = (try decryptOnce(gpa, "spell", spec_ncryptsec, &session, &w)).?;
+    defer plain.deinit();
+    try std.testing.expectEqualStrings(spec_secret_hex, plain.slice());
+    // Every reader after the first is handed the hex: no prompt.
+    var sk = try secretKeyWith(gpa, plain.slice(), NoTerminal{});
+    defer std.crypto.secureZero(u8, &sk);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect((try decryptOnce(gpa, "spell", spec_secret_hex, &session, &w)) == null);
+    plain.deinit();
+    try std.testing.expectEqual(@as(u8, 0), plain.text[0]);
 }
