@@ -87,6 +87,21 @@ pub const Server = struct {
     /// Connections dropped for reading too slowly.
     dropped: std.atomic.Value(u64) = .init(0),
 
+    // Group commit. Verified events from every connection wait in `wq`; one
+    // task takes whatever is queued and stores it in one transaction.
+    wq_mu: Io.Mutex = .init,
+    wq_data: Io.Condition = .init,
+    wq_space: Io.Condition = .init,
+    wq: std.ArrayList(Job) = .empty,
+    /// No more jobs are taken; the committer ends when `wq` is empty.
+    wq_closed: bool = false,
+    committer: Io.Future(void) = undefined,
+    /// Test hook: commits to fail before any succeeds.
+    fail_commits: std.atomic.Value(u32) = .init(0),
+    /// Commits made, and events in them, for tests.
+    commits: std.atomic.Value(u64) = .init(0),
+    committed: std.atomic.Value(u64) = .init(0),
+
     /// Starts listening and accepting in the background. `self` must not move
     /// until `stop`. `store` must outlive the server.
     pub fn start(self: *Server, gpa: std.mem.Allocator, io: Io, store: *Store, opts: Options) !void {
@@ -112,7 +127,20 @@ pub const Server = struct {
         else
             try std.fmt.bufPrint(&self.url_buf, "ws://{s}:{d}", .{ host, self.port() });
         self.url_len = u.len;
+        self.committer = try io.concurrent(commitMain, .{self});
+        errdefer {
+            self.closeQueue();
+            _ = self.committer.cancel(io);
+        }
         self.accept_task = try io.concurrent(acceptLoop, .{self});
+    }
+
+    fn closeQueue(self: *Server) void {
+        self.wq_mu.lockUncancelable(self.io);
+        self.wq_closed = true;
+        self.wq_data.broadcast(self.io);
+        self.wq_space.broadcast(self.io);
+        self.wq_mu.unlock(self.io);
     }
 
     /// The port the kernel bound, which differs from the one asked for when
@@ -129,7 +157,12 @@ pub const Server = struct {
     /// Stops accepting, ends every connection and waits for them.
     pub fn stop(self: *Server) void {
         _ = self.accept_task.cancel(self.io);
+        // Connections go first: each waits for its own pending events, which
+        // the committer is still answering.
         self.group.cancel(self.io);
+        self.closeQueue();
+        _ = self.committer.cancel(self.io);
+        self.wq.deinit(self.gpa);
         self.listener.deinit(self.io);
         self.conns.deinit(self.gpa);
     }
@@ -243,6 +276,9 @@ const Conn = struct {
     /// Stop now.
     dead: bool = false,
     slow: bool = false,
+    /// Events handed to the committer and not yet answered. Under `q_mu`.
+    pending: usize = 0,
+    idle: Io.Condition = .init,
 
     handshake_done: Io.Event = .unset,
     writer_done: Io.Event = .unset,
@@ -390,6 +426,137 @@ const Conn = struct {
 
 const SendError = error{ OutOfMemory, Canceled, Gone };
 
+/// Jobs waiting for the committer before readers wait for room.
+const max_queued_jobs = 4096;
+/// Events in one write transaction at most.
+const max_batch = 1024;
+
+/// One EVENT on its way to the store, or an answer that has to keep its place
+/// behind the OKs before it.
+const Job = struct {
+    conn: *Conn,
+    id: [32]u8,
+    /// Owns the event. Null for a refusal.
+    parsed: ?message.ParsedClientMessage,
+    /// The refusal to send, when `parsed` is null.
+    refusal: []const u8 = "",
+};
+
+/// Hands `job` to the committer, waiting while the queue is full. On failure
+/// the caller still owns the job's message.
+fn enqueue(server: *Server, job: Job) SendError!void {
+    const c = job.conn;
+    server.wq_mu.lockUncancelable(server.io);
+    defer server.wq_mu.unlock(server.io);
+    while (server.wq.items.len >= max_queued_jobs and !server.wq_closed) {
+        try server.wq_space.wait(server.io, &server.wq_mu);
+    }
+    if (server.wq_closed) return error.Gone;
+    try server.wq.append(server.gpa, job);
+    c.q_mu.lockUncancelable(server.io);
+    c.pending += 1;
+    c.q_mu.unlock(server.io);
+    server.wq_data.signal(server.io);
+}
+
+/// The committer: takes what is queued, stores it in one transaction, then
+/// answers each event and fans out the stored ones. An OK true is sent only
+/// after the commit.
+fn commitMain(server: *Server) void {
+    const io = server.io;
+    const gpa = server.gpa;
+    // Everything the loop needs is allocated here, so a batch cannot fail
+    // half way for want of memory.
+    var batch = std.ArrayList(Job).initCapacity(gpa, max_batch) catch return server.closeQueue();
+    defer batch.deinit(gpa);
+    var evs = std.ArrayList(Event).initCapacity(gpa, max_batch) catch return server.closeQueue();
+    defer evs.deinit(gpa);
+    var results = std.ArrayList(nostr.store.IngestResult).initCapacity(gpa, max_batch) catch return server.closeQueue();
+    defer results.deinit(gpa);
+    while (true) {
+        batch.clearRetainingCapacity();
+        {
+            server.wq_mu.lockUncancelable(io);
+            defer server.wq_mu.unlock(io);
+            while (server.wq.items.len == 0) {
+                if (server.wq_closed) return;
+                server.wq_data.wait(io, &server.wq_mu) catch {
+                    // Canceled with nothing queued: no one is left to answer.
+                    server.wq_closed = true;
+                    server.wq_space.broadcast(io);
+                    return;
+                };
+            }
+            const n = @min(server.wq.items.len, max_batch);
+            batch.appendSliceAssumeCapacity(server.wq.items[0..n]);
+            std.mem.copyForwards(Job, server.wq.items[0..], server.wq.items[n..]);
+            server.wq.shrinkRetainingCapacity(server.wq.items.len - n);
+            server.wq_space.broadcast(io);
+        }
+        commitBatch(server, batch.items, &evs, &results);
+        for (batch.items) |*job| {
+            if (job.parsed) |*p| p.deinit();
+            const c = job.conn;
+            c.q_mu.lockUncancelable(io);
+            c.pending -= 1;
+            if (c.pending == 0) c.idle.broadcast(io);
+            c.q_mu.unlock(io);
+        }
+    }
+}
+
+/// Stores the events of `jobs` in one transaction and answers all of them.
+fn commitBatch(
+    server: *Server,
+    jobs: []Job,
+    evs: *std.ArrayList(Event),
+    results: *std.ArrayList(nostr.store.IngestResult),
+) void {
+    const gpa = server.gpa;
+    evs.clearRetainingCapacity();
+    for (jobs) |job| if (job.parsed) |p| evs.appendAssumeCapacity(p.value.event);
+    results.resize(gpa, evs.items.len) catch unreachable; // capacity was reserved
+    var failed: ?[]const u8 = null;
+    if (evs.items.len > 0) {
+        const injected = server.fail_commits.load(.acquire) > 0 and
+            server.fail_commits.fetchSub(1, .acq_rel) > 0;
+        if (injected) {
+            failed = "error: the store could not take it";
+        } else if (server.store.ingestBatch(gpa, evs.items, .{}, results.items)) {
+            _ = server.commits.fetchAdd(1, .monotonic);
+            _ = server.committed.fetchAdd(evs.items.len, .monotonic);
+        } else |e| {
+            server.log("the store could not take {d} events: {s}", .{ evs.items.len, @errorName(e) });
+            failed = "error: the store could not take it";
+        }
+    }
+
+    var k: usize = 0;
+    for (jobs) |job| {
+        const c = job.conn;
+        const text, const accepted = blk: {
+            if (job.parsed == null) break :blk .{ job.refusal, false };
+            defer k += 1;
+            if (failed) |f| break :blk .{ f, false };
+            switch (results.items[k]) {
+                .added, .replaced, .ephemeral => {
+                    server.fanout(evs.items[k]);
+                    break :blk .{ "", true };
+                },
+                .duplicate => break :blk .{ "duplicate: already have this event", true },
+                .stale => break :blk .{ "duplicate: a newer version of this event is already stored", false },
+                .deleted => break :blk .{ "blocked: this event was deleted by its author", false },
+                .invalid => break :blk .{ "invalid: the signature does not verify", false },
+            }
+        };
+        const payload = message.encodeOk(gpa, job.id, accepted, text) catch continue;
+        defer gpa.free(payload);
+        // Never wait on one client from here: the others are behind it.
+        const frame = buildFrame(gpa, .text, &.{payload}) catch continue;
+        c.offer(frame);
+    }
+}
+
 /// One connection, start to finish.
 fn connMain(server: *Server, stream: Io.net.Stream) Io.Cancelable!void {
     const io = server.io;
@@ -400,6 +567,10 @@ fn connMain(server: *Server, stream: Io.net.Stream) Io.Cancelable!void {
     };
     c.* = .{ .server = server, .gpa = gpa, .io = io, .stream = stream, .signer = keys.Signer.init() };
     defer {
+        // The committer holds this connection until its events are answered.
+        c.q_mu.lockUncancelable(io);
+        while (c.pending > 0) c.idle.waitUncancelable(io, &c.q_mu);
+        c.q_mu.unlock(io);
         c.deinit();
         gpa.destroy(c);
         stream.close(io);
@@ -717,7 +888,7 @@ fn handleText(c: *Conn, text: []const u8) SendError!void {
     var kept = false;
     defer if (!kept) parsed.deinit();
     switch (parsed.value) {
-        .event => |ev| try onEvent(c, ev),
+        .event => |ev| kept = try onEvent(c, parsed, ev),
         .req => |q| kept = try onReq(c, parsed, q.subscription_id, q.filters),
         .close => |q| onClose(c, q.subscription_id),
         .count => |q| try onCount(c, q.subscription_id, q.filters),
@@ -754,41 +925,49 @@ fn refuseUnreadable(c: *Conn, text: []const u8) SendError!void {
     return c.notice("invalid: the message could not be read");
 }
 
-fn onEvent(c: *Conn, ev: Event) SendError!void {
-    if (c.needsAuth()) return c.ok(ev.id, false, "auth-required: this relay takes events only after AUTH");
-    if (ev.kind == nostr.nip42.kind) return c.ok(ev.id, false, "invalid: an AUTH event goes in an AUTH message");
-    const id = try event.computeId(c.gpa, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
-    if (!std.mem.eql(u8, &id, &ev.id)) return c.ok(ev.id, false, "invalid: the id does not match the event");
-    if (!c.signer.verifyId(ev.sig, ev.id, ev.pubkey)) return c.ok(ev.id, false, "invalid: the signature does not verify");
-    // NIP-40: an event that has already expired is not taken.
-    if (expiration(ev)) |at| if (at <= nowSeconds(c.io)) {
-        return c.ok(ev.id, false, "invalid: the event has expired");
+/// Checks `ev`, then hands it to the committer, which answers it once it is
+/// on disk. Returns true when the job keeps `parsed`.
+fn onEvent(c: *Conn, parsed: message.ParsedClientMessage, ev: Event) SendError!bool {
+    const refusal = try refuse(c, ev);
+    const server = c.server;
+    if (refusal) |text| {
+        // An answer may not overtake the OK of an event before it.
+        c.q_mu.lockUncancelable(c.io);
+        const behind = c.pending > 0;
+        c.q_mu.unlock(c.io);
+        if (!behind) {
+            try c.ok(ev.id, false, text);
+            return false;
+        }
+        try enqueue(server, .{ .conn = c, .id = ev.id, .parsed = null, .refusal = text });
+        return false;
+    }
+    enqueue(server, .{ .conn = c, .id = ev.id, .parsed = parsed }) catch |e| {
+        if (e == error.Gone) {
+            // The relay is stopping.
+            try c.ok(ev.id, false, "error: the relay is shutting down");
+            return false;
+        }
+        return e;
     };
+    return true;
+}
+
+/// Why `ev` is not taken, or null when it is to be stored.
+fn refuse(c: *Conn, ev: Event) SendError!?[]const u8 {
+    if (c.needsAuth()) return "auth-required: this relay takes events only after AUTH";
+    if (ev.kind == nostr.nip42.kind) return "invalid: an AUTH event goes in an AUTH message";
+    const id = try event.computeId(c.gpa, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
+    if (!std.mem.eql(u8, &id, &ev.id)) return "invalid: the id does not match the event";
+    if (!c.signer.verifyId(ev.sig, ev.id, ev.pubkey)) return "invalid: the signature does not verify";
+    // NIP-40: an event that has already expired is not taken.
+    if (expiration(ev)) |at| if (at <= nowSeconds(c.io)) return "invalid: the event has expired";
     // NIP-70: a protected event is taken only from its own author.
     if (isProtected(ev)) {
-        const a = c.authed orelse return c.ok(ev.id, false, "auth-required: a protected event needs its author to AUTH");
-        if (!std.mem.eql(u8, &a, &ev.pubkey)) return c.ok(ev.id, false, "restricted: a protected event is taken only from its author");
+        const a = c.authed orelse return "auth-required: a protected event needs its author to AUTH";
+        if (!std.mem.eql(u8, &a, &ev.pubkey)) return "restricted: a protected event is taken only from its author";
     }
-
-    const result = c.server.store.ingest(c.gpa, ev, .{}) catch |e| {
-        if (e == error.OutOfMemory) return error.OutOfMemory;
-        c.server.log("the store could not take an event: {s}", .{@errorName(e)});
-        return c.ok(ev.id, false, "error: the store could not take it");
-    };
-    switch (result) {
-        .added, .replaced => {
-            c.server.fanout(ev);
-            try c.ok(ev.id, true, "");
-        },
-        .ephemeral => {
-            c.server.fanout(ev);
-            try c.ok(ev.id, true, "");
-        },
-        .duplicate => try c.ok(ev.id, true, "duplicate: already have this event"),
-        .stale => try c.ok(ev.id, false, "duplicate: a newer version of this event is already stored"),
-        .deleted => try c.ok(ev.id, false, "blocked: this event was deleted by its author"),
-        .invalid => try c.ok(ev.id, false, "invalid: the signature does not verify"),
-    }
+    return null;
 }
 
 /// Registers the subscription, then sends what is stored. In that order, so
@@ -1867,4 +2046,115 @@ test "preload stores good lines and reports bad ones by number" {
     var res = try tstore.store.query(testing.allocator, .{});
     defer res.deinit();
     for (res.events) |ev| try testing.expect(try event.verify(arena, signer, ev));
+}
+
+test "many publishers get their own OKs, in order, and everything is stored" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+
+    const clients = 8;
+    const each = 40;
+    var cls: [clients]*RawClient = undefined;
+    var made: usize = 0;
+    defer for (cls[0..made]) |cl| cl.deinit();
+    var ids: [clients][each][32]u8 = undefined;
+    for (0..clients) |i| {
+        cls[i] = try RawClient.connect(gpa, ts.server.port());
+        made += 1;
+    }
+    // Interleave the sends so the relay sees them all at once.
+    for (0..each) |j| for (0..clients) |i| {
+        const kp = try testKey(signer, @intCast(10 + i));
+        const ev = try makeEvent(arena, signer, kp, 1, 1_700_000_000 + @as(i64, @intCast(j)), "note");
+        ids[i][j] = ev.id;
+        try cls[i].send(try message.encodeEvent(arena, ev));
+    };
+    for (0..clients) |i| for (0..each) |j| {
+        const reply = try cls[i].text();
+        const want = try std.fmt.allocPrint(arena, "[\"OK\",\"{s}\",true", .{std.fmt.bytesToHex(&ids[i][j], .lower)});
+        try testing.expect(std.mem.startsWith(u8, reply, want));
+    };
+    try testing.expectEqual(@as(usize, clients * each), try ts.ts.store.eventCount());
+    try testing.expectEqual(@as(u64, clients * each), ts.server.committed.load(.monotonic));
+    try testing.expect(ts.server.commits.load(.monotonic) <= clients * each);
+}
+
+test "an OK false when the commit fails, and nothing is stored" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 4);
+
+    var cl = try RawClient.connect(gpa, ts.server.port());
+    defer cl.deinit();
+    ts.server.fail_commits.store(1, .release);
+    const first = try makeEvent(arena, signer, kp, 1, 1_700_000_000, "one");
+    try cl.send(try message.encodeEvent(arena, first));
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "false,\"error: the store could not take it\"") != null);
+    try testing.expectEqual(@as(usize, 0), try ts.ts.store.eventCount());
+
+    const second = try makeEvent(arena, signer, kp, 1, 1_700_000_001, "two");
+    try cl.send(try message.encodeEvent(arena, second));
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "true") != null);
+    try testing.expectEqual(@as(usize, 1), try ts.ts.store.eventCount());
+}
+
+test "a refusal does not overtake the OK of an event before it" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 5);
+
+    var cl = try RawClient.connect(gpa, ts.server.port());
+    defer cl.deinit();
+    for (0..20) |j| {
+        const good = try makeEvent(arena, signer, kp, 1, 1_700_000_000 + @as(i64, @intCast(j)), "g");
+        var bad = try makeEvent(arena, signer, kp, 1, 1_700_001_000 + @as(i64, @intCast(j)), "b");
+        bad.sig[0] ^= 1;
+        try cl.send(try message.encodeEvent(arena, good));
+        try cl.send(try message.encodeEvent(arena, bad));
+    }
+    for (0..20) |_| {
+        try testing.expect(std.mem.indexOf(u8, try cl.text(), ",true") != null);
+        try testing.expect(std.mem.indexOf(u8, try cl.text(), ",false,\"invalid: the signature") != null);
+    }
+}
+
+test "stopping with events still queued does not hang" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 6);
+
+    var cl = try RawClient.connect(testing.allocator, ts.server.port());
+    for (0..300) |j| {
+        const ev = try makeEvent(arena, signer, kp, 1, 1_700_000_000 + @as(i64, @intCast(j)), "q");
+        try cl.send(try message.encodeEvent(arena, ev));
+    }
+    // Stop while the relay is still working through them, unread.
+    ts.stop();
+    cl.deinit();
 }

@@ -168,11 +168,10 @@ pub fn run(
         temp_dir = dir;
         const file = try std.fmt.allocPrintSentinel(gpa, "{s}{c}events.mdb", .{ dir, std.fs.path.sep }, 0);
         defer gpa.free(file);
-        store = Store.open(file, .{}) catch |e| {
+        store = Store.open(file, .{ .durability = .no_sync }) catch |e| {
             try err.print("deed serve: cannot open a store in {s}: {s}\n", .{ dir, @errorName(e) });
             return cli.exit_fail;
         };
-        skipSync(&store);
     }
     defer store.deinit();
 
@@ -249,17 +248,6 @@ fn tempBase() []const u8 {
         }
     }
     return if (builtin.os.tag == .windows) "." else "/tmp";
-}
-
-/// LMDB's own switch for not syncing on every commit. The library has no
-/// option for it, and a store that is deleted when the relay stops has
-/// nothing to gain from a sync per event: on macOS each one is a full flush
-/// of the disk cache, which is most of what publishing costs.
-extern fn mdb_env_set_flags(env: *anyopaque, flags: c_uint, onoff: c_int) c_int;
-const mdb_nosync: c_uint = 0x10000;
-
-fn skipSync(store: *Store) void {
-    _ = mdb_env_set_flags(@ptrCast(store.env), mdb_nosync, 1);
 }
 
 /// SIGINT and SIGTERM, or a console Ctrl-C on Windows, set a flag that the
