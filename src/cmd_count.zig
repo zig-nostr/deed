@@ -202,7 +202,7 @@ fn sendText(gpa: std.mem.Allocator, io: Io, r: *relay.Relay, text: []const u8) !
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(gpa);
     var mask: [4]u8 = undefined;
-    io.randomSecure(&mask) catch return error.RandomFailed;
+    io.randomSecure(&mask) catch |e| return if (e == error.Canceled) error.Canceled else error.RandomFailed;
     try nostr.websocket.appendClientFrame(&frame, gpa, .text, text, mask);
     r.conn.write_lock.lockUncancelable(io);
     defer r.conn.write_lock.unlock(io);
