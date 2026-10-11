@@ -51,7 +51,7 @@ pub const usage =
     \\                   bunker://... or 64 hex characters; $NOSTR_SECRET_KEY
     \\                   is read when --sec is absent
     \\  --pretty         indent the JSON
-    \\  --timeout <s>    give up after this many seconds (default 15)
+    \\  --timeout <ms>   give up after this many milliseconds (default 15000)
     \\  --allow-http     permit plain http to a host that is not local
     \\
     \\Exits: 0 on success; 1 if the relay refuses the call or cannot be reached;
@@ -224,12 +224,12 @@ pub fn run(
             settings.sec = args[i];
         } else if (std.mem.eql(u8, a, "--timeout")) {
             i += 1;
-            const secs = if (i < args.len) std.fmt.parseInt(u32, args[i], 10) catch null else null;
-            if (secs == null) {
-                try err.writeAll("deed admin: --timeout needs a number of seconds\n");
+            const ms = if (i < args.len) std.fmt.parseInt(u32, args[i], 10) catch null else null;
+            if (ms == null or ms.? == 0) {
+                try err.writeAll("deed admin: --timeout needs a number of milliseconds\n");
                 return cli.exit_usage;
             }
-            settings.timeout_ms = @as(u64, secs.?) * 1000;
+            settings.timeout_ms = ms.?;
         } else {
             try err.print("deed admin: unknown option '{s}'\n", .{a});
             return cli.exit_usage;
@@ -499,4 +499,15 @@ test "a call signed by a remote signer carries a header by the user that verifie
         .now = Io.Timestamp.now(io, .real).toSeconds(),
     });
     try testing.expectEqualSlices(u8, &rig.user.public_key, &pk);
+}
+
+test "--timeout is in milliseconds, and 0 or a word is a usage error" {
+    const io = testing.io;
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    try testing.expectEqual(cli.exit_usage, try runAdmin(io, &.{ "--timeout", "0", "x", "supportedmethods" }, &out, &err));
+    try testing.expectEqual(cli.exit_usage, try runAdmin(io, &.{ "--timeout", "15s", "x", "supportedmethods" }, &out, &err));
+    try testing.expect(std.mem.indexOf(u8, err.written(), "milliseconds") != null);
 }

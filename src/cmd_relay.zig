@@ -27,7 +27,7 @@ pub const usage =
     \\
     \\Options:
     \\  --pretty           indent each document over several lines
-    \\  --timeout <secs>   give up on a relay after this long (default 10)
+    \\  --timeout <ms>     give up on a relay after this long (default 10000)
     \\  --allow-http       permit plain http to a host that is not local
     \\
     \\Exits: 1 if any relay failed, after saying why on stderr; the others are
@@ -77,15 +77,15 @@ pub fn run(
         } else if (std.mem.eql(u8, a, "--timeout")) {
             i += 1;
             if (i >= args.len) {
-                try err.writeAll("deed relay: --timeout needs a number of seconds\n");
+                try err.writeAll("deed relay: --timeout needs a number of milliseconds\n");
                 return cli.exit_usage;
             }
-            const secs = std.fmt.parseInt(u32, args[i], 10) catch 0;
-            if (secs == 0 or secs > 3600) {
-                try err.print("deed relay: '{s}' is not a number of seconds from 1 to 3600\n", .{args[i]});
+            const ms = std.fmt.parseInt(u32, args[i], 10) catch 0;
+            if (ms == 0 or ms > 3_600_000) {
+                try err.print("deed relay: '{s}' is not a number of milliseconds from 1 to 3600000\n", .{args[i]});
                 return cli.exit_usage;
             }
-            settings.timeout_ms = @as(u64, secs) * 1000;
+            settings.timeout_ms = ms;
         } else if (std.mem.startsWith(u8, a, "-")) {
             try err.print("deed relay: unknown option '{s}'\n", .{a});
             return cli.exit_usage;
@@ -305,7 +305,7 @@ test "a relay that never answers fails at the deadline" {
     var err: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer err.deinit();
 
-    const code = try runForTest(io, &.{ "--timeout", "1", url }, &out, &err);
+    const code = try runForTest(io, &.{ "--timeout", "300", url }, &out, &err);
     try std.testing.expectEqual(cli.exit_fail, code);
     try std.testing.expectEqualStrings("", out.written());
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "timed out") != null);
