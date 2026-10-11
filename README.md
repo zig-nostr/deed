@@ -1,6 +1,6 @@
 # deed
 
-**The nostr command line.**
+**Fastest and smallest nostr command line, built for AI agents and humans.**
 
 A deed is two things at once: a signed instrument, and a thing done. So is a nostr event. `deed` makes them, reads them and proves them.
 
