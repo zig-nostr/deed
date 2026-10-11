@@ -23,7 +23,6 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const dial = @import("dial.zig");
-const kinds = @import("kinds.zig");
 const keyinput = @import("keyinput.zig");
 const cmd_post = @import("cmd_post.zig");
 const cmd_decode = @import("cmd_decode.zig");
@@ -97,6 +96,34 @@ const max_limit: i64 = 200;
 
 const max_content_bytes = 256 * 1024;
 const max_tags = 512;
+
+/// The kinds publish_event signs, and nothing else. A signature is a
+/// credential: some kinds act for the key rather than say something, and a
+/// relay that answers OK false has still been handed the signed event, so the
+/// list names what is safe instead of what is not.
+const publishable_kinds = [_]u16{
+    // A text note: the same thing publish_note signs.
+    1,
+    // A repost of a kind 1 note. It points at a note that already exists.
+    6,
+    // A reaction to an event.
+    7,
+    // A generic repost of an event of any other kind.
+    16,
+    // A comment (NIP-22).
+    1111,
+    // A highlight (NIP-84): a quote from a piece of content.
+    9802,
+};
+
+/// Tags whose meaning belongs to an authentication or a deletion-like event:
+/// NIP-42 AUTH (relay, challenge), NIP-62 request to vanish (relay), and
+/// NIP-98 HTTP auth (u, method, payload). Refused on every kind, so an event
+/// signed here never carries what a careless verifier would check.
+const refused_tags = [_][]const u8{ "challenge", "relay", "u", "method", "payload" };
+
+/// How far created_at may be from now, either way.
+const max_clock_skew_s: i64 = 300;
 
 pub const Config = struct {
     /// The store `store_query` reads. Null leaves the tool out.
@@ -235,9 +262,9 @@ const tools = [_]Tool{
     },
     .{
         .name = "publish_event",
-        .description = "Sign an event with the server's key and offer it to the relays named. Returns the event and the relays that accepted it. Replaceable, addressable and deletion kinds are refused, because publishing one over data that was not read first can destroy it.",
+        .description = "Sign an event with the server's key and offer it to the relays named. Returns the event and the relays that accepted it. Only kinds 1 (note), 6 and 16 (repost), 7 (reaction), 1111 (comment) and 9802 (highlight) are signed; created_at must be within five minutes of now, and challenge, relay, u, method and payload tags are refused.",
         .schema =
-        \\{"type":"object","properties":{"kind":{"type":"integer","minimum":0,"maximum":65535},"content":{"type":"string"},"tags":{"type":"array","items":{"type":"array","items":{"type":"string"}}},"created_at":{"type":"integer"},"relays":
+        \\{"type":"object","properties":{"kind":{"type":"integer","enum":[1,6,7,16,1111,9802]},"content":{"type":"string"},"tags":{"type":"array","items":{"type":"array","items":{"type":"string"}}},"created_at":{"type":"integer","description":"unix seconds, within 300 of now; defaults to now"},"relays":
         ++ relays_schema ++
             \\,"timeout_ms":{"type":"integer","minimum":100,"maximum":30000,"default":10000}},"required":["kind","relays"]}
         ,
@@ -802,10 +829,9 @@ fn toolPublishEvent(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Alloca
     const kind_n = intArg(args, "kind") orelse return fail(out, "kind is required");
     if (kind_n < 0 or kind_n > 65535) return fail(out, "kind must be from 0 to 65535");
     const kind: u16 = @intCast(kind_n);
-    if (kinds.classOf(kind) != .regular and kinds.classOf(kind) != .ephemeral) {
-        return fail(out, "refused: replaceable and addressable kinds replace what a relay holds, and that has to be read first; use a command line for those");
+    if (std.mem.indexOfScalar(u16, &publishable_kinds, kind) == null) {
+        return failf(out, "refused: kind {d} is not one this server signs; it signs kinds 1, 6, 7, 16, 1111 and 9802", .{kind});
     }
-    if (kind == 5) return fail(out, "refused: deletion requests are not offered as a tool");
     const content = strArg(args, "content") orelse "";
 
     var tags: std.ArrayList(event.Tag) = .empty;
@@ -819,6 +845,9 @@ fn toolPublishEvent(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Alloca
                 if (p != .string) return fail(out, "each tag is a non-empty array of strings");
                 try parts.append(a, p.string);
             }
+            for (refused_tags) |name| if (std.mem.eql(u8, parts.items[0], name)) {
+                return failf(out, "refused: a {s} tag belongs to an authentication or deletion event", .{name});
+            };
             try tags.append(a, parts.items);
         }
     }
@@ -836,6 +865,10 @@ fn publish(
     out: *Io.Writer.Allocating,
 ) !bool {
     const sk = s.cfg.secret orelse return fail(out, "no signing key");
+    const now = Io.Timestamp.now(s.io, .real).toSeconds();
+    if (created_at) |t| if (t < now - max_clock_skew_s or t > now + max_clock_skew_s) {
+        return failf(out, "created_at must be within {d} seconds of now", .{max_clock_skew_s});
+    };
     if (content.len > max_content_bytes) return failf(out, "content is longer than {d} bytes", .{max_content_bytes});
     if (std.mem.trim(u8, content, " \t\r\n").len == 0 and kind == 1) return fail(out, "nothing to post");
     const relays = (try relayList(a, args, out, true)) orelse return false;
@@ -843,7 +876,7 @@ fn publish(
     var signer = try nostr.keys.Signer.initRandomized(s.io);
     defer signer.deinit();
     const kp = try signer.keyPairFromSecretKey(sk);
-    const at = created_at orelse Io.Timestamp.now(s.io, .real).toSeconds();
+    const at = created_at orelse now;
     const ev = try event.create(a, signer, kp, at, kind, tags, content, null);
     const wire = try event.toJson(a, ev);
     const id = try nostr.hex.encode(a, &ev.id);
@@ -1239,9 +1272,58 @@ test "publish_event refuses kinds that replace, and a relay that refuses reports
     const got = try converse(gpa, .{ .secret = [_]u8{0x44} ** 32 }, all);
     defer gpa.free(got);
     var b: [32]u8 = undefined;
-    try testing.expect(has(replyFor(got, 1, &b).?, "refused: replaceable"));
+    try testing.expect(has(replyFor(got, 1, &b).?, "refused: kind 3"));
     const r2 = replyFor(got, 2, &b).?;
     try testing.expect(has(r2, "\"isError\":true"));
     try testing.expect(has(r2, "no relay accepted"));
     try testing.expect(!has(r2, "\\\"accepted\\\":true"));
+}
+
+/// Asks publish_event for `kind_args` against a relay that refuses every
+/// event, and checks that the call is refused before anything is signed.
+fn refusedBeforeSigning(kind_args: []const u8, want: []const u8) !void {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    var script = cmd_post.Script{ .refuse = true };
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, cmd_post.Script.handle, &script);
+    defer relay.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, relay.port());
+    const a1 = try std.fmt.allocPrint(gpa, "{{{s},\"relays\":[\"{s}\"],\"timeout_ms\":3000}}", .{ kind_args, url });
+    defer gpa.free(a1);
+    const l1 = try callLine(gpa, 1, "publish_event", a1);
+    defer gpa.free(l1);
+    const got = try converse(gpa, .{ .secret = [_]u8{0x44} ** 32 }, l1);
+    defer gpa.free(got);
+    // A relay that answers OK false has still seen the signed event, so the
+    // refusal has to come before the relay is offered anything.
+    try testing.expectEqual(@as(usize, 0), script.events);
+    try testing.expect(has(got, "\"isError\":true"));
+    try testing.expect(has(got, want));
+}
+
+test "publish_event refuses a NIP-42 AUTH event for another relay" {
+    try refusedBeforeSigning("\"kind\":22242,\"tags\":[[\"relay\",\"wss://victim.example\"],[\"challenge\",\"c\"]]", "refused: kind 22242");
+}
+
+test "publish_event refuses a NIP-62 request to vanish" {
+    try refusedBeforeSigning("\"kind\":62,\"tags\":[[\"relay\",\"ALL_RELAYS\"]]", "refused: kind 62");
+}
+
+test "publish_event refuses NIP-98 and NIP-46 kinds" {
+    try refusedBeforeSigning("\"kind\":27235,\"tags\":[[\"u\",\"https://x.example\"],[\"method\",\"GET\"]]", "refused: kind 27235");
+    try refusedBeforeSigning("\"kind\":24133,\"content\":\"x\"", "refused: kind 24133");
+}
+
+test "publish_event refuses auth tags on an allowed kind" {
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"tags\":[[\"challenge\",\"c\"]]", "refused: a challenge tag");
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"tags\":[[\"relay\",\"wss://victim.example\"]]", "refused: a relay tag");
+}
+
+test "publish_event refuses a created_at far from now" {
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"created_at\":1000", "created_at must be within");
+    try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"created_at\":99999999999", "created_at must be within");
 }
