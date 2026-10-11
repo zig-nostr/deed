@@ -37,8 +37,9 @@ pub const usage =
     \\Usage:
     \\  deed publish [--timeout <ms>] [--auth] <relay-url>... [<event-json>...]
     \\
-    \\Reads events as newline-delimited JSON on stdin when given no event
-    \\arguments, checks each one, and offers it to every relay named.
+    \\Relays are positional: name each as a ws:// or wss:// argument. Reads events
+    \\as newline-delimited JSON on stdin when given no event arguments, checks
+    \\each one, and offers it to every relay named.
     \\
     \\  deed event -c "hello" | deed publish wss://relay.example
     \\

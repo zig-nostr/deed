@@ -49,6 +49,8 @@ pub const usage =
     \\      --local          count from the store alone, dialling nothing
     \\      --timeout <ms>   give up on relays that have not answered (default 10000)
     \\
+    \\Relays are positional: name each as a ws:// or wss:// argument.
+    \\
     \\Prints one line per relay that answered: its URL, a tab, and its count. A
     \\count a relay marks as approximate has "~" in front of the number. A
     \\filter can also be given as JSON, as an argument that starts with {; flags

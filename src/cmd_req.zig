@@ -58,8 +58,9 @@ pub const usage =
     \\A filter can also be given as JSON: as an argument that starts with {, or
     \\on stdin when a lone - is given (one object, several, or an array of them).
     \\Stdin is read only for that -, never on its own, so a caller that leaves a
-    \\pipe open cannot stall a request; reading it gives up after --timeout. Flags are laid over each JSON filter: a field a flag sets replaces
-    \\the one in the JSON. Several filters make one subscription.
+    \\pipe open cannot stall a request; reading it gives up after --timeout.
+    \\Flags are laid over each JSON filter: a field a flag sets replaces the one
+    \\in the JSON. Several filters make one subscription.
     \\More than 500 ids or authors in a filter go out as several filters in the
     \\same REQ, so none is dropped.
     \\
@@ -67,6 +68,10 @@ pub const usage =
     \\Each page asks for events older than the oldest one seen so far, and an
     \\event two pages return is printed once. --paginate cannot be combined
     \\with --stream or --local, and --ids-only cannot be combined with --stream.
+    \\
+    \\Relays are positional: name each as a ws:// or wss:// argument. With none,
+    \\the REQ is printed and nothing is dialled. (--relay only says where to look
+    \\up relay lists.)
     \\
     \\A relay that has not accepted the connection within five seconds, or
     \\within --timeout if that is shorter, is named on stderr and left out.
