@@ -8,10 +8,22 @@
 //!
 //! The one step a cancel cannot cut short is the name lookup, which is a plain
 //! libc call: a resolver that hangs still holds its dial until it returns.
+//!
+//! Proxies. `nostr.relay.dial` opens its own TCP connection and takes no
+//! stream from outside, so a relay connection cannot go through a proxy yet.
+//! It never goes around one quietly either: when `--proxy` or `DEED_PROXY`
+//! names one for a relay's host, the dial fails with `ProxyUnsupported` and
+//! says so, because whoever set it (a Tor user, say) asked for nothing to
+//! leave directly. A proxy found only in HTTPS_PROXY, HTTP_PROXY or ALL_PROXY,
+//! which are often set for a whole desktop and which deed ignored before, gets
+//! a warning on stderr and the relay is dialled directly. NO_PROXY excludes a
+//! relay from either.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const nostr = @import("nostr");
+
+const proxy = @import("proxy.zig");
 
 const Io = std.Io;
 const relay = nostr.relay;
@@ -56,6 +68,7 @@ pub fn all(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, timeout_ms:
     std.debug.assert(urls.len <= max_relays);
     std.debug.assert(out.len >= urls.len);
     for (out[0..urls.len]) |*o| o.* = .timed_out;
+    const cfg: ?*const proxy.Config = if (proxy.global) |*g| g else null;
 
     // One slot per task that can finish, or `cancel` below deadlocks waiting
     // for room to put a result.
@@ -64,6 +77,13 @@ pub fn all(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, timeout_ms:
 
     var pending: usize = 0;
     for (urls, 0..) |url, i| {
+        if (cfg) |c| if (proxied(c, url)) |choice| {
+            if (choice.explicit) {
+                out[i] = .{ .failed = error.ProxyUnsupported };
+                continue;
+            }
+            warnDirect(choice);
+        };
         // `concurrent`, never `async`: past its limit `async` runs the task
         // inline, and an inline dial is exactly the unbounded wait this avoids.
         sel.concurrent(.dial, dialOne, .{ gpa, io, url, i }) catch |e| {
@@ -99,6 +119,50 @@ pub fn all(gpa: std.mem.Allocator, io: Io, urls: []const []const u8, timeout_ms:
         } else |_| {},
         .timer => {},
     };
+}
+
+/// The proxy `url` would go through, if it parses as a relay URL at all. One
+/// that does not is left for the dial to refuse in its own words.
+fn proxied(cfg: *const proxy.Config, url: []const u8) ?proxy.Choice {
+    const parsed = relay.parseUrl(url) catch return null;
+    return cfg.select(parsed.secure, parsed.host, parsed.port);
+}
+
+var warned = std.atomic.Value(bool).init(false);
+
+/// Once a run: a proxy from the conventional variables does not cover relays.
+fn warnDirect(choice: proxy.Choice) void {
+    if (warned.swap(true, .monotonic)) return;
+    std.debug.print(
+        "deed: warning: relay connections cannot go through a proxy yet; relays are dialled directly, not through the proxy in {s} (set NO_PROXY to the relay hosts to silence this, or use --proxy to refuse direct relay connections)\n",
+        .{choice.name},
+    );
+}
+
+test "a relay that a proxy given with --proxy would carry is refused, not dialled around it" {
+    const io = std.testing.io;
+    var da: @import("testrelay.zig").DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the dials leaked");
+    const gpa = da.allocator();
+
+    const saved = proxy.global;
+    defer proxy.global = saved;
+    proxy.global = .{
+        .explicit = .{ .url = "socks5h://127.0.0.1:9", .name = "--proxy", .explicit = true },
+        .no_proxy = "127.0.0.1",
+    };
+
+    const urls = [_][]const u8{ "wss://relay.example", "not a relay url", "ws://127.0.0.1:1" };
+    var out: [3]Outcome = undefined;
+    all(gpa, io, &urls, 2000, &out);
+    defer for (out) |o| switch (o) {
+        .connected => |r| r.deinit(),
+        else => {},
+    };
+    try std.testing.expect(out[0] == .failed and out[0].failed == error.ProxyUnsupported);
+    // Left to the dial: an unparseable URL, and a host NO_PROXY excludes.
+    try std.testing.expect(out[1] == .failed and out[1].failed != error.ProxyUnsupported);
+    try std.testing.expect(out[2] != .failed or out[2].failed != error.ProxyUnsupported);
 }
 
 test "a silent relay times out, a closed port fails, and a live relay connects, all at once" {
@@ -169,6 +233,7 @@ pub fn describe(e: anyerror) []const u8 {
     if (eql(u8, name, "HandshakeFailed")) return "not a websocket relay (the upgrade was refused)";
     if (eql(u8, name, "SyntaxError") or eql(u8, name, "InvalidResponse") or eql(u8, name, "UnexpectedFrame")) return "the relay's reply was not understood";
     if (eql(u8, name, "InvalidUrl") or eql(u8, name, "UnsupportedScheme")) return "not a usable relay URL";
+    if (eql(u8, name, "ProxyUnsupported")) return "not dialled: a proxy is set and relay connections cannot go through one yet (add the relay's host to NO_PROXY to connect directly)";
     if (starts(u8, name, "Tls") or starts(u8, name, "Certificate")) return "could not set up a secure connection";
     return name;
 }

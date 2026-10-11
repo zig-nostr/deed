@@ -37,6 +37,7 @@ src/
   dial.zig        # dialling every relay at once under one deadline
   auth.zig        # NIP-42 answers for req, fetch and publish
   http.zig        # bounded HTTP client for relay, curl, admin, blossom, NIP-05
+  proxy.zig       # proxy settings, NO_PROXY, and CONNECT and SOCKS5 tunnels
   parallel.zig    # ordered worker pool, used by verify
   outbox.zig      # a person's NIP-65 relay list, found, checked and cached in the store
   relayserver.zig # the relay behind `deed serve`

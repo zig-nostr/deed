@@ -246,6 +246,7 @@ test {
     _ = @import("relayset.zig");
     _ = @import("storepath.zig");
     _ = @import("dial.zig");
+    _ = @import("proxy.zig");
     _ = @import("testrelay.zig");
     _ = @import("cmd_verify.zig");
     _ = @import("verbs.zig");
