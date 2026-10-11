@@ -61,6 +61,10 @@ deed reaches relays and keeps what it finds. Every verb that does not need a soc
 | `nsite` | deploy, download and list static sites (NIP-5A) |
 | `nip` | list the NIPs, or print one by number |
 | `group` | read and write NIP-29 groups: info, chat, join, moderation |
+| `podcast` | list the episodes of a podcast published on Nostr |
+| `validate` | check events against a registry-of-kinds schema |
+| `dekey` | set up and share a NIP-4E decoupled encryption key |
+| `git` | NIP-34 repositories, patches and issues: read them, announce, send patches |
 
 `deed help <command>` explains any of them, and so does `deed <command> --help`. Wherever a verb takes an `npub`, `nsec` or `note` it also takes it in upper case, the form a QR code carries, and `decode` and `fetch` take a code with a `nostr:` prefix in either case. A code that mixes cases is refused, as bech32 requires.
 
@@ -71,6 +75,7 @@ Keys come from `--sec` or from `$NOSTR_SECRET_KEY`. A key on a command line land
 A remote signer works there too: give a `bunker://` URI in place of the key, and every verb that signs or encrypts as you (`event`, `post`, `profile set`, `group`, `encrypt`, `decrypt`, `gift`, `curl`, `admin`, `blossom`, and the answers `--auth` gives a relay that asks who you are) asks the signer over NIP-46 instead. Each request waits up to 60 seconds for an answer, since someone may be approving it on another device. When the signer asks for approval at a link, the link is shown on stderr if it is a plain https URL, and not shown otherwise. deed makes a fresh client key for each run, so a signer that asks before trusting a new client asks every time; set `DEED_BUNKER_CLIENT_KEYS` to a file path to keep one client key per signer there (the file is created readable only by you). The verbs that need the key itself (`key public`, `key encrypt`, `bunker`, `nsite deploy`, `mcp`) refuse a `bunker://` URI.
 
 ```sh
+NOSTR_SECRET_KEY='bunker://…' deed post "hello" wss://relay.example   # the signer approves, up to 60 seconds
 deed key encrypt "$NOSTR_SECRET_KEY" > me.ncryptsec                # asks for a password
 deed key public "$(cat me.ncryptsec)"                               # asks for it again
 deed key mnemonic                                                   # a BIP-39 phrase
@@ -199,6 +204,8 @@ deed profile set --about "hello" --confirm wss://relay.example   # change your o
 
 `deed spell` fetches a kind 777 event, checks its signature, and runs the subscription its tags describe, as `req` would. `$me` and `$contacts` stand for you and the people you follow; say who you are with `--pub` or `--sec`. A spell that lists no relays, or lists `$outbox`, asks each author's own write relays, and `-n` sets how many. A spell ends once the relays have sent what they hold unless you give `--stream`.
 
+The relays a spell lists are its author's choice, so they are printed on stderr before anything is asked of them. A listed relay at a loopback or private address (localhost, 127.x, 10.x, 192.168.x, a name with no dot) is refused unless `--allow-local` is given or the address was also named on your command line. NIP-42 challenges (`--auth`, which needs `--sec`) are answered only at relays named on your command line, never at relays that came from the spell or from `$outbox`.
+
 ```sh
 deed nip 44 | less
 deed spell nevent1… -r wss://relay.example --pub npub1…
@@ -215,7 +222,7 @@ deed group chat 'wss://groups.example'pizza --send "hello"  # signed with your k
 deed group join 'wss://groups.example'pizza --code abc123
 ```
 
-`info`, `members`, `admins` and `chat` read. `chat --send`, `join`, `leave` and the moderation commands (`put-user`, `remove-user`, `delete-event`, `create-group`, `delete-group`, `create-invite`) write: each is signed with `--sec` or `$NOSTR_SECRET_KEY`, offered to the group's relay, and printed only if the relay accepted it. The relay decides who may moderate.
+The group's state (kinds 39000, 39001 and 39002) counts only when the relay's own key signed it: the `self` field of its NIP-11 document, or its `pubkey` field when `self` is absent. Events from any other key are dropped. A relay that states neither, or whose document cannot be read, is still read, with a warning, and `info` then carries `"verified":false`. `info`, `members`, `admins` and `chat` read. `chat --send`, `join`, `leave` and the moderation commands (`put-user`, `remove-user`, `delete-event`, `create-group`, `delete-group`, `create-invite`) write: each is signed with `--sec` or `$NOSTR_SECRET_KEY`, offered to the group's relay, and printed only if the relay accepted it. The relay decides who may moderate.
 
 ## Static sites
 
@@ -228,7 +235,7 @@ deed nsite list npub1… -r wss://relay.example               # path, a tab, sha
 deed nsite download npub1… ./copy -r wss://relay.example    # into an empty directory
 ```
 
-`deploy` uploads only the files the published manifest does not already name, publishes nothing if every upload has not succeeded, and publishes nothing when nothing changed unless you give `--force`. `--name` picks a named site instead of the root site. `download` writes a file only when its bytes hash to the name in the manifest. With no relay named, the person's relays are found through `DEED_RELAYS`.
+`deploy` hashes every regular file under the folder, dot-files included, so keep a `.env` or similar out of the folder you deploy. Symbolic links are skipped. It uploads only the files the published manifest does not already name, publishes nothing if every upload has not succeeded, and publishes nothing when nothing changed unless you give `--force`. `--name` picks a named site instead of the root site. `download` writes a file only when its bytes hash to the name in the manifest. With no relay named, the person's relays are found through `DEED_RELAYS`.
 
 ## A local relay
 
@@ -255,6 +262,48 @@ deed req -k 1059 -p npub1… wss://relay.example | deed gift unwrap --json
 
 `dm` adds a copy for you so your other clients can show the message. `unwrap` prints the rumor inside each wrap, and says which check failed (the wrap, the seal, the rumor or the sender) when one does. `encrypt` and `decrypt` take `--nip04` for older clients; NIP-04 has no authentication, so use it only where you must.
 
+## Git repositories
+
+`deed git` reads and writes NIP-34 repositories, patches and issues. A repository is an `naddr1` code, `<npub>/<identifier>`, or a `nostr://` address.
+
+```sh
+deed git repo npub1…/deed wss://relay.example            # the announcement
+deed git state npub1…/deed                               # HEAD and the refs, from the newest kind 30618
+deed git patches naddr1… --apply-ready 1a2b3c4d | git am  # a patch, or a whole series, as an mbox
+deed git issues naddr1… --json
+deed git announce --dry-run wss://relay.example          # sign the announcement, send nothing
+deed git send-patch --repo naddr1… HEAD~2..HEAD --dry-run
+```
+
+`repo`, `state`, `patches`, `issues` and `pulls` read, and print events whose signatures were checked. `announce` publishes a kind 30617 for the repository in the current directory (or `-C`), built from its name, remotes and root commit. It never writes over an announcement that exists unless `--replace` is given, which replaces the whole of it. `send-patch` runs `git format-patch` on a commit range and publishes one kind 1617 per commit to the relays the announcement lists. The first carries a root tag and each later one replies to the one before. A patch of 60 kB or more is refused, because NIP-34 asks for a pull request then. `--dry-run` prints the signed events and publishes nothing.
+
+## Podcasts
+
+`deed podcast` lists a podcast's episodes, newest first, one line each: the first eight characters of the event id, the date, the title and the media URL, separated by tabs. The person may be the podcast itself (kind 10154 metadata) or someone who lists podcasts they make (kind 10064 or 10164). It only reads: it does not play or download audio. `-l` limits the episodes per podcast and `-r` names where to look.
+
+```sh
+deed podcast npub1… -r wss://relay.example
+deed podcast show@example.com -l 10
+```
+
+## Checking events against a schema
+
+`deed validate` checks events against the registry-of-kinds schema: each kind's content type, its tags and the tags it requires. An event that passes is printed as given; one that fails is not, its reason goes to stderr as `line N: <reason>`, and the exit status is 1. `--schema` takes an http(s) URL or a file, and a file needs no network. A schema fetched from a URL is kept for 24 hours, and `--refresh` fetches it again. It does not check ids or signatures: `deed verify` does that. A kind the schema does not list passes.
+
+```sh
+deed event -k 1 -p not_a_pubkey | deed validate
+deed validate --schema ./schema.yaml < events.jsonl
+```
+
+## A decoupled encryption key
+
+`deed dekey` sets up and shares a NIP-4E decoupled encryption key. With none announced it makes one, keeps it in `--dir` (default `~/.config/deed/dekey`, files readable only by you) and announces its public key as kind 10044. On a machine that lacks an announced key it announces itself as a device (kind 4454) and looks for a key message (kind 4455) another device sent it. When it holds the key it lists the devices waiting for it. Nothing is sent to them unless you give `--authorize-all`, which sends the key to every waiting device, encrypted to it with NIP-44. `--reject-all`, or neither flag, sends it to none, and the verb never asks a question. `--rotate` makes a new key even though one is announced, and devices then have to be sent the new one. It prints the key's public key as 64 hex characters once this machine holds the secret half.
+
+```sh
+deed dekey -r wss://relay.example                    # set up, or look for a key; share with nobody
+deed dekey -r wss://relay.example --authorize-all    # send the key to every device waiting for it
+```
+
 ## Running a signer
 
 `deed bunker` holds a key and signs for the clients it trusts (NIP-46), over the relays you give it. It prints a `bunker://` URI for a client to connect with, and `--qrcode` prints the same URI as a QR code on stderr.
@@ -275,9 +324,11 @@ Only authorized clients are served: those whose pubkey was given with `--authori
 {"mcpServers":{"deed":{"command":"deed","args":["mcp"]}}}
 ```
 
-The tools that are always there are `decode`, `encode`, `verify`, `req`, `fetch`, `count`, `relay_info`, `relays` and `kind`. Events that arrive from relays are checked before they are returned. `encode` never builds an nsec and `decode` refuses one. Every call has a deadline of at most 30 seconds, and results are capped at 256 KiB, with a note saying so.
+The server speaks both generations of the protocol. The older one opens with an `initialize` handshake and is served for the 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25 revisions; a handshake that names no known version is answered with 2025-11-25. The 2026-07-28 revision has no handshake: each request carries its protocol version in its metadata, and `server/discover` reports the supported versions, capabilities and server identity.
 
-`--store <path>` adds `store_query`, which reads that store and nothing else. Publishing is off: the `publish_note` and `publish_event` tools are neither listed nor callable unless you start the server with `--allow-publish`, which also needs a signing key from `--sec` or `$NOSTR_SECRET_KEY`. The key is never accepted as a tool argument and never returned. Anything published this way is public, so enable it only for a client you trust to publish.
+The tools that are always there are `decode`, `encode`, `verify`, `req`, `fetch`, `count`, `relay_info`, `relays` and `kind`. Relays are named by the caller as `ws://` or `wss://` URLs, and `relay_info` takes nothing else. It also refuses a loopback or private address, unless the server was started with `--allow-local`, for a relay on this machine or network. Events that arrive from relays are checked before they are returned. `encode` never builds an nsec and `decode` refuses one. Every call has a deadline of at most 30 seconds, and results are capped at 256 KiB, with a note saying so.
+
+`--store <path>` adds `store_query`, which reads that store and nothing else. Publishing is off: the `publish_note` and `publish_event` tools are neither listed nor callable unless you start the server with `--allow-publish`, which also needs a signing key from `--sec` or `$NOSTR_SECRET_KEY`. The key is never accepted as a tool argument and never returned. Only kinds 1 (note), 6 and 16 (reposts), 7 (reaction), 1111 (comment) and 9802 (highlight) are signed, `created_at` must be within 300 seconds of now, and `challenge`, `relay`, `u`, `method` and `payload` tags are refused, so a client cannot use the key to answer a relay's authentication or to sign an HTTP request. Anything published this way is public, so enable it only for a client you trust to publish.
 
 ```json
 {"mcpServers":{"deed":{"command":"deed","args":["mcp","--store","/home/me/.deed/db"]}}}
@@ -294,6 +345,8 @@ deed curl -X PUT -d '{"a":1}' https://example.com/api/thing      # curl with a N
 deed admin relay.example.com banpubkey npub1… "spam"             # a NIP-86 call to a relay
 deed blossom upload photo.jpg -s cdn.example.com                 # a blob, by its sha256
 ```
+
+A NIP-05 name is looked up over https and a redirect is an error. A domain on this machine, or one that resolves to a private or link-local address, is refused, because a name read from an event could otherwise point deed at the local network; `decode --allow-local` permits it, over plain http for localhost. `relay` takes `--pretty`, `--timeout <secs>` and `--allow-http` for plain http to a host that is not local.
 
 `curl` signs a kind 27235 event for the request and hands the rest to the system curl, whose exit status becomes its own. `admin` signs each call with your key and prints the relay's result. `blossom` has `list`, `upload`, `download`, `delete`, `check` and `mirror`; an upload is confirmed only when the server's sha256 and size match the file, and a download is written only when its sha256 matches. Plain http is used only for a host on this machine, or with `--allow-http` where the verb has it.
 

@@ -4,7 +4,7 @@ A guide to this repository for anyone changing it, people and coding agents alik
 
 ## What this is
 
-`deed` is a command line for nostr, written in Zig on top of the [`nostr`](https://github.com/zig-nostr/nostr) library. It makes and protects keys, builds and signs events, reads and writes NIP-19 codes, encrypts and decrypts, wraps private messages, checks signatures, asks relays for events, publishes to them, syncs, signs for remote clients, runs a local relay and an MCP server, talks to relays and servers over HTTP, and keeps what it fetches in a local LMDB store.
+`deed` is a command line for nostr, written in Zig on top of the [`nostr`](https://github.com/zig-nostr/nostr) library. It makes and protects keys, builds and signs events, reads and writes NIP-19 codes, encrypts and decrypts, wraps private messages, checks signatures, asks relays for events, publishes to them, syncs, signs for remote clients, runs a local relay and an MCP server, reads and writes NIP-29 groups and NIP-34 repositories, deploys static sites, talks to relays and servers over HTTP, and keeps what it fetches in a local LMDB store.
 
 ## Build and test
 

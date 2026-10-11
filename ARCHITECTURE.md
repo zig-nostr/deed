@@ -48,6 +48,10 @@ deed is one short-lived process per command. There is no config file and no defa
 | `nsite` | `cmd_nsite.zig` | static sites (NIP-5A): deploy, download, list |
 | `nip` | `cmd_nip.zig` | list the NIPs or print one, cached for a day |
 | `group` | `cmd_group.zig` | NIP-29 groups: read, chat, join, moderation |
+| `podcast` | `cmd_podcast.zig` | the episodes of a podcast published on Nostr, read only |
+| `validate` | `cmd_validate.zig` | check events against a registry-of-kinds schema |
+| `dekey` | `cmd_dekey.zig` | a NIP-4E decoupled encryption key: announce, share with devices |
+| `git` | `cmd_git.zig` | NIP-34 repositories, patches and issues: read, announce, send patches |
 
 Shared pieces:
 
@@ -135,7 +139,9 @@ Every event's id and signature is checked before it is stored. The relay speaks 
 
 ## MCP
 
-`cmd_mcp.zig` speaks JSON-RPC 2.0 on stdio, one message per line, with nothing on stdout but protocol messages. Each tool calls the verb of the same name in this process with an argument list built from the tool's structured arguments, so a tool and the command line cannot disagree about what a filter or a code means. Nothing is spawned. Because the arguments are built there, a caller cannot reach an option a tool does not offer: a value that could be read as a flag is refused, a relay must be a ws:// or wss:// URL, and the store a tool reads is the one named when the server started. Every call has a deadline taken from its `timeout_ms` and clamped to 30 seconds, and a result is capped at 256 KiB. The publishing tools exist only with `--allow-publish`, and the key comes from `--sec` or `NOSTR_SECRET_KEY` and never from a tool argument.
+`cmd_mcp.zig` speaks JSON-RPC 2.0 on stdio, one message per line, with nothing on stdout but protocol messages. Each tool calls the verb of the same name in this process with an argument list built from the tool's structured arguments, so a tool and the command line cannot disagree about what a filter or a code means. Nothing is spawned. Because the arguments are built there, a caller cannot reach an option a tool does not offer: a value that could be read as a flag is refused, a relay must be a ws:// or wss:// URL, and the store a tool reads is the one named when the server started. Every call has a deadline taken from its `timeout_ms` and clamped to 30 seconds, and a result is capped at 256 KiB. The publishing tools exist only with `--allow-publish`, and the key comes from `--sec` or `NOSTR_SECRET_KEY` and never from a tool argument. They sign only kinds 1, 6, 7, 16, 1111 and 9802, with a `created_at` within 300 seconds of now, and refuse `challenge`, `relay`, `u`, `method` and `payload` tags, so the key cannot answer a NIP-42 challenge or sign a NIP-98 request through them. `relay_info` takes ws:// and wss:// relays only and refuses loopback and private addresses unless the server was started with `--allow-local`.
+
+The server speaks two generations of the protocol. For the 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25 revisions it answers an `initialize` handshake with the version the client asked for, or with 2025-11-25 when the request names none it knows. The 2026-07-28 revision has no handshake: every request carries its version and client capabilities in `_meta`, a version it does not support is answered with an error, and `server/discover` reports the versions, capabilities and identity. Results of `tools/list` and `server/discover` are marked private and cacheable for an hour, since the tool set is fixed for the life of the process.
 
 ## Sync
 
@@ -145,7 +151,7 @@ Every event's id and signature is checked before it is stored. The relay speaks 
 
 `cmd_bunker.zig` holds a key and answers NIP-46 requests over the relays given, through the same dial and reader machinery. It serves only authorized clients: a pubkey given with `--authorized-keys`, or a client that presents a secret, which is spent on first use and replaced. With `--persist` the state is written to a file that deed refuses to use if anyone but the owner can read it. `qr.zig` is a small encoder for exactly this: byte mode, error correction level M, versions 1 to 40, all eight masks tried, and a terminal rendering.
 
-The other side of NIP-46 is `signing.zig`, described under keys above. Its tests run the library's `signer.serve` on an in-memory relay (`signertest.zig`) behind the real verbs.
+The other side of NIP-46 is `signing.zig`, described under keys above. A request to a remote signer has a 60 second deadline, because someone may be approving it on another device. The client key is new for each run unless `DEED_BUNKER_CLIENT_KEYS` names a file, which then keeps one client key per signer and is created readable only by its owner. An approval link from the signer is shown on stderr only when it is an https URL of plain printable characters. `key`, `bunker`, `nsite deploy` and `mcp` need the key itself and refuse a `bunker://` URI. Its tests run the library's `signer.serve` on an in-memory relay (`signertest.zig`) behind the real verbs.
 
 ## Adding a verb
 
