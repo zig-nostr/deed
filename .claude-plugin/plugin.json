@@ -1,6 +1,6 @@
 {
   "name": "deed",
-  "description": "Teaches the agent to use deed for nostr work: generating keys, signing and verifying events, NIP-19 codes, NIP-44, querying relays, publishing, syncing, private messages, profiles, a NIP-46 signer, relay management, Blossom, NIP-29 groups, static sites, spells, a local relay, an MCP server, and a local store it can query offline.",
+  "description": "Teaches the agent to use deed for nostr work: generating keys, signing and verifying events, NIP-19 codes, NIP-44, querying relays, publishing, syncing, private messages, profiles, a NIP-46 signer, relay management, Blossom, NIP-29 groups, NIP-34 git repositories and patches, podcasts, NIP-4E decoupled keys, schema validation, remote signing with a bunker:// URI, static sites, spells, a local relay, an MCP server, and a local store it can query offline.",
   "author": {
     "name": "Sepehr Safari",
     "url": "https://github.com/sepehr-safari"
