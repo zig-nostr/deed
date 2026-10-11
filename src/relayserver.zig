@@ -41,6 +41,10 @@ pub const Limits = struct {
     queue_soft: usize = 1 << 20,
     /// Bytes queued for one connection before it is dropped as too slow.
     queue_hard: usize = 4 << 20,
+    /// Bytes the relay holds for work in flight, all connections together:
+    /// frames waiting to be written, events waiting to be stored, and open
+    /// reconciliations. New work past it is refused with a "blocked" answer.
+    memory_budget: usize = 256 << 20,
     /// Connections open at once.
     max_connections: usize = 1024,
     /// Sockets that have been accepted and have not yet finished the
@@ -48,7 +52,7 @@ pub const Limits = struct {
     /// ones cannot use up the descriptors.
     max_pending_handshakes: usize = 64,
     /// Open NIP-77 reconciliations per connection.
-    max_neg_sessions: usize = 8,
+    max_neg_sessions: usize = 4,
     /// Stored events one reconciliation may cover.
     max_neg_items: usize = 500_000,
     /// The largest negentropy message the relay produces, before hex.
@@ -98,6 +102,8 @@ pub const Server = struct {
     /// of those have not finished the handshake.
     open_sockets: std.atomic.Value(usize) = .init(0),
     handshaking: std.atomic.Value(usize) = .init(0),
+    /// Bytes counted against `Limits.memory_budget`.
+    mem_used: std.atomic.Value(usize) = .init(0),
 
     // Group commit. Verified events from every connection wait in `wq`; one
     // task takes whatever is queued and stores it in one transaction.
@@ -231,6 +237,29 @@ pub const Server = struct {
         }
     }
 
+    /// Takes `n` bytes of the budget, or says there is not that much left.
+    fn reserve(self: *Server, n: usize) bool {
+        const budget = self.opts.limits.memory_budget;
+        var cur = self.mem_used.load(.acquire);
+        while (true) {
+            if (cur + n > budget) return false;
+            cur = self.mem_used.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) orelse return true;
+        }
+    }
+
+    /// Counts `n` bytes that are held whether or not the budget has room.
+    fn charge(self: *Server, n: usize) void {
+        _ = self.mem_used.fetchAdd(n, .acq_rel);
+    }
+
+    fn release(self: *Server, n: usize) void {
+        _ = self.mem_used.fetchSub(n, .acq_rel);
+    }
+
+    fn overBudget(self: *const Server) bool {
+        return self.mem_used.load(.acquire) >= self.opts.limits.memory_budget;
+    }
+
     fn socketClosed(self: *Server, handshaking: bool) void {
         _ = self.open_sockets.fetchSub(1, .acq_rel);
         if (handshaking) _ = self.handshaking.fetchSub(1, .acq_rel);
@@ -282,6 +311,8 @@ const Sub = struct {
 };
 
 const Neg = struct {
+    /// What it holds against the server's budget.
+    bytes: usize = 0,
     storage: nip77.Storage,
     responder: nip77.Responder,
 };
@@ -334,6 +365,7 @@ const Conn = struct {
     }
 
     fn deinit(c: *Conn) void {
+        c.server.release(c.q_bytes);
         for (c.q_items.items) |f| c.gpa.free(f);
         c.q_items.deinit(c.gpa);
         var it = c.subs.valueIterator();
@@ -342,6 +374,7 @@ const Conn = struct {
         var nit = c.negs.iterator();
         while (nit.next()) |e| {
             c.gpa.free(e.key_ptr.*);
+            c.server.release(e.value_ptr.*.bytes);
             e.value_ptr.*.storage.deinit(c.gpa);
             c.gpa.destroy(e.value_ptr.*);
         }
@@ -369,7 +402,12 @@ const Conn = struct {
             c.gpa.free(frame);
             return;
         }
-        if (c.q_bytes + frame.len > c.server.opts.limits.queue_hard) {
+        // Past the relay's budget, a client that already has a backlog is
+        // the one dropped; one with nothing waiting still gets its frame.
+        const too_slow = c.q_bytes + frame.len > c.server.opts.limits.queue_hard or
+            (c.q_bytes > 0 and !c.server.reserve(frame.len));
+        if (!too_slow and c.q_bytes == 0) c.server.charge(frame.len);
+        if (too_slow) {
             c.dead = true;
             c.slow = true;
             c.q_data.broadcast(c.io);
@@ -382,6 +420,7 @@ const Conn = struct {
         }
         c.q_items.append(c.gpa, frame) catch {
             c.q_mu.unlock(c.io);
+            c.server.release(frame.len);
             c.gpa.free(frame);
             return;
         };
@@ -410,6 +449,7 @@ const Conn = struct {
             c.gpa.free(frame);
             return e;
         };
+        c.server.charge(frame.len);
         c.q_bytes += frame.len;
         c.q_data.signal(c.io);
     }
@@ -472,6 +512,10 @@ const Conn = struct {
     }
 };
 
+/// What one stored event costs a reconciliation, about: id, timestamp and
+/// the sorted copy.
+const neg_item_bytes = 48;
+
 const SendError = error{ OutOfMemory, Canceled, Gone };
 
 /// Jobs waiting for the committer before readers wait for room.
@@ -488,6 +532,8 @@ const Job = struct {
     parsed: ?message.ParsedClientMessage,
     /// The refusal to send, when `parsed` is null.
     refusal: []const u8 = "",
+    /// Held against the budget until the commit is done.
+    bytes: usize = 0,
 };
 
 /// Hands `job` to the committer, waiting while the queue is full. On failure
@@ -544,6 +590,7 @@ fn commitMain(server: *Server) void {
         commitBatch(server, batch.items, &evs, &results);
         for (batch.items) |*job| {
             if (job.parsed) |*p| p.deinit();
+            server.release(job.bytes);
             const c = job.conn;
             c.q_mu.lockUncancelable(io);
             c.pending -= 1;
@@ -721,6 +768,7 @@ fn writerMain(c: *Conn) Io.Cancelable!void {
 
         c.q_mu.lockUncancelable(io);
         c.q_bytes -= written;
+        c.server.release(written);
         c.q_space.broadcast(io);
         c.q_mu.unlock(io);
     }
@@ -1004,7 +1052,13 @@ fn onEvent(c: *Conn, parsed: message.ParsedClientMessage, ev: Event) SendError!b
         try enqueue(server, .{ .conn = c, .id = ev.id, .parsed = null, .refusal = text });
         return false;
     }
-    enqueue(server, .{ .conn = c, .id = ev.id, .parsed = parsed }) catch |e| {
+    const bytes = ev.content.len + 1024;
+    if (!server.reserve(bytes)) {
+        try c.ok(ev.id, false, "blocked: the relay has too much in flight, try again shortly");
+        return false;
+    }
+    enqueue(server, .{ .conn = c, .id = ev.id, .parsed = parsed, .bytes = bytes }) catch |e| {
+        server.release(bytes);
         if (e == error.Gone) {
             // The relay is stopping.
             try c.ok(ev.id, false, "error: the relay is shutting down");
@@ -1046,6 +1100,10 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
     const limits = c.server.opts.limits;
     if (c.needsAuth()) {
         try c.closed(sub_id, "auth-required: this relay answers only after AUTH");
+        return;
+    }
+    if (c.server.overBudget()) {
+        try c.closed(sub_id, "blocked: the relay has too much in flight, try again shortly");
         return;
     }
     if (filters.len == 0) {
@@ -1211,6 +1269,10 @@ fn onNegOpen(c: *Conn, sub_id: []const u8, f: Filter, initial_hex: []const u8) S
     };
     var storage_owned = false;
     defer if (!storage_owned) neg.storage.deinit(c.gpa);
+    neg.bytes = neg.storage.size() * neg_item_bytes;
+    if (!c.server.reserve(neg.bytes)) return c.negErr(sub_id, "blocked: the relay has too much in flight, try again shortly");
+    var reserved = true;
+    defer if (reserved) c.server.release(neg.bytes);
     if (neg.storage.size() > limits.max_neg_items) return c.negErr(sub_id, "blocked: too many events match, narrow the filter");
     neg.responder = nip77.Responder.init(&neg.storage, .{ .frame_size_limit = limits.neg_frame_limit }) catch
         return c.negErr(sub_id, "error: the reconciliation could not start");
@@ -1228,6 +1290,7 @@ fn onNegOpen(c: *Conn, sub_id: []const u8, f: Filter, initial_hex: []const u8) S
     };
     owned = true;
     storage_owned = true;
+    reserved = false;
     try c.sendOwned(try message.encodeNegMsg(c.gpa, sub_id, reply));
 }
 
@@ -1256,6 +1319,7 @@ fn onNegMsg(c: *Conn, sub_id: []const u8, msg_hex: []const u8) SendError!void {
 fn onNegClose(c: *Conn, sub_id: []const u8) void {
     const kv = c.negs.fetchRemove(sub_id) orelse return;
     c.gpa.free(kv.key);
+    c.server.release(kv.value.bytes);
     kv.value.storage.deinit(c.gpa);
     c.gpa.destroy(kv.value);
 }
@@ -2348,4 +2412,35 @@ test "sockets that say nothing are turned away past the handshake cap" {
     // Closed by the server at once, not after the 30 second timeout.
     try testing.expectError(error.EndOfStream, r.interface.takeByte());
     try testing.expectEqual(@as(usize, 2), ts.server.handshaking.load(.acquire));
+}
+
+test "work past the relay's memory budget is refused, and the budget comes back" {
+    var ts: TestServer = undefined;
+    try ts.start(.{ .limits = .{ .memory_budget = 64 * 1024 } });
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 7);
+    const now = nowSeconds(testing.io);
+
+    var cl = try RawClient.connect(gpa, ts.server.port());
+    defer cl.deinit();
+    const big = try arena.alloc(u8, 100 * 1024);
+    @memset(big, 'x');
+    try cl.send(try message.encodeEvent(arena, try makeEvent(arena, signer, kp, 1, now, big)));
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "false,\"blocked:") != null);
+
+    // A small one still goes through, and what it used is given back.
+    try cl.send(try message.encodeEvent(arena, try makeEvent(arena, signer, kp, 1, now + 1, "small")));
+    try testing.expect(std.mem.indexOf(u8, try cl.text(), "true") != null);
+    try cl.send("[\"REQ\",\"s\",{}]");
+    _ = try cl.text();
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", try cl.text());
+    var tries: usize = 0;
+    while (ts.server.mem_used.load(.acquire) != 0 and tries < 200) : (tries += 1) try testing.io.sleep(.fromMilliseconds(5), .awake);
+    try testing.expectEqual(@as(usize, 0), ts.server.mem_used.load(.acquire));
 }
