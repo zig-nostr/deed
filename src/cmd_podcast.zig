@@ -49,9 +49,14 @@ pub const usage =
     \\                       NIP-05 name's relays are used as well
     \\  -l, --limit <n>      most episodes per podcast (default 50)
     \\      --timeout <ms>   give up on relays still answering (default 30000)
+    \\      --allow-local    let a NIP-05 name resolve to an address on this
+    \\                       machine or network (refused by default)
     \\
     \\With no relay named, the person's own write relays are looked up through
     \\the relays in DEED_RELAYS. deed has no built-in relay list.
+    \\
+    \\Exits: 0 on success; 1 if no podcast was found or no relay answered; 2 if
+    \\the command line was not understood.
     \\
 ;
 
@@ -153,6 +158,7 @@ pub fn run(
     var urls: std.ArrayList([]const u8) = .empty;
     defer urls.deinit(gpa);
     var limit: u32 = 50;
+    var allow_local = false;
     var timeout_ms: i64 = 30_000;
 
     var i: usize = 0;
@@ -163,6 +169,10 @@ pub fn run(
             return cli.exit_ok;
         }
         if (i == 0 and std.mem.eql(u8, a, "list")) continue;
+        if (std.mem.eql(u8, a, "--allow-local")) {
+            allow_local = true;
+            continue;
+        }
         if (cli.isOneOf(a, &.{ "play", "info" }) and i == 0) {
             try err.print("deed podcast: '{s}' is not supported: this only lists episodes\n", .{a});
             return cli.exit_usage;
@@ -223,8 +233,8 @@ pub fn run(
             break :blk p.pubkey;
         }
         if (cmd_decode.isNip05(s) and !keyinput.hasPrefix(s, "npub1")) {
-            resolved = cmd_decode.resolveNip05(gpa, io, s) catch |e| {
-                try err.print("deed podcast: {s}: {s}\n", .{ raw, @errorName(e) });
+            resolved = cmd_decode.resolveNip05Opts(gpa, io, s, !allow_local) catch |e| {
+                try err.print("deed podcast: {s}: {s}\n", .{ raw, cmd_decode.reason(e) });
                 return cli.exit_fail;
             };
             for (resolved.?.relays) |h| try urls.append(gpa, h);

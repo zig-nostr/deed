@@ -109,7 +109,7 @@ pub fn run(
     return if (failures == 0) cli.exit_ok else cli.exit_fail;
 }
 
-fn reason(e: anyerror) []const u8 {
+pub fn reason(e: anyerror) []const u8 {
     return switch (e) {
         // NIP-05.
         error.EmptyName => "the name before @ is empty",
