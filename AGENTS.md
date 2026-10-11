@@ -4,7 +4,7 @@ A guide to this repository for anyone changing it, people and coding agents alik
 
 ## What this is
 
-`deed` is a command line for nostr, written in Zig on top of the [`nostr`](https://github.com/zig-nostr/nostr) library. It makes and protects keys, builds and signs events, reads and writes NIP-19 codes, encrypts and decrypts, wraps private messages, checks signatures, asks relays for events, publishes to them, syncs, signs for remote clients, talks to relays and servers over HTTP, and keeps what it fetches in a local LMDB store.
+`deed` is a command line for nostr, written in Zig on top of the [`nostr`](https://github.com/zig-nostr/nostr) library. It makes and protects keys, builds and signs events, reads and writes NIP-19 codes, encrypts and decrypts, wraps private messages, checks signatures, asks relays for events, publishes to them, syncs, signs for remote clients, runs a local relay and an MCP server, talks to relays and servers over HTTP, and keeps what it fetches in a local LMDB store.
 
 ## Build and test
 
@@ -38,7 +38,9 @@ src/
   auth.zig        # NIP-42 answers for req, fetch and publish
   http.zig        # bounded HTTP client for relay, curl, admin, blossom, NIP-05
   parallel.zig    # ordered worker pool, used by verify
-  outbox.zig      # a person's NIP-65 relay list, found and checked
+  outbox.zig      # a person's NIP-65 relay list, found, checked and cached in the store
+  relayserver.zig # the relay behind `deed serve`
+  cmd_mcp.zig     # `deed mcp`: the tools over MCP on stdio
   negclient.zig   # NIP-77 negentropy against one relay
   password.zig    # passwords read with echo off or from NOSTR_PASSWORD
   qr.zig          # QR encoder for bunker --qrcode
