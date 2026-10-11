@@ -687,8 +687,14 @@ fn downloadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, sha: [32]
         break :blk headers[0..1];
     } else &.{};
 
-    const file = cwd.createFile(ctx.io, tmp, .{}) catch |e| {
-        try ctx.err.print("deed blossom download: cannot write {s}: {s}\n", .{ tmp, @errorName(e) });
+    // Exclusive: a leftover part file may be someone else's, or another
+    // download's still in progress, and is never truncated.
+    const file = cwd.createFile(ctx.io, tmp, .{ .exclusive = true }) catch |e| {
+        if (e == error.PathAlreadyExists) {
+            try ctx.err.print("deed blossom download: {s} already exists; remove it or choose another -o\n", .{tmp});
+        } else {
+            try ctx.err.print("deed blossom download: cannot write {s}: {s}\n", .{ tmp, @errorName(e) });
+        }
         return false;
     };
     var closed = false;
@@ -1664,6 +1670,37 @@ test "a download signs a get token when a key is given" {
     try testing.expectEqual(cli.exit_ok, r.code);
     try testing.expectEqual(@as(usize, 1), mock.auth_seen);
     try testing.expectEqual(@as(usize, 0), mock.problems);
+}
+
+test "a download leaves an existing part file alone and refuses" {
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+
+    var dir: TmpDir = undefined;
+    try dir.init();
+    defer dir.deinit();
+    var mock: Mock = undefined;
+    try mock.start(io, 1);
+    defer mock.stop(io);
+    mock.serve_len = 1000;
+    mock.serve_sha = patternSha(1000);
+    const hex = std.fmt.bytesToHex(mock.serve_sha, .lower);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dest = try dir.path(&pbuf, "got.bin");
+    var partbuf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const part_name = try std.fmt.bufPrint(&partbuf, "got.bin.{s}.part", .{hex[0..8]});
+    try dir.tmp.dir.writeFile(io, .{ .sub_path = part_name, .data = "precious" });
+    var bbuf: [64]u8 = undefined;
+
+    const r = try runWith(gpa, &.{ "download", &hex, "-s", mock.base(&bbuf), "-o", dest });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_fail, r.code);
+    try testing.expect(std.mem.find(u8, r.err, "already exists") != null);
+    var kept: [16]u8 = undefined;
+    const got = try dir.tmp.dir.readFile(io, part_name, &kept);
+    try testing.expectEqualStrings("precious", got);
 }
 
 test "delete sends a delete token naming the blob" {
