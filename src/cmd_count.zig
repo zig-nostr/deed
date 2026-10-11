@@ -239,7 +239,11 @@ fn countOne(gpa: std.mem.Allocator, io: Io, r: *relay.Relay, text: []const u8, i
                 ans.setNote(c.message);
                 return ans;
             },
+            // A NOTICE is free text: a relay may greet, warn or complain about
+            // something else before it answers. Only one that is about COUNT
+            // is a refusal; the rest are waited past, up to the deadline.
             .notice => |n| {
+                if (std.ascii.findIgnoreCase(n.message, "count") == null) continue;
                 ans.kind = .refused;
                 ans.setNote(n.message);
                 return ans;
@@ -303,7 +307,15 @@ pub fn run(
         return cli.exit_usage;
     }
 
-    const text = try message.encodeCount(gpa, subscription_id, filters.items);
+    // A long list of ids or authors goes out as several filters, as in req.
+    const pieces = filterflags.splitLarge(arena, filters.items) catch |e| switch (e) {
+        error.TooManyFilters => {
+            try err.print("deed count: too many ids and authors together: a filter naming more than {d} of both is not sent in more than {d} pieces\n", .{ filterflags.chunk_size, filterflags.max_pieces });
+            return cli.exit_usage;
+        },
+        else => |other| return other,
+    };
+    const text = try message.encodeCount(gpa, subscription_id, pieces);
     defer gpa.free(text);
 
     const started = Io.Timestamp.now(io, .awake).toMilliseconds();
@@ -336,7 +348,15 @@ pub fn run(
     if (pending > 0) {
         const elapsed = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
         const left = @max(req.timeout_ms - elapsed, 0);
-        sel.concurrent(.timer, Io.sleep, .{ io, Io.Duration.fromMilliseconds(left), .awake }) catch {};
+        sel.concurrent(.timer, Io.sleep, .{ io, Io.Duration.fromMilliseconds(left), .awake }) catch |e| {
+            // Without a timer the wait has no bound: stop the readers and say so.
+            for (outcomes[0..req.relays.len], 0..) |o, i| switch (o) {
+                .connected => |r| if (answers[i] == null) r.shutdown(io),
+                else => {},
+            };
+            while (sel.cancel()) |_| {}
+            return e;
+        };
     }
 
     var timed_out = false;
@@ -579,6 +599,95 @@ test "a relay that answers CLOSED is named on stderr and the others still count"
     r = try runCount(gpa, &.{url_bad}, &ob, &eb);
     try std.testing.expectEqual(cli.exit_fail, r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "no relay answered") != null);
+}
+
+const Greets = struct {
+    fn noticeThenCounts(ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void {
+        _ = ctx;
+        if (std.mem.indexOf(u8, frame, "\"COUNT\"") == null) return;
+        try testrelay.sendText(w, "[\"NOTICE\",\"welcome to the relay\"]");
+        const reply = try message.encodeCountReply(std.testing.allocator, "deed", 42, null);
+        defer std.testing.allocator.free(reply);
+        try testrelay.sendText(w, reply);
+    }
+    fn noticeRefuses(ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void {
+        _ = ctx;
+        if (std.mem.indexOf(u8, frame, "\"COUNT\"") == null) return;
+        try testrelay.sendText(w, "[\"NOTICE\",\"unknown command: COUNT\"]");
+    }
+    /// Answers with how many filters the COUNT carried.
+    fn filterCount(ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void {
+        _ = ctx;
+        if (std.mem.indexOf(u8, frame, "\"COUNT\"") == null) return;
+        const n = std.mem.count(u8, frame, "\"ids\":[");
+        const reply = try message.encodeCountReply(std.testing.allocator, "deed", n, null);
+        defer std.testing.allocator.free(reply);
+        try testrelay.sendText(w, reply);
+    }
+};
+
+test "a NOTICE that is not about COUNT does not make the relay unsupported" {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var rl: testrelay.Relay = undefined;
+    try rl.startCustom(io, Greets.noticeThenCounts, null);
+    defer rl.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, rl.port());
+    var ob: [512]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const r = try runCount(gpa, &.{ "-k", "1", url }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\t42\n") != null);
+    try std.testing.expectEqualStrings("", r.err);
+}
+
+test "a NOTICE that refuses COUNT is still a refusal" {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var rl: testrelay.Relay = undefined;
+    try rl.startCustom(io, Greets.noticeRefuses, null);
+    defer rl.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, rl.port());
+    var ob: [512]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const r = try runCount(gpa, &.{ "-k", "1", url }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_fail, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "does not support COUNT: unknown command") != null);
+}
+
+test "COUNT filters naming many ids go out split" {
+    const io = std.testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var rl: testrelay.Relay = undefined;
+    try rl.startCustom(io, Greets.filterCount, null);
+    defer rl.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, rl.port());
+
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    try json.appendSlice(gpa, "{\"ids\":[");
+    for (0..600) |i| {
+        if (i > 0) try json.append(gpa, ',');
+        try json.print(gpa, "\"{x:0>64}\"", .{i + 1});
+    }
+    try json.appendSlice(gpa, "]}");
+    var ob: [512]u8 = undefined;
+    var eb: [512]u8 = undefined;
+    const r = try runCount(gpa, &.{ json.items, url }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\t2\n") != null);
 }
 
 test "a silent relay is bounded by the deadline" {
