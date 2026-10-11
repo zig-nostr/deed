@@ -1739,3 +1739,39 @@ test "an unreachable relay is named with the verb and a plain reason" {
     try std.testing.expectEqual(cli.exit_fail, r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "deed req: ws://127.0.0.1:1: connection refused") != null);
 }
+
+test "events come back through a CONNECT proxy and a SOCKS5 proxy" {
+    const io = std.testing.io;
+    const proxy = @import("proxy.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ev = try relayset.testEvent(arena, io, "through the proxy");
+
+    for ([_]testrelay.Tunnel.Kind{ .connect, .socks5 }, [_][]const u8{ "http://", "socks5h://" }) |kind, scheme| {
+        var da: testrelay.DialAllocator = .init;
+        defer if (da.deinit() == .leak) @panic("the run leaked");
+
+        var r: testrelay.Relay = undefined;
+        try r.start(io, .serve);
+        defer r.stop(io);
+        r.serving = &.{ev};
+        var tun: testrelay.Tunnel = undefined;
+        try tun.start(io, kind, 1);
+        defer tun.stop(io);
+
+        const saved = proxy.global;
+        defer proxy.global = saved;
+        var pb: [64]u8 = undefined;
+        proxy.global = .{ .explicit = .{ .url = try tun.url(&pb, scheme), .name = "--proxy", .explicit = true } };
+
+        var ub: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&ub, "ws://relay.example.test:{d}", .{r.port()});
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var err: std.Io.Writer.Allocating = .init(arena);
+        const code = try runWith(da.allocator(), io, &.{ "-k", "1", url }, null, &out.writer, &err.writer);
+        try std.testing.expectEqual(cli.exit_ok, code);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "through the proxy") != null);
+        try std.testing.expectEqual(@as(usize, 1), tun.opened.load(.monotonic));
+    }
+}

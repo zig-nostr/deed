@@ -128,9 +128,11 @@ pub const usage =
     "\n" ++
     "  cat notes.jsonl | deed verify\n" ++
     "\n" ++
-    "--proxy <url> sends web requests through an http://, socks5:// or\n" ++
-    "socks5h:// proxy (socks5h for Tor). Without it, DEED_PROXY, then\n" ++
-    "HTTPS_PROXY, HTTP_PROXY and ALL_PROXY are used, minus NO_PROXY.\n" ++
+    "--proxy <url> sends web requests and relay connections through an\n" ++
+    "http://, socks5:// or socks5h:// proxy (socks5h for Tor). Without it,\n" ++
+    "DEED_PROXY, then HTTPS_PROXY, HTTP_PROXY and ALL_PROXY are used, minus\n" ++
+    "NO_PROXY. A proxy that is set and cannot be reached fails the command;\n" ++
+    "nothing goes around it.\n" ++
     "\n" ++
     "Exit codes: 0 success, 1 the command ran and failed, 2 the command was\n" ++
     "not understood.\n";
