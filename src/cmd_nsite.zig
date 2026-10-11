@@ -50,7 +50,10 @@ pub const usage =
     \\         published one is not uploaded again, and when nothing at all
     \\         changed nothing is published. If any file cannot be uploaded to
     \\         any server, nothing is published. Prints the manifest event if at
-    \\         least one relay accepted it. Symbolic links are skipped.
+    \\         least one relay accepted it. Symbolic links are skipped, and so
+    \\         are dot-files and dot-directories (.git, .env, .DS_Store): a
+    \\         published file cannot be taken back. --include-hidden publishes
+    \\         them.
     \\download Fetches the manifest and downloads each file from the servers the
     \\         manifest names (and any given with --server), in order, into
     \\         <dir>, which must not exist or be empty. A file is written only
@@ -75,6 +78,7 @@ pub const usage =
     \\      --source <url>    deploy: where the source lives
     \\      --force           deploy: upload every file and publish even if the
     \\                        published manifest is the same
+    \\      --include-hidden  deploy: publish dot-files and dot-directories too
     \\      --sites           list: the person's sites rather than one site's files
     \\  -r, --relay <url>     a relay (repeatable; a bare ws:// or wss:// argument
     \\                        works too)
@@ -236,6 +240,7 @@ const Opts = struct {
     description: ?[]const u8 = null,
     source: ?[]const u8 = null,
     force: bool = false,
+    include_hidden: bool = false,
     sites: bool = false,
     timeout_ms: i64 = 10_000,
 
@@ -288,6 +293,8 @@ pub fn run(
         }
         if (std.mem.eql(u8, a, "--force")) {
             opts.force = true;
+        } else if (std.mem.eql(u8, a, "--include-hidden")) {
+            opts.include_hidden = true;
         } else if (std.mem.eql(u8, a, "--sites")) {
             opts.sites = true;
         } else if (cli.isOneOf(a, &.{ "-s", "--server", "-r", "--relay", "--sec", "--name", "--title", "--description", "--source", "--timeout" })) {
@@ -585,7 +592,7 @@ fn hashFile(io: Io, path: []const u8) !struct { sha: [32]u8, size: u64 } {
 
 /// Every regular file under `dir`, hashed. Null after saying why on `err` when
 /// the directory cannot be read or holds something a site cannot carry.
-fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u8, err: *Io.Writer) !?[]LocalFile {
+fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u8, include_hidden: bool, err: *Io.Writer) !?[]LocalFile {
     var root = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |e| {
         try err.print("deed nsite deploy: cannot read {s}: {s}\n", .{ dir, @errorName(e) });
         return null;
@@ -600,6 +607,14 @@ fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u
         try err.print("deed nsite deploy: cannot read {s}: {s}\n", .{ dir, @errorName(e) });
         return null;
     }) |entry| {
+        if (!include_hidden) {
+            if (hiddenAt(entry.path)) |top| {
+                // Said once, for the dot-file or dot-directory itself, and not
+                // again for everything inside it.
+                if (top) try err.print("deed nsite deploy: skipping the hidden {s} {s} (--include-hidden publishes it)\n", .{ if (entry.kind == .directory) "directory" else "file", entry.path });
+                continue;
+            }
+        }
         switch (entry.kind) {
             .directory => continue,
             .sym_link => {
@@ -643,6 +658,16 @@ fn scan(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, dir: []const u
     return files.items;
 }
 
+/// Null when no segment of `rel` starts with a dot; otherwise whether the last
+/// segment is the one that does.
+fn hiddenAt(rel: []const u8) ?bool {
+    var it = std.mem.splitAny(u8, rel, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len > 0 and seg[0] == '.') return it.peek() == null;
+    }
+    return null;
+}
+
 fn secretKey(gpa: std.mem.Allocator, flag: ?[]const u8, err: *Io.Writer) !?nostr.keys.SecretKey {
     const raw = flag orelse getEnv("NOSTR_SECRET_KEY") orelse {
         try err.writeAll("deed nsite deploy: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n");
@@ -669,7 +694,7 @@ fn deploy(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts, 
         return cli.exit_usage;
     };
 
-    const files = (try scan(gpa, io, arena, opts.positionals.items[0], err)) orelse return cli.exit_fail;
+    const files = (try scan(gpa, io, arena, opts.positionals.items[0], opts.include_hidden, err)) orelse return cli.exit_fail;
     if (files.len == 0) {
         try err.writeAll("deed nsite deploy: the directory holds no files\n");
         return cli.exit_fail;
@@ -1433,4 +1458,53 @@ test "the command line is checked before anything is sent" {
     var f = try runArgs(gpa, io, &.{ "list", "not-a-key" });
     defer f.deinit();
     try testing.expectEqual(cli.exit_usage, f.code);
+}
+
+test "deploy leaves dot-files and dot-directories out unless asked" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    try tmp.tmp.dir.createDirPath(io, "site/.git");
+    try tmp.tmp.dir.createDirPath(io, "site/css");
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/index.html", .data = "<h1>hello</h1>" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/.env", .data = "SECRET=1" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/.DS_Store", .data = "junk" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/.git/config", .data = "[core]" });
+    try tmp.tmp.dir.writeFile(io, .{ .sub_path = "site/css/.hidden.css", .data = "x" });
+    const src = try tmp.path(a, "site");
+
+    var relay: SiteRelay = .{};
+    try relay.start(io, 4);
+    defer relay.stop(io);
+    var blobs: BlobServer = undefined;
+    try blobs.start(io, 16);
+    defer blobs.stop(io);
+    var rbuf: [64]u8 = undefined;
+    var bbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const server_url = blobs.base(&bbuf);
+
+    var plain = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, relay_url });
+    defer plain.deinit();
+    try testing.expectEqual(cli.exit_ok, plain.code);
+    try testing.expectEqual(@as(usize, 1), blobs.puts);
+    try testing.expect(std.mem.indexOf(u8, plain.err.written(), "skipping the hidden directory .git") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.err.written(), "skipping the hidden file .env") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.err.written(), "css/.hidden.css") != null);
+    try testing.expect(std.mem.indexOf(u8, plain.out.written(), ".env") == null);
+
+    var all = try runArgs(gpa, io, &.{ "deploy", src, "-s", server_url, "--sec", test_sec, "--include-hidden", relay_url });
+    defer all.deinit();
+    try testing.expectEqual(cli.exit_ok, all.code);
+    try testing.expectEqual(@as(usize, 5), blobs.puts);
+    try testing.expect(std.mem.indexOf(u8, all.out.written(), "/.git/config") != null);
 }
