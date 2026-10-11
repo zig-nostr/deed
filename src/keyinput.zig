@@ -48,22 +48,24 @@ const TerminalPassword = struct {
 /// A secret key as `nsec1…`, as 64 hex characters, or as an `ncryptsec1…`
 /// (NIP-49), whose password is asked for on the terminal.
 ///
-/// Says why on stderr when a password is the problem, because the callers
-/// only know the key could not be read.
+/// Says nothing: the caller says what went wrong, in one line, and the error
+/// tells a wrong password and a missing one from a bad key. A verb that
+/// reports on its own writer uses `secretKeyForVerb`, which says it for it.
 pub fn secretKey(gpa: std.mem.Allocator, s: []const u8) !keys.SecretKey {
-    return secretKeyWith(gpa, s, TerminalPassword{}) catch |e| {
-        switch (e) {
-            Error.WrongPassword => std.debug.print("deed: wrong password for that ncryptsec\n", .{}),
-            Error.NoPassword => std.debug.print("deed: an ncryptsec needs a password: run on a terminal, or set {s}\n", .{password.password_env}),
-            else => {},
-        }
-        return e;
-    };
+    return secretKeyWith(gpa, s, TerminalPassword{});
 }
 
 /// `secretKeyWith` for a verb that reports on `err`: one line saying what is
 /// wrong with the key, never two. Fails with `error.BadKey` after saying it.
+///
+/// A `bunker://` URI is refused here with its own line: a verb that comes
+/// this way needs the key itself, and the verbs a remote signer can serve read
+/// their key through `signing.open`, which takes one.
 pub fn secretKeyOrSay(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, source: anytype, err: *std.Io.Writer) !keys.SecretKey {
+    if (isBunkerUri(s)) {
+        try err.print("deed {s}: a remote signer (bunker://) cannot be used here, this needs the secret key itself\n", .{verb});
+        return error.BadKey;
+    }
     return secretKeyWith(gpa, s, source) catch |e| {
         switch (e) {
             Error.WrongPassword => try err.print("deed {s}: wrong password for that ncryptsec\n", .{verb}),
@@ -72,6 +74,11 @@ pub fn secretKeyOrSay(gpa: std.mem.Allocator, verb: []const u8, s: []const u8, s
         }
         return error.BadKey;
     };
+}
+
+/// Whether `s` is a NIP-46 `bunker://` URI rather than a key.
+pub fn isBunkerUri(s: []const u8) bool {
+    return hasPrefix(std.mem.trim(u8, s, " \t\r\n"), "bunker://");
 }
 
 /// `secretKeyOrSay`, asking for an ncryptsec's password where `secretKey` does.
@@ -195,6 +202,15 @@ test "a wrong password is one line, and a bad key is one line" {
     var w2: std.Io.Writer = .fixed(&buf);
     try std.testing.expectError(error.BadKey, secretKeyOrSay(gpa, "post", "nope", NoTerminal{}, &w2));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w2.buffered(), "\n"));
+}
+
+test "a bunker URI is refused, in one line, where the key itself is needed" {
+    const gpa = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.BadKey, secretKeyOrSay(gpa, "key encrypt", "bunker://" ++ "ab" ** 32 ++ "?relay=wss://r.example", NoTerminal{}, &w));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "remote signer") != null);
 }
 
 test "nsec and hex never ask for a password" {

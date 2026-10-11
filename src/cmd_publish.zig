@@ -14,6 +14,7 @@ const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const dial = @import("dial.zig");
 const auth = @import("auth.zig");
+const signing = @import("signing.zig");
 const relayset = @import("relayset.zig");
 
 const hex = nostr.hex;
@@ -131,11 +132,12 @@ pub fn run(
         try err.print("deed publish: name at most {d} relays\n", .{dial.max_relays});
         return cli.exit_usage;
     }
-    const auth_opts = auth.resolve(gpa, auth_flags, "publish", err) catch |e| switch (e) {
+    const auth_opts = auth.resolve(gpa, io, auth_flags, "publish", err) catch |e| switch (e) {
         error.Usage => return cli.exit_usage,
         error.BadKey => return cli.exit_fail,
         else => |other| return other,
     };
+    defer if (auth_opts) |o| o.deinit(gpa);
 
     const stdin_buf = try gpa.alloc(u8, max_record_bytes);
     defer gpa.free(stdin_buf);
@@ -824,7 +826,14 @@ const Set = struct {
         waiting: *[dial.max_relays]bool,
         err: *std.Io.Writer,
     ) !?[32]u8 {
-        var ans = try auth.answer(self.gpa, self.io, self.auth.?, self.urls[i], self.challenge[i].?);
+        var ans = auth.answer(self.gpa, self.io, self.auth.?, self.urls[i], self.challenge[i].?) catch |e| {
+            // A remote signer that refused or went quiet: this relay goes
+            // without an answer, as one whose send failed does.
+            const why = signing.describe(e) orelse return e;
+            waiting[i] = false;
+            try err.print("deed {s}: {s}: cannot authenticate: {s}\n", .{ self.verb, self.urls[i], why });
+            return null;
+        };
         defer ans.deinit();
         waiting[i] = false;
         try self.sendSome(&.{i}, ans.event, .auth, id, deadline, timeout_ms, .closed, waiting, null, err);

@@ -21,6 +21,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 const dial = @import("dial.zig");
 const auth = @import("auth.zig");
+const signing = @import("signing.zig");
 
 const filter = nostr.filter;
 const message = nostr.message;
@@ -553,7 +554,13 @@ pub fn query(
             .lost => |why| {
                 // A relay that drops mid-answer is a relay this run does
                 // without. The events it already sent are still good.
-                if (why) |e| try err.print("deed: a relay stopped answering: {s}\n", .{@errorName(e)});
+                if (why) |e| {
+                    if (signing.describe(e)) |reason| {
+                        try err.print("deed: {s}: cannot authenticate: {s}\n", .{ url, reason });
+                    } else {
+                        try err.print("deed: a relay stopped answering: {s}\n", .{@errorName(e)});
+                    }
+                }
                 finish(&sh, &live, &live_count, i);
             },
             .deadline => unreachable,

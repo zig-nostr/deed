@@ -18,6 +18,7 @@ const cli = @import("cli.zig");
 const http = @import("http.zig");
 const jsonout = @import("jsonout.zig");
 const keyinput = @import("keyinput.zig");
+const signing = @import("signing.zig");
 
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -54,7 +55,8 @@ pub const usage =
     \\Options:
     \\  -s, --server <url>   the server; repeat it to use several. upload sends to
     \\                       all of them, download tries them in order
-    \\      --sec <key>      the key that signs, as nsec1... or 64 hex characters.
+    \\      --sec <key>      the key that signs, as nsec1..., ncryptsec1... or 64
+    \\                       hex characters, or a remote signer as bunker://...
     \\                       Falls back to $NOSTR_SECRET_KEY. upload, delete and
     \\                       mirror need one; list, download and check sign only
     \\                       when one is given
@@ -220,8 +222,8 @@ const Ctx = struct {
     io: Io,
     out: *Io.Writer,
     err: *Io.Writer,
-    signer: nostr.keys.Signer,
-    keypair: ?nostr.keys.KeyPair,
+    /// Who signs the tokens, or null when no key was given.
+    signer: ?*signing.Signer,
     timeout_ms: ?u64,
 
     fn now(self: *const Ctx) i64 {
@@ -241,18 +243,19 @@ const Ctx = struct {
         hashes: []const [32]u8,
         srv: Server,
     ) !?[]const u8 {
-        const kp = self.keypair orelse return null;
+        const signer = self.signer orelse return null;
         const created = self.now();
         const one = [1][]const u8{srv.host orelse ""};
-        const header = try blossom.buildAuthHeader(self.gpa, self.signer, kp, created, .{
+        // Built with the signer's helper key, then signed as the user: the
+        // same event for a key held here, re-signed by a remote signer.
+        const built = try blossom.authEvent(arena, signer.ctx, signer.helper, created, .{
             .action = action,
             .content = content,
             .expiration = created + auth_lifetime_s,
             .hashes = hashes,
             .servers = if (srv.host != null) one[0..] else &.{},
         }, null);
-        defer self.gpa.free(header);
-        return try arena.dupe(u8, header);
+        return try blossom.authHeader(arena, try signer.finish(arena, built));
     }
 };
 
@@ -462,18 +465,10 @@ pub fn run(
         return cli.exit_usage;
     }
 
-    var signer = try nostr.keys.Signer.initRandomized(io);
-    defer signer.deinit();
-    var keypair: ?nostr.keys.KeyPair = null;
+    var signer: ?signing.Signer = null;
+    defer if (signer) |*s| s.deinit();
     if (raw_key) |raw| {
-        const sk = keyinput.secretKey(gpa, raw) catch {
-            try err.writeAll("deed blossom: not a secret key (want nsec1... or 64 hex characters)\n");
-            return cli.exit_usage;
-        };
-        keypair = signer.keyPairFromSecretKey(sk) catch {
-            try err.writeAll("deed blossom: not a secret key (want nsec1... or 64 hex characters)\n");
-            return cli.exit_usage;
-        };
+        signer = (try signing.open(gpa, io, "blossom", raw, err)) orelse return cli.exit_fail;
     }
 
     const ctx: Ctx = .{
@@ -481,11 +476,10 @@ pub fn run(
         .io = io,
         .out = out,
         .err = err,
-        .signer = signer,
-        .keypair = keypair,
+        .signer = if (signer) |*s| s else null,
         .timeout_ms = opts.timeout_ms,
     };
-    return switch (cmd) {
+    const ran = switch (cmd) {
         .list => cmdList(&ctx, arena, opts, servers.items),
         .upload => cmdUpload(&ctx, arena, opts, servers.items),
         .download => cmdDownload(&ctx, arena, opts, servers.items),
@@ -493,6 +487,7 @@ pub fn run(
         .check => cmdCheck(&ctx, arena, opts, servers.items),
         .mirror => cmdMirror(&ctx, arena, opts, servers.items),
     };
+    return ran catch |e| signing.report("blossom", e, err);
 }
 
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
@@ -1771,4 +1766,31 @@ test "mirror names the blob in the token and sends the URL" {
     try testing.expectEqual(@as(usize, 1), mock.mirrors);
     try testing.expect(std.mem.find(u8, mock.mirror_body[0..mock.mirror_body_len], source) != null);
     try testing.expect(std.mem.find(u8, r.out, &hex) != null);
+}
+
+test "a delete token signed by a remote signer is by the user and checks out" {
+    const signertest = @import("signertest.zig");
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+
+    var rig: signertest.Rig = undefined;
+    try rig.init(gpa, io, .serve);
+    defer rig.deinit();
+
+    var mock: Mock = undefined;
+    try mock.start(io, 1);
+    defer mock.stop(io);
+    // The token must come from the user the remote signer holds.
+    mock.pubkey_hex = std.fmt.bytesToHex(rig.user.public_key, .lower);
+    const hex = "b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553";
+    var bbuf: [64]u8 = undefined;
+
+    const r = try runWith(gpa, &.{ "delete", hex, "-s", mock.base(&bbuf), "--sec", rig.uri() });
+    defer r.deinit();
+    try testing.expectEqualStrings("", r.err);
+    try testing.expectEqual(cli.exit_ok, r.code);
+    try testing.expectEqual(@as(usize, 1), mock.deletes);
+    try testing.expectEqual(@as(usize, 0), mock.problems);
 }

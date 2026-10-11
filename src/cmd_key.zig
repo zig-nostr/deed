@@ -160,9 +160,9 @@ fn public(
         return cli.exit_usage;
     };
 
-    const sk = keyinput.secretKey(gpa, raw) catch {
-        try err.writeAll("deed key public: not a secret key (want nsec1… or 64 hex characters)\n");
-        return cli.exit_fail;
+    const sk = keyinput.secretKeyForVerb(gpa, "key public", raw, err) catch |e| switch (e) {
+        error.BadKey => return cli.exit_fail,
+        else => return e,
     };
 
     var signer = keys.Signer.init();
@@ -258,9 +258,9 @@ fn encrypt(
         return cli.exit_usage;
     };
 
-    var sk = keyinput.secretKey(gpa, raw) catch {
-        try err.writeAll("deed key encrypt: not a secret key (want nsec1…, ncryptsec1… or 64 hex characters)\n");
-        return cli.exit_fail;
+    var sk = keyinput.secretKeyForVerb(gpa, "key encrypt", raw, err) catch |e| switch (e) {
+        error.BadKey => return cli.exit_fail,
+        else => return e,
     };
     defer wipeKey(&sk);
 

@@ -109,7 +109,9 @@ The store comes from the library, along with its indexes, replaceable event rule
 
 `auth.zig` answers NIP-42. A relay that keeps some events behind authentication sends a challenge and refuses what needs it with a reason starting `auth-required:`. With `--auth` on `req`, `fetch` and `publish`, the reader task answers with a kind 22242 event naming the relay and the challenge, then the request is tried once more. `--force-pre-auth` waits for the challenge before asking anything. Without `--auth` nothing is signed that was not asked for, so a key passed to a verb that only reads is not used on its own.
 
-Secret keys all come through `keyinput.zig`, so a form added there (an ncryptsec was the last) is taught to every verb at once. The password for an ncryptsec comes from `password.zig`: the terminal with echo off, restored on every way out including SIGINT, or `NOSTR_PASSWORD`. It is never read from an argument, and it lives in a caller-owned fixed buffer that is wiped after use. <!-- TODO remote signer -->
+Secret keys all come through `keyinput.zig`, so a form added there (an ncryptsec was the last) is taught to every verb at once. The password for an ncryptsec comes from `password.zig`: the terminal with echo off, restored on every way out including SIGINT, or `NOSTR_PASSWORD`. It is never read from an argument, and it lives in a caller-owned fixed buffer that is wiped after use.
+
+Who signs is `signing.zig`. A `Signer` holds either a key read through `keyinput.zig` or a NIP-46 session opened from a `bunker://` URI, and the verbs sign, encrypt and decrypt through it without knowing which. A session dials the URI's relays, runs one reader per relay, connects with the URI's secret and asks for the user's pubkey; every request after that has its own deadline and is a cancelation point. Library helpers that sign with a key pair (NIP-98, Blossom tokens) build the event with a throwaway key, and `finish` has the remote signer sign the same fields as the user.
 
 ## HTTP
 
@@ -141,7 +143,9 @@ Every event's id and signature is checked before it is stored. The relay speaks 
 
 ## Remote signer
 
-`cmd_bunker.zig` holds a key and answers NIP-46 requests over the relays given, through the same dial and reader machinery. It serves only authorized clients: a pubkey given with `--authorized-keys`, or a client that presents a secret, which is spent on first use and replaced. With `--persist` the state is written to a file that deed refuses to use if anyone but the owner can read it. `qr.zig` is a small encoder for exactly this: byte mode, error correction level M, versions 1 to 40, all eight masks tried, and a terminal rendering. <!-- TODO remote signer -->
+`cmd_bunker.zig` holds a key and answers NIP-46 requests over the relays given, through the same dial and reader machinery. It serves only authorized clients: a pubkey given with `--authorized-keys`, or a client that presents a secret, which is spent on first use and replaced. With `--persist` the state is written to a file that deed refuses to use if anyone but the owner can read it. `qr.zig` is a small encoder for exactly this: byte mode, error correction level M, versions 1 to 40, all eight masks tried, and a terminal rendering.
+
+The other side of NIP-46 is `signing.zig`, described under keys above. Its tests run the library's `signer.serve` on an in-memory relay (`signertest.zig`) behind the real verbs.
 
 ## Adding a verb
 

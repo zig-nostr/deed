@@ -12,6 +12,7 @@ const cli = @import("cli.zig");
 const http = @import("http.zig");
 const keyinput = @import("keyinput.zig");
 const curl = @import("cmd_curl.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const nip86 = nostr.nip86;
@@ -47,7 +48,8 @@ pub const usage =
     \\
     \\Options:
     \\  --sec <key>      the secret key to sign with (nsec1..., hex or
-    \\                   ncryptsec1...). Falls back to $NOSTR_SECRET_KEY.
+    \\                   ncryptsec1...), or a remote signer as bunker://...
+    \\                   Falls back to $NOSTR_SECRET_KEY.
     \\  --pretty         indent the JSON
     \\  --timeout <s>    give up after this many seconds (default 15)
     \\  --allow-http     permit plain http to a host that is not local
@@ -256,17 +258,19 @@ pub fn run(
         },
     };
 
-    const sk = (try curl.readSecret(gpa, "admin", settings.sec, err)) orelse return cli.exit_usage;
-    var signer = try keys.Signer.initRandomized(io);
+    var signer = (signing.fromFlag(gpa, io, "admin", settings.sec, err) catch |e| switch (e) {
+        error.BadKey => return cli.exit_fail,
+        else => return e,
+    }) orelse return cli.exit_usage;
     defer signer.deinit();
-    const keypair = try signer.keyPairFromSecretKey(sk);
 
     const url = try httpUrl(arena, positional.items[0]);
 
     for (calls) |call| {
         const body = try nip86.encodeRequest(arena, call);
         const now = std.Io.Timestamp.now(io, .real).toSeconds();
-        const auth = try nip86.authHeader(arena, signer, keypair, now, url, body, null);
+        // NIP-86 signs the call as NIP-98 does a POST with this body.
+        const auth = signer.httpAuthHeader(arena, now, url, "POST", body) catch |e| return signing.report("admin", e, err);
         const headers = [_]http.Header{.{ .name = "Authorization", .value = auth }};
 
         var response = http.fetch(gpa, io, url, .{
@@ -458,4 +462,40 @@ test "bad arguments are refused before anything is sent" {
         try testing.expectEqual(cli.exit_usage, try runAdmin(io, c, &out, &err));
         try testing.expect(err.written().len > 0);
     }
+}
+
+test "a call signed by a remote signer carries a header by the user that verifies" {
+    const io = testing.io;
+    const signertest = @import("signertest.zig");
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("the admin verb leaked");
+    const gpa = da.allocator();
+
+    var rig: signertest.Rig = undefined;
+    try rig.init(gpa, io, .serve);
+    defer rig.deinit();
+
+    var srv: curl.CaptureServer = undefined;
+    try srv.start(io, .ok, "{\"result\":[\"supportedmethods\"]}", 1);
+    defer srv.stop(io);
+    var ub: [64]u8 = undefined;
+    const http_url = try srv.url(&ub, "/");
+
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    const code = try run(gpa, io, &.{ "--sec", rig.uri(), http_url, "supportedmethods" }, &out.writer, &err.writer);
+    try testing.expectEqualStrings("", err.written());
+    try testing.expectEqual(cli.exit_ok, code);
+
+    var ctx = keys.Signer.init();
+    defer ctx.deinit();
+    const pk = try nostr.nip98.verifyHeader(testing.allocator, ctx, srv.sentAuth(), .{
+        .url = http_url,
+        .method = "POST",
+        .body = srv.sentBody(),
+        .now = Io.Timestamp.now(io, .real).toSeconds(),
+    });
+    try testing.expectEqualSlices(u8, &rig.user.public_key, &pk);
 }

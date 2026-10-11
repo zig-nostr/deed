@@ -10,6 +10,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const auth = @import("auth.zig");
+const signing = @import("signing.zig");
 const cli = @import("cli.zig");
 const cmd_req = @import("cmd_req.zig");
 const filterflags = @import("filterflags.zig");
@@ -191,11 +192,14 @@ pub fn run(
         return cli.exit_usage;
     }
 
-    const auth_opts = auth.resolve(a, auth_flags, "spell", err) catch |e| switch (e) {
+    // The allocator, not the arena: a remote signer's readers allocate from
+    // their own threads.
+    const auth_opts = auth.resolve(gpa, io, auth_flags, "spell", err) catch |e| switch (e) {
         error.Usage => return cli.exit_usage,
         error.BadKey => return cli.exit_fail,
         else => |other| return other,
     };
+    defer if (auth_opts) |o| o.deinit(gpa);
 
     // The spell, checked by the same code every run uses.
     var spell_ev = (try fetchOne(a, gpa, io, fetch_relays.items, fetch_filter, timeout_ms, auth_opts, err)) orelse {
@@ -217,14 +221,10 @@ pub fn run(
             return cli.exit_fail;
         };
     } else if (sec_arg) |sk_raw| {
-        const sk = keyinput.secretKeyForVerb(a, "spell", sk_raw, err) catch return cli.exit_fail;
-        var signer = nostr.keys.Signer.init();
+        // A key or a remote signer: either one says who the user is.
+        var signer = (try signing.open(gpa, io, "spell", sk_raw, err)) orelse return cli.exit_fail;
         defer signer.deinit();
-        const kp = signer.keyPairFromSecretKey(sk) catch {
-            try err.writeAll("deed spell: not a secret key (want nsec1... or 64 hex characters)\n");
-            return cli.exit_fail;
-        };
-        me = kp.public_key;
+        me = signer.publicKey();
     }
 
     const now = std.Io.Timestamp.now(io, .real).toSeconds();

@@ -14,6 +14,7 @@ const dial = @import("dial.zig");
 const keyinput = @import("keyinput.zig");
 const post = @import("cmd_post.zig");
 const outbox = @import("outbox.zig");
+const signing = @import("signing.zig");
 const storepath = @import("storepath.zig");
 
 const event = nostr.event;
@@ -51,7 +52,8 @@ pub const usage =
     \\if a relay accepted it.
     \\
     \\Options for set:
-    \\      --sec <key>        secret key, as nsec1... or 64 hex characters.
+    \\      --sec <key>        secret key, as nsec1..., ncryptsec1... or 64 hex
+    \\                         characters, or a remote signer as bunker://...
     \\                         Falls back to $NOSTR_SECRET_KEY.
     \\      --name <text>      --about <text>   --picture <url>   --banner <url>
     \\      --nip05 <name>     --lud16 <addr>   --website <url>
@@ -423,10 +425,11 @@ fn runSet(
         try err.writeAll("deed profile set: nothing to change: give at least one field or --metadata\n");
         return cli.exit_usage;
     }
-    const sk = (post.readSecret(gpa, "profile set", sec, err) catch |e| switch (e) {
+    var signer = (signing.fromFlag(gpa, io, "profile set", sec, err) catch |e| switch (e) {
         error.BadKey => return cli.exit_fail,
         else => return e,
     }) orelse return cli.exit_usage;
+    defer signer.deinit();
 
     // Checked here, before any relay is asked, so a bad --metadata costs nothing.
     {
@@ -450,10 +453,6 @@ fn runSet(
         };
     }
 
-    var signer = try nostr.keys.Signer.initRandomized(io);
-    defer signer.deinit();
-    const keypair = try signer.keyPairFromSecretKey(sk);
-
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -463,7 +462,7 @@ fn runSet(
     var followed: ?outbox.Urls = null;
     defer if (followed) |*fu| fu.deinit();
     if (urls.items.len == 0 and !(dry_run and force_new)) {
-        followed = (try outbox.followWriteRelays(gpa, io, "profile set", keypair.public_key, bootstrap.items, null, timeout_ms, err)) orelse return cli.exit_usage;
+        followed = (try outbox.followWriteRelays(gpa, io, "profile set", signer.publicKey(), bootstrap.items, null, timeout_ms, err)) orelse return cli.exit_usage;
         const take = @min(followed.?.urls.len, dial.max_relays);
         try urls.appendSlice(gpa, followed.?.urls[0..take]);
     }
@@ -472,7 +471,7 @@ fn runSet(
     var current: ?event.Parsed = null;
     defer if (current) |*p| p.deinit();
     if (urls.items.len > 0) {
-        var authors = [1][32]u8{keypair.public_key};
+        var authors = [1][32]u8{signer.publicKey()};
         const kinds = [1]u16{0};
         const found = try post.fetchNewest(gpa, io, urls.items, .{ .authors = &authors, .kinds = &kinds, .limit = 1 }, timeout_ms, null, err);
         current = found.parsed;
@@ -511,18 +510,19 @@ fn runSet(
     // old one when both land in the same second.
     var created_at = std.Io.Timestamp.now(io, .real).toSeconds();
     if (current) |c| created_at = @max(created_at, c.value.created_at + 1);
-    const ev = try event.create(arena, signer, keypair, created_at, 0, &.{}, merged, null);
-    const wire = try event.toJson(arena, ev);
-
-    if (dry_run) {
-        try out.print("{s}\n", .{wire});
-        return cli.exit_ok;
-    }
+    // Confirmed before it is signed, as `post` does.
     if (tty) |*t| {
         if (!try t.confirm(merged, urls.items.len)) {
             try err.writeAll("deed profile set: not published, not confirmed\n");
             return cli.exit_fail;
         }
+    }
+    const ev = signer.sign(arena, created_at, 0, &.{}, merged) catch |e| return signing.report("profile set", e, err);
+    const wire = try event.toJson(arena, ev);
+
+    if (dry_run) {
+        try out.print("{s}\n", .{wire});
+        return cli.exit_ok;
     }
     const accepted = try post.publishEvent(gpa, io, urls.items, ev, timeout_ms, "profile set", err);
     if (accepted == 0) {

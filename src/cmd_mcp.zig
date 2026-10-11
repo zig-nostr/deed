@@ -296,10 +296,14 @@ pub fn run(
             try err.writeAll("deed mcp: publishing signs with a local key; a bunker URL is not supported here\n");
             return cli.exit_usage;
         };
-        cfg.secret = (cmd_post.readSecret(gpa, "mcp", sec_flag, err) catch |e| switch (e) {
+        const raw = sec_flag orelse envSecret() orelse {
+            try err.writeAll("deed mcp: needs a secret key: pass --sec or set $NOSTR_SECRET_KEY\n");
+            return cli.exit_usage;
+        };
+        cfg.secret = keyinput.secretKeyForVerb(gpa, "mcp", raw, err) catch |e| switch (e) {
             error.BadKey => return cli.exit_fail,
             else => return e,
-        }) orelse return cli.exit_usage;
+        };
     }
     defer if (cfg.secret) |*k| std.crypto.secureZero(u8, k);
 
@@ -308,6 +312,12 @@ pub fn run(
     // Streaming, for the reason `main` gives for its writers.
     var stdin = Io.File.stdin().readerStreaming(io, buf);
     return serve(gpa, io, cfg, &stdin.interface, out, err);
+}
+
+fn envSecret() ?[]const u8 {
+    const value = std.c.getenv("NOSTR_SECRET_KEY") orelse return null;
+    const span = std.mem.span(value);
+    return if (span.len == 0) null else span;
 }
 
 const Server = struct {
