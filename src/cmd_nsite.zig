@@ -12,6 +12,7 @@
 //! be only so large, and a whole site only so large.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const blossom = @import("cmd_blossom.zig");
@@ -860,6 +861,10 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
         try err.writeAll("deed nsite download: the manifest names no files\n");
         return cli.exit_fail;
     }
+    if (try diskConflict(arena, m.paths, builtin.os.tag == .windows)) |why| {
+        try err.print("deed nsite download: {s}; nothing was written\n", .{why});
+        return cli.exit_fail;
+    }
 
     var servers: std.ArrayList([]const u8) = .empty;
     for (m.servers) |raw| {
@@ -890,6 +895,56 @@ fn download(gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, opts: Opts
         }
     }
     return code;
+}
+
+/// Device names Windows reserves, with or without an extension.
+fn windowsReserved(seg: []const u8) bool {
+    const stem = seg[0 .. std.mem.indexOfScalar(u8, seg, '.') orelse seg.len];
+    const names = [_][]const u8{ "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" };
+    for (names) |n| if (std.ascii.eqlIgnoreCase(stem, n)) return true;
+    if (stem.len == 4 and stem[3] >= '1' and stem[3] <= '9') {
+        if (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) return true;
+    }
+    return false;
+}
+
+/// Why `paths` cannot be written to a disk as they are named, or null. Two
+/// paths that differ only in case would overwrite each other on a disk that
+/// folds case, and a file that is also a directory cannot be both. With
+/// `windows`, a segment Windows cannot create is a reason too.
+fn diskConflict(a: std.mem.Allocator, paths: []const PathHash, windows: bool) !?[]const u8 {
+    var seen: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer seen.deinit(a);
+    var dirs: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer dirs.deinit(a);
+    for (paths) |p| {
+        if (windows) {
+            var it = std.mem.splitScalar(u8, p.path[1..], '/');
+            while (it.next()) |seg| {
+                const last = seg[seg.len - 1];
+                if (last == '.' or last == ' ') return try std.fmt.allocPrint(a, "{s} has a name ending in a dot or a space, which Windows cannot create", .{p.path});
+                if (windowsReserved(seg)) return try std.fmt.allocPrint(a, "{s} is named like a Windows device, which Windows cannot create", .{p.path});
+            }
+        }
+        const folded = try std.ascii.allocLowerString(a, p.path);
+        const gop = try seen.getOrPut(a, folded);
+        if (gop.found_existing) {
+            return try std.fmt.allocPrint(a, "{s} and {s} differ only in case and would overwrite each other on a disk that ignores case", .{ gop.value_ptr.*, p.path });
+        }
+        gop.value_ptr.* = p.path;
+        var i: usize = 1;
+        while (std.mem.indexOfScalarPos(u8, folded, i, '/')) |at| : (i = at + 1) {
+            const d = try dirs.getOrPut(a, folded[0..at]);
+            if (!d.found_existing) d.value_ptr.* = p.path;
+        }
+    }
+    for (paths) |p| {
+        const folded = try std.ascii.allocLowerString(a, p.path);
+        if (dirs.get(folded)) |inside| {
+            return try std.fmt.allocPrint(a, "{s} is both a file and a directory ({s} is inside it)", .{ p.path, inside });
+        }
+    }
+    return null;
 }
 
 /// Gets the blob named `sha` from the first server that has it, and writes it
@@ -1600,4 +1655,71 @@ test "deploy will not replace a manifest it cannot read, or publish blind" {
     try testing.expectEqual(cli.exit_fail, blind.code);
     try testing.expect(std.mem.indexOf(u8, blind.err.written(), "finished answering") != null);
     try testing.expectEqual(@as(usize, 0), mute.events.load(.monotonic));
+}
+
+test "paths that cannot all be written to a disk are caught up front" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const z = [_]u8{0} ** 32;
+    const fine = [_]PathHash{ .{ .path = "/a/b.css", .sha = z }, .{ .path = "/a.html", .sha = z } };
+    try testing.expect((try diskConflict(a, &fine, true)) == null);
+    const cased = [_]PathHash{ .{ .path = "/Index.html", .sha = z }, .{ .path = "/index.html", .sha = z } };
+    try testing.expect((try diskConflict(a, &cased, false)) != null);
+    const both = [_]PathHash{ .{ .path = "/a", .sha = z }, .{ .path = "/a/b", .sha = z } };
+    try testing.expect((try diskConflict(a, &both, false)) != null);
+    const dot = [_]PathHash{.{ .path = "/news./x.html", .sha = z }};
+    try testing.expect((try diskConflict(a, &dot, false)) == null);
+    try testing.expect((try diskConflict(a, &dot, true)) != null);
+    const space = [_]PathHash{.{ .path = "/x.html ", .sha = z }};
+    try testing.expect((try diskConflict(a, &space, true)) != null);
+    for ([_][]const u8{ "/con", "/NUL.txt", "/a/com1.js", "/Lpt9", "/aux.tar.gz" }) |name| {
+        const one = [_]PathHash{.{ .path = name, .sha = z }};
+        try testing.expect((try diskConflict(a, &one, true)) != null);
+        try testing.expect((try diskConflict(a, &one, false)) == null);
+    }
+    const ok = [_]PathHash{ .{ .path = "/console.js", .sha = z }, .{ .path = "/com10", .sha = z } };
+    try testing.expect((try diskConflict(a, &ok, true)) == null);
+}
+
+test "download refuses a manifest whose paths collide, and writes nothing" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("nsite leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x33} ** 32);
+    const sha = "186ea5fd14e88fd1ac49351759e7ab906fa94892002b60bf7f5a428f28ca1c99";
+    const other = "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
+    const tags = [_]event.Tag{
+        &.{ "path", "/Index.html", sha },
+        &.{ "path", "/index.html", other },
+        &.{ "server", "http://127.0.0.1:1" },
+    };
+    const ev = try event.create(a, signer, kp, 1_700_000_000, kind_root, &tags, "", null);
+    var relay: SiteRelay = .{};
+    try relay.start(io, 1);
+    defer relay.stop(io);
+    const json = try event.toJson(a, ev);
+    @memcpy(relay.stored[0..json.len], json);
+    relay.stored_len = json.len;
+    var rbuf: [64]u8 = undefined;
+    const relay_url = try relay.url(&rbuf);
+    const npub = try nostr.nip19.encodeNpub(a, kp.public_key);
+
+    var tmp: Tmp = undefined;
+    try tmp.init(io);
+    defer tmp.deinit();
+    const dest = try tmp.path(a, "got");
+    var r = try runArgs(gpa, io, &.{ "download", npub, dest, relay_url });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_fail, r.code);
+    try testing.expect(std.mem.indexOf(u8, r.err.written(), "differ only in case") != null);
+    try testing.expectError(error.FileNotFound, tmp.tmp.dir.access(io, "got", .{}));
 }
