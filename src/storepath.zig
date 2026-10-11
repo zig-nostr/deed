@@ -92,6 +92,10 @@ fn openWithHome(
             try err.print("deed {s}: cannot open the store at {s}: {s}\n", .{ verb, full, whyNotOpened(io, full) });
             return null;
         },
+        else => {
+            try err.print("deed {s}: cannot open the store at {s}: {s}\n", .{ verb, full, @errorName(e) });
+            return null;
+        },
     }
 }
 

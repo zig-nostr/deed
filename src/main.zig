@@ -6,48 +6,9 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const console = @import("console.zig");
-const cmd_decode = @import("cmd_decode.zig");
-const cmd_encode = @import("cmd_encode.zig");
-const cmd_crypt = @import("cmd_crypt.zig");
-const cmd_event = @import("cmd_event.zig");
-const cmd_key = @import("cmd_key.zig");
-const cmd_fetch = @import("cmd_fetch.zig");
-const cmd_publish = @import("cmd_publish.zig");
-const cmd_req = @import("cmd_req.zig");
-const cmd_verify = @import("cmd_verify.zig");
+const verbs = @import("verbs.zig");
 
-pub const version = "0.4.1";
-
-const usage =
-    \\deed: the nostr command line
-    \\
-    \\Usage:
-    \\  deed <command> [arguments]
-    \\
-    \\Commands:
-    \\  key       make a key, or derive the public one from it
-    \\  event     build an event and sign it
-    \\  decode    turn a NIP-19 code into the fields it carries
-    \\  encode    build a NIP-19 code out of its parts
-    \\  encrypt   encrypt a message to someone, with NIP-44
-    \\  decrypt   decrypt a NIP-44 payload from someone
-    \\  req       build a subscription, and run it
-    \\  fetch     get the events a code names
-    \\  publish   offer signed events to relays
-    \\  verify    check that events are correctly signed
-    \\
-    \\  help      this text, or `deed help <command>` (also -h, --help)
-    \\  version   the version (also -V, --version)
-    \\
-    \\Every verb that takes events reads them as newline-delimited JSON on
-    \\stdin when given no positional arguments, so verbs compose:
-    \\
-    \\  cat notes.jsonl | deed verify
-    \\
-    \\Exit codes: 0 success, 1 the command ran and failed, 2 the command was
-    \\not understood.
-    \\
-;
+pub const version = "0.5.0";
 
 pub fn main(init: std.process.Init) !void {
     // A general-purpose allocator, not `page_allocator`: that one maps pages
@@ -90,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr = std.Io.File.stderr().writerStreaming(io, &err_buf);
 
     const code = run(gpa, io, argv.items, &stdout.interface, &stderr.interface) catch |e| blk: {
-        // `deed decode … | head -1` closes the pipe on purpose, and every other
+        // `deed decode ... | head -1` closes the pipe on purpose, and every other
         // filter goes quiet when its reader leaves rather than complaining that
         // it did. deed cannot die of SIGPIPE the way they do, because the I/O
         // implementation underneath installs a handler of its own, so it
@@ -157,87 +118,7 @@ fn run(
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 ) !u8 {
-    if (args.len == 0) {
-        try out.writeAll(usage);
-        return cli.exit_usage;
-    }
-
-    const verb = args[0];
-    const rest = args[1..];
-
-    if (cli.isOneOf(verb, &.{ "help", "-h", "--help" })) {
-        if (rest.len != 0) return helpFor(rest[0], out, err);
-        try out.writeAll(usage);
-        return cli.exit_ok;
-    }
-    if (cli.isOneOf(verb, &.{ "version", "-V", "--version" })) {
-        try out.print("deed {s}\n", .{version});
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, verb, "key")) return cmd_key.run(gpa, io, rest, out, err);
-    if (std.mem.eql(u8, verb, "event")) return cmd_event.run(gpa, io, rest, out, err);
-    if (std.mem.eql(u8, verb, "decode")) return cmd_decode.run(gpa, io, rest, out, err);
-    if (std.mem.eql(u8, verb, "encode")) return cmd_encode.run(gpa, rest, out, err);
-    if (std.mem.eql(u8, verb, "encrypt")) return cmd_crypt.run(gpa, io, .encrypt, rest, out, err);
-    if (std.mem.eql(u8, verb, "decrypt")) return cmd_crypt.run(gpa, io, .decrypt, rest, out, err);
-    if (std.mem.eql(u8, verb, "req")) return cmd_req.run(gpa, io, rest, out, err);
-    if (std.mem.eql(u8, verb, "fetch")) return cmd_fetch.run(gpa, io, rest, out, err);
-    if (std.mem.eql(u8, verb, "publish")) return cmd_publish.run(gpa, io, rest, out, err);
-    if (std.mem.eql(u8, verb, "verify")) return cmd_verify.run(gpa, io, rest, out, err);
-
-    try err.print("deed: unknown command '{s}'\nRun `deed help` for the list.\n", .{verb});
-    return cli.exit_usage;
-}
-
-fn helpFor(topic: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
-    if (std.mem.eql(u8, topic, "key")) {
-        try out.writeAll(cmd_key.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "event")) {
-        try out.writeAll(cmd_event.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "decode")) {
-        try out.writeAll(cmd_decode.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "encode")) {
-        try out.writeAll(cmd_encode.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "encrypt")) {
-        try out.writeAll(cmd_crypt.encrypt_usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "decrypt")) {
-        try out.writeAll(cmd_crypt.decrypt_usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "fetch")) {
-        try out.writeAll(cmd_fetch.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "publish")) {
-        try out.writeAll(cmd_publish.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "req")) {
-        try out.writeAll(cmd_req.usage);
-        return cli.exit_ok;
-    }
-    if (std.mem.eql(u8, topic, "verify")) {
-        try out.writeAll(cmd_verify.usage);
-        return cli.exit_ok;
-    }
-    // Both are listed as commands one line above the sentence promising help
-    // for any of them, so asking about either has to answer rather than refuse.
-    if (cli.isOneOf(topic, &.{ "help", "version" })) {
-        try out.writeAll(usage);
-        return cli.exit_ok;
-    }
-    try err.print("deed: no help for '{s}'\n", .{topic});
-    return cli.exit_usage;
+    return verbs.dispatch(gpa, io, version, args, out, err);
 }
 
 const TestRun = struct { code: u8, out: []const u8, err: []const u8 };
@@ -254,12 +135,13 @@ fn testRun(args: []const []const u8, out_buf: []u8, err_buf: []u8) !TestRun {
     return .{ .code = code, .out = out.buffered(), .err = err.buffered() };
 }
 
-test "no arguments prints the usage and reports that nothing was understood" {
-    var ob: [8192]u8 = undefined;
-    var eb: [1024]u8 = undefined;
+test "no arguments prints the usage on stderr and reports that nothing was understood" {
+    var ob: [1024]u8 = undefined;
+    var eb: [8192]u8 = undefined;
     const r = try testRun(&.{}, &ob, &eb);
     try std.testing.expectEqual(cli.exit_usage, r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "deed: the nostr command line") != null);
+    try std.testing.expectEqualStrings("", r.out);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "deed: the nostr command line") != null);
 }
 
 test "every spelling of version agrees" {
@@ -275,13 +157,34 @@ test "every spelling of version agrees" {
 test "help is available for every command the usage lists" {
     // `help` and `version` are listed as commands one line above the sentence
     // promising help for any of them, and asking about either used to exit 2.
-    for ([_][]const u8{ "key", "event", "decode", "encode", "encrypt", "decrypt", "verify", "help", "version" }) |topic| {
-        var ob: [8192]u8 = undefined;
+    for (verbs.table) |v| try helpOk(v.name);
+    for ([_][]const u8{ "help", "version" }) |topic| try helpOk(topic);
+}
+
+fn helpOk(topic: []const u8) !void {
+    var ob: [8192]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    const r = try testRun(&.{ "help", topic }, &ob, &eb);
+    try std.testing.expectEqual(cli.exit_ok, r.code);
+    try std.testing.expect(r.out.len > 0);
+    try std.testing.expectEqualStrings("", r.err);
+}
+
+test "every verb in the table is reachable by name" {
+    for (verbs.table) |v| {
+        try std.testing.expect(verbs.find(v.name) != null);
+    }
+}
+
+test "a verb that is not built yet says so, exits 2 and stays out of the help" {
+    for (verbs.table) |v| {
+        if (v.ready) continue;
+        var ob: [1024]u8 = undefined;
         var eb: [1024]u8 = undefined;
-        const r = try testRun(&.{ "help", topic }, &ob, &eb);
-        try std.testing.expectEqual(cli.exit_ok, r.code);
-        try std.testing.expect(r.out.len > 0);
-        try std.testing.expectEqualStrings("", r.err);
+        const r = try testRun(&.{v.name}, &ob, &eb);
+        try std.testing.expectEqual(cli.exit_usage, r.code);
+        try std.testing.expectEqualStrings("", r.out);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, "is not built yet") != null);
     }
 }
 
@@ -339,9 +242,44 @@ test {
     _ = @import("cmd_fetch.zig");
     _ = @import("cmd_publish.zig");
     _ = @import("cmd_req.zig");
+    _ = @import("cmd_spell.zig");
     _ = @import("relayset.zig");
     _ = @import("storepath.zig");
     _ = @import("dial.zig");
+    _ = @import("proxy.zig");
     _ = @import("testrelay.zig");
     _ = @import("cmd_verify.zig");
+    _ = @import("verbs.zig");
+    _ = @import("filterflags.zig");
+    _ = @import("auth.zig");
+    _ = @import("signing.zig");
+    _ = @import("signertest.zig");
+    _ = @import("cmd_admin.zig");
+    _ = @import("cmd_blossom.zig");
+    _ = @import("cmd_bunker.zig");
+    _ = @import("cmd_count.zig");
+    _ = @import("cmd_curl.zig");
+    _ = @import("cmd_filter.zig");
+    _ = @import("cmd_git.zig");
+    _ = @import("cmd_gift.zig");
+    _ = @import("cmd_kind.zig");
+    _ = @import("cmd_post.zig");
+    _ = @import("cmd_profile.zig");
+    _ = @import("cmd_relay.zig");
+    _ = @import("cmd_relays.zig");
+    _ = @import("cmd_serve.zig");
+    _ = @import("cmd_store.zig");
+    _ = @import("cmd_mcp.zig");
+    _ = @import("cmd_outbox.zig");
+    _ = @import("cmd_nsite.zig");
+    _ = @import("cmd_nip.zig");
+    _ = @import("cmd_group.zig");
+    _ = @import("cmd_podcast.zig");
+    _ = @import("cmd_validate.zig");
+    _ = @import("cmd_dekey.zig");
+    _ = @import("cmd_sync.zig");
+    _ = @import("kinds.zig");
+    _ = @import("outbox.zig");
+    _ = @import("parallel.zig");
+    _ = @import("password.zig");
 }

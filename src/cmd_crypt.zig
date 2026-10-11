@@ -1,4 +1,4 @@
-//! `deed encrypt` and `deed decrypt`: NIP-44 payloads.
+//! `deed encrypt` and `deed decrypt`: NIP-44 payloads, or NIP-04 with `--nip04`.
 //!
 //! One file for both, because they are the same command run in opposite
 //! directions: the conversation key is symmetric, so the only thing that
@@ -8,9 +8,11 @@ const std = @import("std");
 const nostr = @import("nostr");
 const cli = @import("cli.zig");
 const keyinput = @import("keyinput.zig");
+const signing = @import("signing.zig");
 
 const keys = nostr.keys;
 const nip44 = nostr.nip44;
+const nip04 = nostr.nip04;
 
 /// NIP-44 caps a plaintext at 65535 bytes and a payload is base64 of a little
 /// more than that, so nothing legitimate comes close to this.
@@ -38,41 +40,53 @@ pub const Direction = enum {
 };
 
 pub const encrypt_usage =
-    \\deed encrypt: encrypt a message to someone, with NIP-44
+    \\deed encrypt: encrypt a message to someone, NIP-44, or NIP-04 with --nip04
     \\
     \\Usage:
-    \\  deed encrypt --to <pubkey> [--sec <key>] [<message>...]
+    \\  deed encrypt --to <pubkey> [--sec <key>] [--nip04] [<message>...]
     \\
     \\Options:
-    \\  --to <pubkey>   recipient, as npub1… or 64 hex characters
-    \\  --sec <key>     your secret key, as nsec1… or 64 hex characters.
-    \\                  Falls back to $NOSTR_SECRET_KEY.
+    \\  --to <pubkey>   recipient, as npub1... or 64 hex characters
+    \\  --sec <key>     your secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                  64 hex characters; $NOSTR_SECRET_KEY is read when --sec
+    \\                  is absent
+    \\  --nip04         use legacy NIP-04 (payload ends in ?iv=...) instead of
+    \\                  NIP-44. It has no authentication; use it only to talk
+    \\                  to older clients.
     \\
     \\Reads messages one per line on stdin when given no arguments, and prints
     \\one base64 payload per line. A message containing newlines has to be
     \\passed as an argument, since on stdin a newline ends the message.
     \\
-    \\  deed encrypt --to npub1… --sec nsec1… "meet at six"
+    \\  deed encrypt --to npub1... --sec nsec1... "meet at six"
     \\
+    \\Exits: 0 on success; 1 if the key or recipient is wrong or a message could
+    \\not be encrypted; 2 if the command line was not understood.
 ;
 
 pub const decrypt_usage =
-    \\deed decrypt: decrypt a NIP-44 payload from someone
+    \\deed decrypt: decrypt a message from someone, NIP-44, or NIP-04 with --nip04
     \\
     \\Usage:
-    \\  deed decrypt --from <pubkey> [--sec <key>] [<payload>...]
+    \\  deed decrypt --from <pubkey> [--sec <key>] [--nip04] [<payload>...]
     \\
     \\Options:
-    \\  --from <pubkey> sender, as npub1… or 64 hex characters
-    \\  --sec <key>     your secret key, as nsec1… or 64 hex characters.
-    \\                  Falls back to $NOSTR_SECRET_KEY.
+    \\  --from <pubkey> sender, as npub1... or 64 hex characters
+    \\  --sec <key>     your secret key: nsec1..., ncryptsec1..., bunker://... or
+    \\                  64 hex characters; $NOSTR_SECRET_KEY is read when --sec
+    \\                  is absent
+    \\  --nip04         the payload is legacy NIP-04. A wrong key or an altered
+    \\                  payload is only noticed when the padding turns out
+    \\                  malformed, so a successful decrypt proves nothing.
     \\
     \\Reads payloads one per line on stdin when given no arguments. Prints each
     \\plaintext on its own line, so a plaintext that itself contains newlines
     \\spans several lines of output.
     \\
-    \\  deed decrypt --from npub1… --sec nsec1… "AiJ…"
+    \\  deed decrypt --from npub1... --sec nsec1... "AiJ..."
     \\
+    \\Exits: 0 on success; 1 if the key or sender is wrong or a payload could not
+    \\be decrypted; 2 if the command line was not understood.
 ;
 
 pub fn run(
@@ -85,6 +99,7 @@ pub fn run(
 ) !u8 {
     var raw_sec: ?[]const u8 = null;
     var raw_peer: ?[]const u8 = null;
+    var legacy = false;
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(gpa);
 
@@ -106,6 +121,10 @@ pub fn run(
             i += 1;
             while (i < args.len) : (i += 1) try positionals.append(gpa, args[i]);
             break;
+        }
+        if (std.mem.eql(u8, a, "--nip04")) {
+            legacy = true;
+            continue;
         }
         if (std.mem.startsWith(u8, a, "-")) {
             const is_sec = std.mem.eql(u8, a, "--sec");
@@ -137,32 +156,16 @@ pub fn run(
         return cli.exit_usage;
     };
 
-    const sk = keyinput.secretKey(gpa, sec_text) catch {
-        try err.print(
-            "deed {s}: not a secret key (want nsec1… or 64 hex characters)\n",
-            .{dir.verb()},
-        );
-        return cli.exit_fail;
-    };
     const peer = keyinput.publicKey(gpa, peer_text) catch {
         try err.print(
-            "deed {s}: {s} is not a public key (want npub1… or 64 hex characters)\n",
+            "deed {s}: {s} is not a public key (want npub1... or 64 hex characters)\n",
             .{ dir.verb(), dir.peerFlag() },
         );
         return cli.exit_fail;
     };
 
-    var signer = try keys.Signer.initRandomized(io);
+    var signer = (try signing.open(gpa, io, dir.verb(), sec_text, err)) orelse return cli.exit_fail;
     defer signer.deinit();
-
-    // Derived once and reused: the conversation key depends only on the pair,
-    // so a thousand messages cost one ECDH rather than a thousand. The *nonce*
-    // is the part that must never be reused, and it is drawn fresh inside the
-    // loop below.
-    const conversation_key = nip44.conversationKey(signer, sk, peer) catch |e| {
-        try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
-        return cli.exit_fail;
-    };
 
     const stdin_buf = try gpa.alloc(u8, max_record_bytes);
     defer gpa.free(stdin_buf);
@@ -171,6 +174,42 @@ pub fn run(
     // records an earlier reader on the same descriptor already consumed.
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, stdin_buf);
     var input = cli.Input.init(positionals.items, &stdin_reader.interface);
+    return cryptAll(gpa, io, dir, legacy, &signer, peer, &input, out, err);
+}
+
+/// Encrypts or decrypts every record of `input` and prints one result per
+/// line. Returns the exit code.
+fn cryptAll(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: Direction,
+    legacy: bool,
+    signer: *signing.Signer,
+    peer: keys.PublicKey,
+    input: *cli.Input,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    // Derived once and reused: the conversation key depends only on the pair,
+    // so a thousand messages cost one ECDH rather than a thousand. The *nonce*
+    // is the part that must never be reused, and it is drawn fresh inside the
+    // loop below. A remote signer holds the key, so it does this itself, once
+    // per message.
+    var conversation_key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &conversation_key);
+    if (signer.keyPair()) |kp| {
+        if (legacy) {
+            conversation_key = nip04Key(signer.ctx, kp.secret_key, peer) catch |e| {
+                try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
+                return cli.exit_fail;
+            };
+        } else {
+            conversation_key = nip44.conversationKey(signer.ctx, kp.secret_key, peer) catch |e| {
+                try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
+                return cli.exit_fail;
+            };
+        }
+    }
 
     var failures: usize = 0;
     while (try input.next()) |record| {
@@ -185,23 +224,52 @@ pub fn run(
                 continue;
             },
         };
-        const result = switch (dir) {
+        const result = if (signer.isRemote()) remote: {
+            const method: signing.Method = switch (dir) {
+                .encrypt => if (legacy) .nip04_encrypt else .nip44_encrypt,
+                .decrypt => if (legacy) .nip04_decrypt else .nip44_decrypt,
+            };
+            // A signer that refused or went quiet will do the same for the
+            // next message, so the run ends here.
+            break :remote signer.crypt(gpa, io, method, peer, text) catch |e|
+                return signing.report(dir.verb(), e, err);
+        } else switch (dir) {
             .encrypt => blk: {
+                if (legacy) {
+                    var iv: [16]u8 = undefined;
+                    io.randomSecure(&iv) catch return error.RandomFailed;
+                    break :blk nip04.encryptWithIv(gpa, conversation_key, iv, text);
+                }
                 var nonce: [32]u8 = undefined;
                 io.randomSecure(&nonce) catch return error.RandomFailed;
                 break :blk nip44.encryptWithConversationKey(gpa, conversation_key, text, nonce);
             },
-            .decrypt => nip44.decryptWithConversationKey(gpa, conversation_key, text),
+            .decrypt => if (legacy)
+                nip04.decryptWithKey(gpa, conversation_key, text)
+            else
+                nip44.decryptWithConversationKey(gpa, conversation_key, text),
         } catch |e| {
             try err.print("deed {s}: {s}\n", .{ dir.verb(), reason(e) });
             failures += 1;
             continue;
         };
-        defer gpa.free(result);
+        defer {
+            std.crypto.secureZero(u8, result);
+            gpa.free(result);
+        }
         try out.print("{s}\n", .{result});
     }
 
     return if (failures == 0) cli.exit_ok else cli.exit_fail;
+}
+
+/// The NIP-04 key is the raw x coordinate of the shared point, symmetric like
+/// the NIP-44 conversation key, so it is derived once per run as well.
+fn nip04Key(signer: keys.Signer, sk: keys.SecretKey, peer: keys.PublicKey) ![32]u8 {
+    return signer.sharedSecretX(sk, peer) catch |e| switch (e) {
+        error.InvalidPublicKey => error.InvalidPublicKey,
+        else => error.InvalidSecretKey,
+    };
 }
 
 fn reason(e: anyerror) []const u8 {
@@ -210,8 +278,9 @@ fn reason(e: anyerror) []const u8 {
         // it is either the wrong counterparty or a payload somebody edited,
         // and that in neither case is there a plaintext to recover.
         error.InvalidMac => "authentication failed: wrong key, or the payload was altered",
-        error.InvalidPayload => "not a NIP-44 payload",
-        error.InvalidPadding => "payload padding is malformed",
+        error.InvalidPayload => "not a NIP-44 or NIP-04 payload (check --nip04)",
+        error.InvalidIv => "the NIP-04 iv is not 16 bytes",
+        error.InvalidPadding => "payload padding is malformed (with NIP-04 this is also what a wrong key looks like)",
         error.MessageEmpty => "nothing to encrypt",
         error.MessageTooLong => "too long: NIP-44 allows 65535 bytes",
         error.InvalidPublicKey => "that public key is not a point on the curve",
@@ -266,4 +335,60 @@ test "a third party cannot read it" {
         error.InvalidMac,
         nip44.decryptWithConversationKey(gpa, kc, payload),
     );
+}
+
+test "nip04 round trip through the shared key" {
+    const gpa = std.testing.allocator;
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const a = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    const b = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+
+    const ka = try nip04Key(signer, a.secret_key, b.public_key);
+    const kb = try nip04Key(signer, b.secret_key, a.public_key);
+    try std.testing.expectEqual(ka, kb);
+
+    const payload = try nip04.encryptWithIv(gpa, ka, [_]u8{0x07} ** 16, "meet at six");
+    defer gpa.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "?iv=") != null);
+    const plain = try nip04.decryptWithKey(gpa, kb, payload);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("meet at six", plain);
+}
+
+test "nip04 reads a payload made by nak" {
+    // Throwaway keys, made for this test with nak v0.21.2:
+    //   nak encrypt --nip04 --sec <a> --to <b-pub> "meet at six, bring tea"
+    const gpa = std.testing.allocator;
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const a_pub = try keyinput.publicKey(gpa, "6118e5c17cdac8bda27716e8bfea58a3e30693abd41c022b7a17e154a36863fb");
+    const b_sec = try keyinput.secretKey(gpa, "9224f7229d4d67810b092013af790316598058bc71ae99b19fb291b4ad82b381");
+    const key = try nip04Key(signer, b_sec, a_pub);
+    const plain = try nip04.decryptWithKey(
+        gpa,
+        key,
+        "fRKqmHQB1Z3qiWiu61VqB0tIcIRy24QiyXA0Puk/hVs=?iv=BHNqG8pTFSZUNkhBK/LtDQ==",
+    );
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("meet at six, bring tea", plain);
+}
+
+test "nip04 with the wrong key or a mangled payload does not yield the plaintext" {
+    const gpa = std.testing.allocator;
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const a = try signer.keyPairFromSecretKey([_]u8{0x11} ** 32);
+    const b = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+    const c = try signer.keyPairFromSecretKey([_]u8{0x44} ** 32);
+    const ka = try nip04Key(signer, a.secret_key, b.public_key);
+    const kc = try nip04Key(signer, c.secret_key, a.public_key);
+    const payload = try nip04.encryptWithIv(gpa, ka, [_]u8{0x07} ** 16, "private");
+    defer gpa.free(payload);
+
+    if (nip04.decryptWithKey(gpa, kc, payload)) |p| {
+        defer gpa.free(p);
+        try std.testing.expect(!std.mem.eql(u8, p, "private"));
+    } else |_| {}
+    try std.testing.expectError(error.InvalidPayload, nip04.decryptWithKey(gpa, ka, "no-iv-here"));
 }
