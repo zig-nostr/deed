@@ -40,8 +40,8 @@ pub const usage =
     \\podcasts found, each is listed under a header line.
     \\
     \\This only reads. It does not play audio, download it, or open a player:
-    \\nak's `podcast play` and `podcast info` have no equivalent here, so pass
-    \\the URL to whatever plays media on your machine.
+    \\There is no play or info subcommand: pass the URL to whatever plays media
+    \\on your machine.
     \\
     \\Options:
     \\  -r, --relay <url>    where to look (repeatable; a bare ws:// or wss://
