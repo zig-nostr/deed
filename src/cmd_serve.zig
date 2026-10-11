@@ -29,6 +29,7 @@ pub const usage =
     \\Usage:
     \\  deed serve [--hostname <host>] [--port <n>] [--store <path>]
     \\             [--events <file>] [--auth-required]
+    \\             [--allow-origin <origin>]...
     \\
     \\Options:
     \\      --hostname <host>  the address to listen on (default 127.0.0.1);
@@ -42,6 +43,13 @@ pub const usage =
     \\                         reported on stderr and skipped
     \\      --auth-required    send a NIP-42 challenge on connect and answer
     \\                         nothing until the client has authenticated
+    \\      --allow-origin <origin>  let a browser page from this origin (for
+    \\                         example http://localhost:3000) connect; give it
+    \\                         more than once, or * for any page. Without it a
+    \\                         websocket request that carries an Origin header
+    \\                         is refused, so a page you happen to have open
+    \\                         cannot reach the relay. Clients that are not
+    \\                         browsers send no Origin and are not affected.
     \\
     \\Once it is listening, the relay prints its URL on stdout, so a script can
     \\read it:
@@ -78,7 +86,11 @@ const Parsed = struct {
     store: ?[]const u8 = null,
     events: ?[]const u8 = null,
     auth_required: bool = false,
+    origins: [max_origins][]const u8 = undefined,
+    origin_count: usize = 0,
 };
+
+const max_origins = 16;
 
 /// Reads the arguments. Null after printing the help, an error after saying
 /// what was wrong.
@@ -95,7 +107,7 @@ fn parse(args: []const []const u8, out: *Io.Writer, err: *Io.Writer) !?Parsed {
             p.auth_required = true;
             continue;
         }
-        if (cli.isOneOf(a, &.{ "--hostname", "--port", "--store", "--events" })) {
+        if (cli.isOneOf(a, &.{ "--hostname", "--port", "--store", "--events", "--allow-origin" })) {
             i += 1;
             if (i == args.len) {
                 try err.print("deed serve: {s} needs a value\n", .{a});
@@ -109,6 +121,13 @@ fn parse(args: []const []const u8, out: *Io.Writer, err: *Io.Writer) !?Parsed {
                     try err.print("deed serve: --port needs a number from 0 to 65535, not '{s}'\n", .{v});
                     return error.Usage;
                 };
+            } else if (std.mem.eql(u8, a, "--allow-origin")) {
+                if (p.origin_count == max_origins) {
+                    try err.print("deed serve: --allow-origin can be given at most {d} times\n", .{max_origins});
+                    return error.Usage;
+                }
+                p.origins[p.origin_count] = v;
+                p.origin_count += 1;
             } else if (std.mem.eql(u8, a, "--store")) {
                 p.store = v;
             } else {
@@ -168,11 +187,10 @@ pub fn run(
         temp_dir = dir;
         const file = try std.fmt.allocPrintSentinel(gpa, "{s}{c}events.mdb", .{ dir, std.fs.path.sep }, 0);
         defer gpa.free(file);
-        store = Store.open(file, .{}) catch |e| {
+        store = Store.open(file, .{ .durability = .no_sync }) catch |e| {
             try err.print("deed serve: cannot open a store in {s}: {s}\n", .{ dir, @errorName(e) });
             return cli.exit_fail;
         };
-        skipSync(&store);
     }
     defer store.deinit();
 
@@ -200,6 +218,7 @@ pub fn run(
         .address = addr,
         .hostname = p.hostname,
         .auth_required = p.auth_required,
+        .allow_origins = p.origins[0..p.origin_count],
         .log = err,
     }) catch |e| {
         try err.print("deed serve: cannot listen on {s}:{d}: {s}\n", .{ p.hostname, p.port, @errorName(e) });
@@ -235,7 +254,9 @@ fn makeTempDir(gpa: std.mem.Allocator, io: Io) ![]u8 {
     io.random(&rand);
     const dir = try std.fmt.allocPrint(gpa, "{s}{c}deed-serve-{x}", .{ base, std.fs.path.sep, &rand });
     errdefer gpa.free(dir);
-    try Io.Dir.cwd().createDirPath(io, dir);
+    // Only its owner may open it: the store holds whatever is published.
+    const perms: Io.File.Permissions = if (builtin.os.tag == .windows) .default_dir else Io.File.Permissions.fromMode(0o700);
+    try Io.Dir.cwd().createDir(io, dir, perms);
     return dir;
 }
 
@@ -249,17 +270,6 @@ fn tempBase() []const u8 {
         }
     }
     return if (builtin.os.tag == .windows) "." else "/tmp";
-}
-
-/// LMDB's own switch for not syncing on every commit. The library has no
-/// option for it, and a store that is deleted when the relay stops has
-/// nothing to gain from a sync per event: on macOS each one is a full flush
-/// of the disk cache, which is most of what publishing costs.
-extern fn mdb_env_set_flags(env: *anyopaque, flags: c_uint, onoff: c_int) c_int;
-const mdb_nosync: c_uint = 0x10000;
-
-fn skipSync(store: *Store) void {
-    _ = mdb_env_set_flags(@ptrCast(store.env), mdb_nosync, 1);
 }
 
 /// SIGINT and SIGTERM, or a console Ctrl-C on Windows, set a flag that the
@@ -423,4 +433,13 @@ test "the library client subscribes and receives what another connection publish
     defer m.deinit();
     try testing.expectEqualStrings("live", m.value.event.subscription_id);
     try testing.expectEqualStrings("live one", m.value.event.event.content);
+}
+
+test "the temporary store directory is private to its owner" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const dir = try makeTempDir(testing.allocator, testing.io);
+    defer testing.allocator.free(dir);
+    defer Io.Dir.cwd().deleteTree(testing.io, dir) catch {};
+    const st = try Io.Dir.cwd().statFile(testing.io, dir, .{});
+    try testing.expectEqual(@as(u32, 0), @as(u32, @intCast(st.permissions.toMode() & 0o077)));
 }
