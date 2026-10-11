@@ -45,8 +45,10 @@ pub const usage =
     \\
     \\Options:
     \\  -k, -a, -i, -e, -p, -t, -d, -h, -T, -s, -u, -l, --search
-    \\                       the filter, as `deed req` takes them; a filter can
-    \\                       also be given as one JSON object argument
+    \\                       the filter, as `deed req` takes them, with the long
+    \\                       forms --kind, --author, --id, --tag, --since,
+    \\                       --until and --limit; a filter can also be given as
+    \\                       one JSON object argument
     \\      --store <path>   a local store, as one side of the sync
     \\      --direction <d>  pull, push or both, with --store; overrides the
     \\                       order of the arguments

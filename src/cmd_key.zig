@@ -34,9 +34,9 @@ pub const usage =
     \\
     \\Keys print as bech32 (nsec/npub) unless --hex is given.
     \\
-    \\encrypt makes an ncryptsec (NIP-49). --log-n is the scrypt cost, 16 by
-    \\default (about 64 MiB and a fraction of a second); each step up doubles
-    \\the work an attacker needs. --security records how the key was handled:
+    \\encrypt makes an ncryptsec (NIP-49). --log-n (also spelled --logn) is the
+    \\scrypt cost, 16 by default (about 64 MiB and a fraction of a second); each
+    \\step up doubles the work an attacker needs. --security records how the key was handled:
     \\insecure, secure or unknown (the default).
     \\
     \\Passwords are never taken from the command line, where they would sit in
