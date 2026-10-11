@@ -19,8 +19,8 @@ pub const summary = "run a relay on this machine, for development and tests";
 
 pub const ready = true;
 
-/// The port `nak serve` listens on too, so a script written for one finds
-/// the other.
+/// 10547 is the port other local test relays already use, so an existing
+/// script finds this one without a change.
 pub const default_port: u16 = 10547;
 
 pub const usage =

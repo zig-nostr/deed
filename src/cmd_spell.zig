@@ -4,8 +4,8 @@
 //! `limit`, `since`, `until` and `search` tags are the filter, `relays` says
 //! where to ask (`$outbox` meaning each author's own write relays), and
 //! `$me` and `$contacts` stand for the reader and the people they follow.
-//! This follows nak's `spell` command, which is where the format is defined
-//! in practice. The spell is checked like any event before it is used.
+//! The format follows the spells in use on relays today, since no merged NIP
+//! defines it yet. The spell is checked like any event before it is used.
 
 const std = @import("std");
 const nostr = @import("nostr");
@@ -57,8 +57,8 @@ pub const usage =
     \\      --auth, --force-pre-auth
     \\                       answer NIP-42 challenges (needs --sec)
     \\
-    \\Unlike nak, a spell without a `close-on-eose` tag still ends once the relays
-    \\have sent what they hold, unless --stream is given.
+    \\A spell without a `close-on-eose` tag still ends once the relays have sent
+    \\what they hold, unless --stream is given.
     \\
     \\Exits: 0 on success; 1 if the spell cannot be found or read, or no relay
     \\answered; 2 if the command line was not understood.
