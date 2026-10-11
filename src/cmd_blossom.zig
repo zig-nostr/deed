@@ -18,11 +18,13 @@ const cli = @import("cli.zig");
 const http = @import("http.zig");
 const jsonout = @import("jsonout.zig");
 const keyinput = @import("keyinput.zig");
+const publish = @import("cmd_publish.zig");
 const signing = @import("signing.zig");
 
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const blossom = nostr.blossom;
+const event = nostr.event;
 
 /// Shown beside the name in `deed help` once `ready` is true.
 pub const summary = "list, upload, download, delete, check and mirror blobs";
@@ -31,7 +33,7 @@ pub const summary = "list, upload, download, delete, check and mirror blobs";
 pub const ready = true;
 
 pub const usage =
-    \\deed blossom: list, upload, download, delete, check and mirror blobs
+    \\deed blossom: list, upload, download, delete, check, verify and mirror blobs
     \\
     \\Usage:
     \\  deed blossom list <pubkey> --server <url>
@@ -40,6 +42,7 @@ pub const usage =
     \\  deed blossom delete <sha256>... --server <url>
     \\  deed blossom check <sha256>... --server <url>
     \\  deed blossom mirror <url> --server <url>
+    \\  deed blossom verify <file> <sha256|url>
     \\
     \\A Blossom server stores blobs by their sha256. A server is a domain or a
     \\URL: cdn.example.com is read as https://cdn.example.com.
@@ -50,7 +53,16 @@ pub const usage =
     \\and writes the file only when its sha256 matches. check and delete print one
     \\line of JSON per server and blob. mirror asks the server to copy a blob from
     \\a URL (BUD-04); the blob's sha256 is read from the URL, or given with
-    \\--sha256.
+    \\--sha256. verify hashes a local file and compares it with a sha256 or the
+    \\sha256 a blob URL names; it needs no server or key, and exits 0 on a match
+    \\and 1 on a mismatch.
+    \\
+    \\upload can also describe the file it sent. --metadata builds a NIP-94
+    \\kind:1063 event (url, m, x, ox, size, and dim for PNG, JPEG, GIF and WebP),
+    \\signs it and prints it; with --relay it is published to those relays and
+    \\printed only when one accepted it. --imeta prints the NIP-92 imeta tag for
+    \\the same file, as a JSON array to paste into a note's tags. The first
+    \\server that took the file supplies the url.
     \\
     \\Options:
     \\  -s, --server <url>   the server; repeat it to use several. upload sends to
@@ -66,6 +78,14 @@ pub const usage =
     \\                       extension)
     \\      --sha256 <hex>   mirror: the sha256 of the blob, when the URL does not
     \\                       carry it
+    \\      --metadata       upload: sign and print a kind:1063 file metadata event
+    \\      --relay <url>    upload: publish that event to this relay; repeat it
+    \\                       for several (--publish-metadata is the same flag)
+    \\      --dry-run        upload: sign the metadata event and print it, but
+    \\                       publish nothing
+    \\      --imeta          upload: print the imeta tag for the file
+    \\      --alt <text>     upload: the alt text for the metadata or imeta
+    \\      --summary <text> upload: a summary for the metadata or imeta
     \\      --limit <n>      list: at most n blobs
     \\      --since <t>      list: only blobs uploaded at or after this unix time
     \\      --until <t>      list: only blobs uploaded at or before this unix time
@@ -79,10 +99,12 @@ pub const usage =
     \\  deed blossom upload photo.jpg -s cdn.example.com --sec nsec1...
     \\  deed blossom download b167...f553 -s cdn.example.com -o photo.jpg
     \\  deed blossom check b167...f553 -s a.example.com -s b.example.com
+    \\  deed blossom upload photo.jpg -s cdn.example.com --metadata --relay wss://relay.example.com
+    \\  deed blossom verify photo.jpg b167...f553
     \\
 ;
 
-const Command = enum { list, upload, download, delete, check, mirror };
+const Command = enum { list, upload, download, delete, check, mirror, verify };
 
 /// A token is valid for this long. Long enough for a slow upload to start, short
 /// enough that a leaked one is of little use.
@@ -107,8 +129,15 @@ const Options = struct {
     since: ?u64 = null,
     until: ?u64 = null,
     timeout_ms: ?u64 = null,
+    relays: std.ArrayList([]const u8) = .empty,
+    metadata: bool = false,
+    imeta: bool = false,
+    dry_run: bool = false,
+    alt: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
 
     fn deinit(self: *Options, gpa: std.mem.Allocator) void {
+        self.relays.deinit(gpa);
         self.servers.deinit(gpa);
         self.positionals.deinit(gpa);
     }
@@ -353,7 +382,7 @@ pub fn run(
     err: *std.Io.Writer,
 ) !u8 {
     if (args.len == 0) {
-        try err.writeAll("deed blossom: say what to do: list, upload, download, delete, check or mirror (see 'deed help blossom')\n");
+        try err.writeAll("deed blossom: say what to do: list, upload, download, delete, check, verify or mirror (see 'deed help blossom')\n");
         return cli.exit_usage;
     }
     if (cli.isOneOf(args[0], &.{ "help", "-h", "--help" })) {
@@ -361,7 +390,7 @@ pub fn run(
         return cli.exit_ok;
     }
     const cmd = std.meta.stringToEnum(Command, args[0]) orelse {
-        try err.print("deed blossom: unknown command '{s}' (want list, upload, download, delete, check or mirror)\n", .{args[0]});
+        try err.print("deed blossom: unknown command '{s}' (want list, upload, download, delete, check, verify or mirror)\n", .{args[0]});
         return cli.exit_usage;
     };
 
@@ -375,7 +404,19 @@ pub fn run(
             try out.writeAll(usage);
             return cli.exit_ok;
         }
-        const takes_value = cli.isOneOf(a, &.{ "-s", "--server", "--sec", "-o", "--output", "--type", "--sha256", "--limit", "--since", "--until", "--timeout" });
+        if (std.mem.eql(u8, a, "--metadata")) {
+            opts.metadata = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--imeta")) {
+            opts.imeta = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--dry-run")) {
+            opts.dry_run = true;
+            continue;
+        }
+        const takes_value = cli.isOneOf(a, &.{ "-s", "--server", "--sec", "-o", "--output", "--type", "--sha256", "--limit", "--since", "--until", "--timeout", "--relay", "--publish-metadata", "--alt", "--summary" });
         if (takes_value) {
             i += 1;
             if (i >= args.len) {
@@ -393,6 +434,12 @@ pub fn run(
                 opts.mime = v;
             } else if (std.mem.eql(u8, a, "--sha256")) {
                 opts.sha256 = v;
+            } else if (cli.isOneOf(a, &.{ "--relay", "--publish-metadata" })) {
+                try opts.relays.append(gpa, v);
+            } else if (std.mem.eql(u8, a, "--alt")) {
+                opts.alt = v;
+            } else if (std.mem.eql(u8, a, "--summary")) {
+                opts.summary = v;
             } else {
                 const n = std.fmt.parseInt(u64, v, 10) catch {
                     try err.print("deed blossom: {s} needs a number, not '{s}'\n", .{ a, v });
@@ -420,6 +467,13 @@ pub fn run(
         }
     }
 
+    if (cmd == .verify) {
+        if (opts.positionals.items.len != 2) {
+            try err.writeAll("deed blossom verify: takes a file and a sha256 or blob URL\n");
+            return cli.exit_usage;
+        }
+        return cmdVerify(gpa, io, opts.positionals.items[0], opts.positionals.items[1], out, err);
+    }
     if (opts.servers.items.len == 0) {
         try err.print("deed blossom {s}: name a server with --server\n", .{@tagName(cmd)});
         return cli.exit_usage;
@@ -433,6 +487,7 @@ pub fn run(
             try err.writeAll("deed blossom download: takes exactly one sha256\n");
             return cli.exit_usage;
         },
+        .verify => unreachable,
         .upload, .delete, .check => if (opts.positionals.items.len == 0) {
             try err.print("deed blossom {s}: name at least one {s}\n", .{ @tagName(cmd), if (cmd == .upload) "file" else "sha256" });
             return cli.exit_usage;
@@ -486,6 +541,7 @@ pub fn run(
         .delete => cmdDelete(&ctx, arena, opts, servers.items),
         .check => cmdCheck(&ctx, arena, opts, servers.items),
         .mirror => cmdMirror(&ctx, arena, opts, servers.items),
+        .verify => unreachable,
     };
     return ran catch |e| signing.report("blossom", e, err);
 }
@@ -581,14 +637,35 @@ fn cmdUpload(ctx: *const Ctx, arena: std.mem.Allocator, opts: Options, servers: 
             continue;
         };
         const mime = opts.mime orelse mimeFor(path);
+        var url: ?[]const u8 = null;
         for (servers) |srv| {
-            if (!try uploadOne(ctx, arena, srv, path, named, mime)) code = cli.exit_fail;
+            const got = try uploadOne(ctx, arena, srv, path, named, mime);
+            if (got == null) code = cli.exit_fail;
+            if (url == null) url = got;
+        }
+        if (url) |u| {
+            const meta: Meta = .{
+                .url = u,
+                .mime = mime,
+                .sha = named.sha,
+                .size = named.size,
+                .dim = readDim(ctx.io, path),
+                .alt = opts.alt,
+                .summary = opts.summary,
+            };
+            if (opts.imeta) {
+                const line = try imetaLine(arena, meta);
+                try ctx.out.print("{s}\n", .{line});
+            }
+            if (opts.metadata or opts.dry_run or opts.relays.items.len > 0) {
+                if (!try publishMeta(ctx, arena, opts, meta)) code = cli.exit_fail;
+            }
         }
     }
     return code;
 }
 
-fn uploadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, path: []const u8, named: Hashed, mime: []const u8) !bool {
+fn uploadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, path: []const u8, named: Hashed, mime: []const u8) !?[]const u8 {
     const hex = std.fmt.bytesToHex(named.sha, .lower);
     const auth = (try ctx.authHeader(arena, .upload, "Upload Blob", &.{named.sha}, srv)).?;
     const len_text = try std.fmt.allocPrint(arena, "{d}", .{named.size});
@@ -608,17 +685,17 @@ fn uploadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, path: []con
         .max_bytes = std.math.maxInt(usize),
     }) catch |e| {
         try failed(ctx, srv, path, e);
-        return false;
+        return null;
     };
     const unsupported = pre.status == 404 or pre.status == 405 or pre.status == 501;
     if (!ok(pre.status) and !unsupported) {
         try ctx.err.print("deed blossom: {s}: {s}: the server would not take it: HTTP {d}\n", .{ srv.base, path, pre.status });
-        return false;
+        return null;
     }
 
     const file = Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |e| {
         try ctx.err.print("deed blossom upload: cannot read {s}: {s}\n", .{ path, @errorName(e) });
-        return false;
+        return null;
     };
     defer file.close(ctx.io);
     var rbuf: [64 * 1024]u8 = undefined;
@@ -636,31 +713,207 @@ fn uploadOne(ctx: *const Ctx, arena: std.mem.Allocator, srv: Server, path: []con
         .transfer = true,
     }) catch |e| {
         try failed(ctx, srv, path, e);
-        return false;
+        return null;
     };
     if (!ok(r.status)) {
         try refused(ctx, srv, path, r);
-        return false;
+        return null;
     }
     if (!std.mem.eql(u8, &hashed.hasher.finalResult(), &named.sha)) {
         try ctx.err.print("deed blossom: {s}: {s} changed while it was being sent\n", .{ srv.base, path });
-        return false;
+        return null;
     }
     const d = readDescriptor(arena, ctx.gpa, r.body) orelse {
         try ctx.err.print("deed blossom: {s}: {s}: the reply is not a blob descriptor\n", .{ srv.base, path });
-        return false;
+        return null;
     };
     if (d.parsed.sha256 == null or !std.mem.eql(u8, &d.parsed.sha256.?, &named.sha)) {
         const theirs = std.fmt.bytesToHex(d.parsed.sha256 orelse [_]u8{0} ** 32, .lower);
         try ctx.err.print("deed blossom: {s}: {s}: the server reports sha256 {s}, the file is {s}\n", .{ srv.base, path, &theirs, &hex });
-        return false;
+        return null;
     }
     if (d.parsed.size != null and d.parsed.size.? != named.size) {
         try ctx.err.print("deed blossom: {s}: {s}: the server reports {d} bytes, the file has {d}\n", .{ srv.base, path, d.parsed.size.?, named.size });
-        return false;
+        return null;
     }
     try writeDescriptor(ctx, d.value);
+    if (d.value == .object) {
+        if (d.value.object.get("url")) |u| if (u == .string and u.string.len > 0) return u.string;
+    }
+    return try std.fmt.allocPrint(arena, "{s}/{s}", .{ srv.base, &hex });
+}
+
+// ---- NIP-94 file metadata and NIP-92 imeta ----------------------------------
+
+const Dim = struct { w: u32, h: u32 };
+
+const Meta = struct {
+    url: []const u8,
+    mime: []const u8,
+    sha: [32]u8,
+    size: u64,
+    dim: ?Dim = null,
+    alt: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
+};
+
+/// How much of a file is read to find an image's size. A JPEG can hold a long
+/// EXIF block before its frame header.
+const dim_probe_max = 256 * 1024;
+
+fn be16(b: []const u8) u32 {
+    return @as(u32, b[0]) << 8 | b[1];
+}
+fn le16(b: []const u8) u32 {
+    return @as(u32, b[1]) << 8 | b[0];
+}
+fn le24(b: []const u8) u32 {
+    return @as(u32, b[2]) << 16 | @as(u32, b[1]) << 8 | b[0];
+}
+
+/// The pixel size an image header states, for PNG, JPEG, GIF and WebP. Null for
+/// anything else, and for a header that is cut short or states a size of 0.
+fn imageDim(b: []const u8) ?Dim {
+    const d = imageDimRaw(b) orelse return null;
+    if (d.w == 0 or d.h == 0) return null;
+    return d;
+}
+
+fn imageDimRaw(b: []const u8) ?Dim {
+    if (b.len >= 24 and std.mem.eql(u8, b[0..8], "\x89PNG\r\n\x1a\n") and std.mem.eql(u8, b[12..16], "IHDR")) {
+        return .{
+            .w = std.mem.readInt(u32, b[16..20], .big),
+            .h = std.mem.readInt(u32, b[20..24], .big),
+        };
+    }
+    if (b.len >= 10 and (std.mem.eql(u8, b[0..6], "GIF87a") or std.mem.eql(u8, b[0..6], "GIF89a"))) {
+        return .{ .w = le16(b[6..8]), .h = le16(b[8..10]) };
+    }
+    if (b.len >= 30 and std.mem.eql(u8, b[0..4], "RIFF") and std.mem.eql(u8, b[8..12], "WEBP")) {
+        const chunk = b[12..16];
+        if (std.mem.eql(u8, chunk, "VP8 ")) {
+            if (!std.mem.eql(u8, b[23..26], "\x9d\x01\x2a")) return null;
+            return .{ .w = le16(b[26..28]) & 0x3fff, .h = le16(b[28..30]) & 0x3fff };
+        }
+        if (std.mem.eql(u8, chunk, "VP8L")) {
+            if (b[20] != 0x2f) return null;
+            const w = 1 + ((@as(u32, b[21])) | (@as(u32, b[22] & 0x3f) << 8));
+            const h = 1 + ((@as(u32, b[22]) >> 6) | (@as(u32, b[23]) << 2) | (@as(u32, b[24] & 0x0f) << 10));
+            return .{ .w = w, .h = h };
+        }
+        if (std.mem.eql(u8, chunk, "VP8X")) {
+            return .{ .w = 1 + le24(b[24..27]), .h = 1 + le24(b[27..30]) };
+        }
+        return null;
+    }
+    if (b.len >= 4 and b[0] == 0xff and b[1] == 0xd8) {
+        var i: usize = 2;
+        while (i + 4 <= b.len) {
+            if (b[i] != 0xff) return null;
+            var m = b[i + 1];
+            // Fill bytes before a marker.
+            while (m == 0xff and i + 2 < b.len) {
+                i += 1;
+                m = b[i + 1];
+            }
+            i += 2;
+            if (m == 0xd8 or m == 0x01 or (m >= 0xd0 and m <= 0xd7)) continue;
+            if (m == 0xd9 or m == 0xda) return null;
+            if (i + 2 > b.len) return null;
+            const len = be16(b[i..]);
+            if (len < 2) return null;
+            const sof = m >= 0xc0 and m <= 0xcf and m != 0xc4 and m != 0xc8 and m != 0xcc;
+            if (sof) {
+                if (i + 7 > b.len) return null;
+                return .{ .w = be16(b[i + 5 ..]), .h = be16(b[i + 3 ..]) };
+            }
+            i += len;
+        }
+    }
+    return null;
+}
+
+/// The size of the image at `path`, when it is one this can read.
+fn readDim(io: Io, path: []const u8) ?Dim {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var fr = file.reader(io, &rbuf);
+    var buf: [dim_probe_max]u8 = undefined;
+    const n = fr.interface.readSliceShort(&buf) catch return null;
+    return imageDim(buf[0..n]);
+}
+
+/// The tags of a kind:1063 event for `m`, in a fixed order. A file sent as it
+/// is has an original hash equal to its hash.
+fn metaTags(arena: std.mem.Allocator, m: Meta) ![]const event.Tag {
+    const hex = std.fmt.bytesToHex(m.sha, .lower);
+    var tags: std.ArrayList(event.Tag) = .empty;
+    try tags.append(arena, try arena.dupe([]const u8, &.{ "url", m.url }));
+    try tags.append(arena, try arena.dupe([]const u8, &.{ "m", m.mime }));
+    try tags.append(arena, try arena.dupe([]const u8, &.{ "x", try arena.dupe(u8, &hex) }));
+    try tags.append(arena, try arena.dupe([]const u8, &.{ "ox", try arena.dupe(u8, &hex) }));
+    try tags.append(arena, try arena.dupe([]const u8, &.{ "size", try std.fmt.allocPrint(arena, "{d}", .{m.size}) }));
+    if (m.dim) |d| try tags.append(arena, try arena.dupe([]const u8, &.{ "dim", try std.fmt.allocPrint(arena, "{d}x{d}", .{ d.w, d.h }) }));
+    if (m.alt) |a| try tags.append(arena, try arena.dupe([]const u8, &.{ "alt", a }));
+    if (m.summary) |a| try tags.append(arena, try arena.dupe([]const u8, &.{ "summary", a }));
+    return tags.items;
+}
+
+/// The NIP-92 tag for a note, as a JSON array: `["imeta","url ...","m ..."]`.
+fn imetaLine(arena: std.mem.Allocator, m: Meta) ![]const u8 {
+    const hex = std.fmt.bytesToHex(m.sha, .lower);
+    var parts: std.ArrayList([]const u8) = .empty;
+    try parts.append(arena, "imeta");
+    try parts.append(arena, try std.fmt.allocPrint(arena, "url {s}", .{m.url}));
+    try parts.append(arena, try std.fmt.allocPrint(arena, "m {s}", .{m.mime}));
+    try parts.append(arena, try std.fmt.allocPrint(arena, "x {s}", .{&hex}));
+    try parts.append(arena, try std.fmt.allocPrint(arena, "ox {s}", .{&hex}));
+    try parts.append(arena, try std.fmt.allocPrint(arena, "size {d}", .{m.size}));
+    if (m.dim) |d| try parts.append(arena, try std.fmt.allocPrint(arena, "dim {d}x{d}", .{ d.w, d.h }));
+    if (m.alt) |a| try parts.append(arena, try std.fmt.allocPrint(arena, "alt {s}", .{a}));
+    if (m.summary) |a| try parts.append(arena, try std.fmt.allocPrint(arena, "summary {s}", .{a}));
+    var aw: Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(parts.items, .{}, &aw.writer);
+    return aw.written();
+}
+
+/// Signs the kind:1063 event and publishes or prints it. True when the event
+/// was printed, or at least one relay accepted it.
+fn publishMeta(ctx: *const Ctx, arena: std.mem.Allocator, opts: Options, m: Meta) !bool {
+    const signer = ctx.signer.?;
+    const tags = try metaTags(arena, m);
+    const ev = try signer.sign(arena, ctx.now(), 1063, tags, m.summary orelse "");
+    if (!opts.dry_run and opts.relays.items.len > 0) {
+        const timeout: i64 = if (opts.timeout_ms) |t| @intCast(@min(t, std.math.maxInt(i32))) else publish.default_timeout_ms;
+        const accepted = try publish.publishOne(ctx.gpa, ctx.io, "blossom", opts.relays.items, ev, timeout, ctx.err);
+        if (!accepted) return false;
+    }
+    const json = try event.toJson(arena, ev);
+    try ctx.out.print("{s}\n", .{json});
     return true;
+}
+
+// ---- verify ----------------------------------------------------------------
+
+fn cmdVerify(gpa: std.mem.Allocator, io: Io, path: []const u8, want_text: []const u8, out: *Io.Writer, err: *Io.Writer) !u8 {
+    _ = gpa;
+    const want = parseSha(want_text) orelse shaFromUrl(want_text) orelse {
+        try err.print("deed blossom verify: '{s}' is neither a sha256 nor a blob URL\n", .{want_text});
+        return cli.exit_usage;
+    };
+    const got = hashFile(io, path) catch |e| {
+        try err.print("deed blossom verify: cannot read {s}: {s}\n", .{ path, @errorName(e) });
+        return cli.exit_fail;
+    };
+    const got_hex = std.fmt.bytesToHex(got.sha, .lower);
+    if (!std.mem.eql(u8, &got.sha, &want)) {
+        const want_hex = std.fmt.bytesToHex(want, .lower);
+        try err.print("deed blossom verify: {s}: sha256 is {s}, not {s}\n", .{ path, &got_hex, &want_hex });
+        return cli.exit_fail;
+    }
+    try out.print("{s}  {s}\n", .{ &got_hex, path });
+    return cli.exit_ok;
 }
 
 // ---- download --------------------------------------------------------------
@@ -884,6 +1137,7 @@ fn cmdMirror(ctx: *const Ctx, arena: std.mem.Allocator, opts: Options, servers: 
 // ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const testrelay = @import("testrelay.zig");
 
 test "a server is a domain or a URL, and is made lowercase without a trailing slash" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1830,4 +2084,263 @@ test "a delete token signed by a remote signer is by the user and checks out" {
     try testing.expectEqual(cli.exit_ok, r.code);
     try testing.expectEqual(@as(usize, 1), mock.deletes);
     try testing.expectEqual(@as(usize, 0), mock.problems);
+}
+
+// ---- file metadata tests -----------------------------------------------------
+
+fn pngBytes(buf: []u8, w: u32, h: u32) []u8 {
+    @memset(buf, 0);
+    @memcpy(buf[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, buf[8..12], 13, .big);
+    @memcpy(buf[12..16], "IHDR");
+    std.mem.writeInt(u32, buf[16..20], w, .big);
+    std.mem.writeInt(u32, buf[20..24], h, .big);
+    return buf;
+}
+
+test "the content type comes from the extension" {
+    try testing.expectEqualStrings("image/png", mimeFor("a/b/pic.PNG"));
+    try testing.expectEqualStrings("image/jpeg", mimeFor("pic.jpeg"));
+    try testing.expectEqualStrings("video/mp4", mimeFor("clip.mp4"));
+    try testing.expectEqualStrings("application/octet-stream", mimeFor("blob"));
+}
+
+test "a PNG header gives the size" {
+    var buf: [33]u8 = undefined;
+    const d = imageDim(pngBytes(&buf, 640, 480)).?;
+    try testing.expectEqual(@as(u32, 640), d.w);
+    try testing.expectEqual(@as(u32, 480), d.h);
+    try testing.expect(imageDim(buf[0..20]) == null);
+    try testing.expect(imageDim(pngBytes(&buf, 0, 480)) == null);
+}
+
+test "a GIF header gives the size" {
+    const gif = "GIF89a\x40\x01\xc8\x00\x00\x00";
+    const d = imageDim(gif).?;
+    try testing.expectEqual(@as(u32, 320), d.w);
+    try testing.expectEqual(@as(u32, 200), d.h);
+}
+
+test "a JPEG gives its size past other segments, and fill bytes" {
+    const jpg = "\xff\xd8\xff\xe0\x00\x04\x00\x00\xff\xff\xe1\x00\x05abc\xff\xc0\x00\x11\x08\x01\xe0\x02\x80\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01";
+    const d = imageDim(jpg).?;
+    try testing.expectEqual(@as(u32, 640), d.w);
+    try testing.expectEqual(@as(u32, 480), d.h);
+    // A table marker is not a frame header, and a cut-short file gives nothing.
+    try testing.expect(imageDim("\xff\xd8\xff\xc4\x00\x04\x00\x00") == null);
+    try testing.expect(imageDim(jpg[0..14]) == null);
+}
+
+test "a WebP gives its size in each of its three forms" {
+    var lossy = [_]u8{0} ** 30;
+    @memcpy(lossy[0..4], "RIFF");
+    @memcpy(lossy[8..16], "WEBPVP8 ");
+    @memcpy(lossy[23..26], "\x9d\x01\x2a");
+    std.mem.writeInt(u16, lossy[26..28], 321, .little);
+    std.mem.writeInt(u16, lossy[28..30], 123, .little);
+    const a = imageDim(&lossy).?;
+    try testing.expectEqual(@as(u32, 321), a.w);
+    try testing.expectEqual(@as(u32, 123), a.h);
+
+    var lossless = [_]u8{0} ** 30;
+    @memcpy(lossless[0..4], "RIFF");
+    @memcpy(lossless[8..16], "WEBPVP8L");
+    lossless[20] = 0x2f;
+    lossless[21] = 0x2b;
+    lossless[22] = 0xc1;
+    lossless[23] = 0x31;
+    const b = imageDim(&lossless).?;
+    try testing.expectEqual(@as(u32, 300), b.w);
+    try testing.expectEqual(@as(u32, 200), b.h);
+
+    var ext = [_]u8{0} ** 30;
+    @memcpy(ext[0..4], "RIFF");
+    @memcpy(ext[8..16], "WEBPVP8X");
+    std.mem.writeInt(u16, ext[24..26], 999, .little);
+    std.mem.writeInt(u16, ext[27..29], 499, .little);
+    const c = imageDim(&ext).?;
+    try testing.expectEqual(@as(u32, 1000), c.w);
+    try testing.expectEqual(@as(u32, 500), c.h);
+
+    try testing.expect(imageDim("not an image at all, just some text here") == null);
+}
+
+fn testMeta() Meta {
+    return .{
+        .url = "https://cdn.example.com/b167.png",
+        .mime = "image/png",
+        .sha = [_]u8{0xab} ** 32,
+        .size = 1234,
+        .dim = .{ .w = 640, .h = 480 },
+        .alt = "a cat",
+    };
+}
+
+test "the metadata event carries url, m, x, ox, size, dim and the optional tags" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const hex = "ab" ** 32;
+    const tags = try metaTags(a, testMeta());
+    try testing.expectEqual(@as(usize, 7), tags.len);
+    const want = [_][2][]const u8{
+        .{ "url", "https://cdn.example.com/b167.png" },
+        .{ "m", "image/png" },
+        .{ "x", hex },
+        .{ "ox", hex },
+        .{ "size", "1234" },
+        .{ "dim", "640x480" },
+        .{ "alt", "a cat" },
+    };
+    for (want, tags) |w, t| {
+        try testing.expectEqual(@as(usize, 2), t.len);
+        try testing.expectEqualStrings(w[0], t[0]);
+        try testing.expectEqualStrings(w[1], t[1]);
+    }
+    var plain = testMeta();
+    plain.dim = null;
+    plain.alt = null;
+    try testing.expectEqual(@as(usize, 5), (try metaTags(a, plain)).len);
+}
+
+test "the imeta tag is one JSON array of 'name value' strings" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const line = try imetaLine(a, testMeta());
+    const want = "[\"imeta\",\"url https://cdn.example.com/b167.png\",\"m image/png\",\"x " ++ "ab" ** 32 ++ "\",\"ox " ++ "ab" ** 32 ++ "\",\"size 1234\",\"dim 640x480\",\"alt a cat\"]";
+    try testing.expectEqualStrings(want, line);
+}
+
+test "verify matches a sha256 or a URL, and fails on a mismatch" {
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    var dir: TmpDir = undefined;
+    try dir.init();
+    defer dir.deinit();
+    try dir.write("note.txt", "hello blossom");
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try dir.path(&pbuf, "note.txt");
+    var sha: [32]u8 = undefined;
+    Sha256.hash("hello blossom", &sha, .{});
+    const hex = std.fmt.bytesToHex(sha, .lower);
+    var ubuf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ubuf, "https://cdn.example.com/{s}.txt", .{&hex});
+
+    const same = try runWith(gpa, &.{ "verify", file, &hex });
+    defer same.deinit();
+    try testing.expectEqual(cli.exit_ok, same.code);
+    try testing.expect(std.mem.startsWith(u8, same.out, &hex));
+    try testing.expectEqualStrings("", same.err);
+
+    const by_url = try runWith(gpa, &.{ "verify", file, url });
+    defer by_url.deinit();
+    try testing.expectEqual(cli.exit_ok, by_url.code);
+
+    const other = try runWith(gpa, &.{ "verify", file, "00" ** 32 });
+    defer other.deinit();
+    try testing.expectEqual(cli.exit_fail, other.code);
+    try testing.expectEqualStrings("", other.out);
+    try testing.expect(std.mem.find(u8, other.err, "not " ++ "00" ** 32) != null);
+
+    const junk = try runWith(gpa, &.{ "verify", file, "xyz" });
+    defer junk.deinit();
+    try testing.expectEqual(cli.exit_usage, junk.code);
+
+    const gone = try runWith(gpa, &.{ "verify", "/no/such/file", &hex });
+    defer gone.deinit();
+    try testing.expectEqual(cli.exit_fail, gone.code);
+}
+
+test "an upload prints the imeta tag, and a dry run signs the event without publishing" {
+    var da: http.TestAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var dir: TmpDir = undefined;
+    try dir.init();
+    defer dir.deinit();
+    var png: [33]u8 = undefined;
+    try dir.write("pic.png", pngBytes(&png, 64, 32));
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try dir.path(&pbuf, "pic.png");
+
+    var mock: Mock = undefined;
+    try mock.start(io, 2);
+    defer mock.stop(io);
+    var bbuf: [64]u8 = undefined;
+
+    const r = try runWith(gpa, &.{ "upload", file, "-s", mock.base(&bbuf), "--sec", test_sec_arg, "--imeta", "--dry-run", "--alt", "tiny" });
+    defer r.deinit();
+    try testing.expectEqualStrings("", r.err);
+    try testing.expectEqual(cli.exit_ok, r.code);
+    try testing.expect(std.mem.find(u8, r.out, "[\"imeta\",\"url http://127.0.0.1:") != null);
+    try testing.expect(std.mem.find(u8, r.out, "\"m image/png\"") != null);
+    try testing.expect(std.mem.find(u8, r.out, "\"dim 64x32\"") != null);
+    try testing.expect(std.mem.find(u8, r.out, "\"kind\":1063") != null);
+    try testing.expect(std.mem.find(u8, r.out, "[\"dim\",\"64x32\"]") != null);
+    try testing.expect(std.mem.find(u8, r.out, "[\"alt\",\"tiny\"]") != null);
+    try testing.expect(std.mem.find(u8, r.out, "\"sig\":\"") != null);
+}
+
+test "the metadata event is published through a relay and printed once it is accepted" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var dir: TmpDir = undefined;
+    try dir.init();
+    defer dir.deinit();
+    try dir.write("note.txt", "hello blossom");
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try dir.path(&pbuf, "note.txt");
+
+    var mock: Mock = undefined;
+    try mock.start(io, 2);
+    defer mock.stop(io);
+    var bbuf: [64]u8 = undefined;
+    var relay: testrelay.Relay = undefined;
+    try relay.start(io, .accept);
+    defer relay.stop(io);
+    var rbuf: [64]u8 = undefined;
+    const relay_url = try testrelay.url(&rbuf, relay.port());
+
+    const r = try runWith(gpa, &.{ "upload", file, "-s", mock.base(&bbuf), "--sec", test_sec_arg, "--publish-metadata", relay_url });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_ok, r.code);
+    try testing.expect(std.mem.find(u8, r.err, "accepted") != null);
+    try testing.expect(std.mem.find(u8, r.out, "\"kind\":1063") != null);
+    try testing.expect(std.mem.find(u8, r.out, "[\"m\",\"text/plain\"]") != null);
+    try testing.expect(std.mem.find(u8, r.out, "[\"size\",\"13\"]") != null);
+}
+
+test "a refused metadata event is not printed and the run fails" {
+    if (std.c.getenv("DEED_RELAYS") != null) return error.SkipZigTest;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const io = testing.io;
+    var dir: TmpDir = undefined;
+    try dir.init();
+    defer dir.deinit();
+    try dir.write("note.txt", "hello blossom");
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try dir.path(&pbuf, "note.txt");
+
+    var mock: Mock = undefined;
+    try mock.start(io, 2);
+    defer mock.stop(io);
+    var bbuf: [64]u8 = undefined;
+    var relay: testrelay.Relay = undefined;
+    try relay.start(io, .refuse);
+    defer relay.stop(io);
+    var rbuf: [64]u8 = undefined;
+    const relay_url = try testrelay.url(&rbuf, relay.port());
+
+    const r = try runWith(gpa, &.{ "upload", file, "-s", mock.base(&bbuf), "--sec", test_sec_arg, "--relay", relay_url });
+    defer r.deinit();
+    try testing.expectEqual(cli.exit_fail, r.code);
+    try testing.expect(std.mem.find(u8, r.out, "1063") == null);
 }
