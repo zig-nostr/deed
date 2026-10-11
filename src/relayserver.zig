@@ -116,6 +116,9 @@ pub const Server = struct {
     committer: Io.Future(void) = undefined,
     /// Test hook: commits to fail before any succeeds.
     fail_commits: std.atomic.Value(u32) = .init(0),
+    /// Test hook: runs in a REQ after the subscription is registered and
+    /// before the stored events are read.
+    test_req_hook: ?*const fn (*Server) void = null,
     /// Commits made, and events in them, for tests.
     commits: std.atomic.Value(u64) = .init(0),
     committed: std.atomic.Value(u64) = .init(0),
@@ -295,6 +298,10 @@ pub const Server = struct {
             var it = c.subs.iterator();
             while (it.next()) |entry| {
                 if (!anyMatches(entry.value_ptr.filters, ev)) continue;
+                if (!entry.value_ptr.live) {
+                    const gop = entry.value_ptr.seen.getOrPut(self.gpa, ev.id) catch continue;
+                    if (gop.found_existing) continue;
+                }
                 const frame = eventFrame(self.gpa, entry.key_ptr.*, json) catch continue;
                 _ = self.fanned.fetchAdd(1, .monotonic);
                 c.offer(frame);
@@ -308,6 +315,16 @@ const Sub = struct {
     /// the subscription id.
     parsed: message.ParsedClientMessage,
     filters: []const Filter,
+    /// False until the stored answer has been sent. Until then `seen` holds
+    /// every event id sent or fanned out to it, so one that is both stored
+    /// and arriving live is delivered once. Under `sub_mu`.
+    live: bool = false,
+    seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+
+    fn deinit(s: *Sub, gpa: std.mem.Allocator) void {
+        s.seen.deinit(gpa);
+        s.parsed.deinit();
+    }
 };
 
 const Neg = struct {
@@ -369,7 +386,7 @@ const Conn = struct {
         for (c.q_items.items) |f| c.gpa.free(f);
         c.q_items.deinit(c.gpa);
         var it = c.subs.valueIterator();
-        while (it.next()) |s| s.parsed.deinit();
+        while (it.next()) |s| s.deinit(c.gpa);
         c.subs.deinit(c.gpa);
         var nit = c.negs.iterator();
         while (nit.next()) |e| {
@@ -1130,15 +1147,14 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
             return;
         }
         c.subs.put(c.gpa, sub_id, .{ .parsed = parsed, .filters = filters }) catch |e| {
-            if (old) |*o| o.parsed.deinit();
+            if (old) |*o| o.deinit(c.gpa);
             return e;
         };
         kept.* = true;
     }
-    if (old) |*o| o.parsed.deinit();
+    if (old) |*o| o.deinit(c.gpa);
+    if (c.server.test_req_hook) |hook| hook(c.server);
 
-    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
-    defer seen.deinit(c.gpa);
     for (filters) |f| {
         var q = f;
         q.limit = @min(f.limit orelse limits.max_limit, limits.max_limit);
@@ -1152,17 +1168,34 @@ fn onReq(c: *Conn, parsed: message.ParsedClientMessage, sub_id: []const u8, filt
         };
         defer res.deinit();
         for (res.events) |ev| {
-            if (filters.len > 1) {
-                const gop = try seen.getOrPut(c.gpa, ev.id);
-                if (gop.found_existing) continue;
-            }
+            // Skip one already sent, by another filter or by fan-out.
+            if (!try firstSight(c, sub_id, ev.id)) continue;
             if (expiration(ev)) |at| if (at <= nowSeconds(c.io)) continue;
             const json = try event.toJson(c.gpa, ev);
             defer c.gpa.free(json);
             try c.push(try eventFrame(c.gpa, sub_id, json));
         }
     }
+    {
+        c.sub_mu.lockUncancelable(c.io);
+        defer c.sub_mu.unlock(c.io);
+        if (c.subs.getPtr(sub_id)) |sub| {
+            sub.live = true;
+            sub.seen.deinit(c.gpa);
+            sub.seen = .empty;
+        }
+    }
     try c.sendOwned(try message.encodeEose(c.gpa, sub_id));
+}
+
+/// Records that `id` is going to the subscription before its EOSE, and says
+/// whether it had not been sent yet.
+fn firstSight(c: *Conn, sub_id: []const u8, id: [32]u8) SendError!bool {
+    c.sub_mu.lockUncancelable(c.io);
+    defer c.sub_mu.unlock(c.io);
+    const sub = c.subs.getPtr(sub_id) orelse return true;
+    const gop = try sub.seen.getOrPut(c.gpa, id);
+    return !gop.found_existing;
 }
 
 /// Removes a subscription that `onReq` registered but could not answer. The
@@ -1172,8 +1205,8 @@ fn dropSub(c: *Conn, sub_id: []const u8) void {
     const kv = c.subs.fetchRemove(sub_id);
     c.sub_mu.unlock(c.io);
     if (kv) |x| {
-        var p = x.value.parsed;
-        p.deinit();
+        var sub = x.value;
+        sub.deinit(c.gpa);
     }
 }
 
@@ -1182,8 +1215,8 @@ fn onClose(c: *Conn, sub_id: []const u8) void {
     const kv = c.subs.fetchRemove(sub_id);
     c.sub_mu.unlock(c.io);
     if (kv) |x| {
-        var p = x.value.parsed;
-        p.deinit();
+        var sub = x.value;
+        sub.deinit(c.gpa);
     }
 }
 
@@ -2443,4 +2476,39 @@ test "work past the relay's memory budget is refused, and the budget comes back"
     var tries: usize = 0;
     while (ts.server.mem_used.load(.acquire) != 0 and tries < 200) : (tries += 1) try testing.io.sleep(.fromMilliseconds(5), .awake);
     try testing.expectEqual(@as(usize, 0), ts.server.mem_used.load(.acquire));
+}
+
+var dedup_hook_event: Event = undefined;
+
+fn dedupHook(server: *Server) void {
+    // The event is stored and announced while the REQ is between its
+    // registration and its query, so both the query and fan-out carry it.
+    _ = server.store.ingest(server.gpa, dedup_hook_event, .{}) catch return;
+    server.fanout(dedup_hook_event);
+}
+
+test "an event both stored and fanned out before EOSE is sent once" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer, 8);
+    dedup_hook_event = try makeEvent(arena, signer, kp, 1, nowSeconds(testing.io), "twice");
+    ts.server.test_req_hook = dedupHook;
+
+    var cl = try RawClient.connect(gpa, ts.server.port());
+    defer cl.deinit();
+    try cl.send("[\"REQ\",\"s\",{\"kinds\":[1]}]");
+    var events: usize = 0;
+    while (true) {
+        const t = try cl.text();
+        if (std.mem.startsWith(u8, t, "[\"EOSE\"")) break;
+        events += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), events);
 }
