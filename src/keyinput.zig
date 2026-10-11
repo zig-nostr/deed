@@ -48,17 +48,11 @@ const TerminalPassword = struct {
 /// A secret key as `nsec1…`, as 64 hex characters, or as an `ncryptsec1…`
 /// (NIP-49), whose password is asked for on the terminal.
 ///
-/// Says why on stderr when a password is the problem, because the callers
-/// only know the key could not be read.
+/// Says nothing: the caller says what went wrong, in one line, and the error
+/// tells a wrong password and a missing one from a bad key. A verb that
+/// reports on its own writer uses `secretKeyForVerb`, which says it for it.
 pub fn secretKey(gpa: std.mem.Allocator, s: []const u8) !keys.SecretKey {
-    return secretKeyWith(gpa, s, TerminalPassword{}) catch |e| {
-        switch (e) {
-            Error.WrongPassword => std.debug.print("deed: wrong password for that ncryptsec\n", .{}),
-            Error.NoPassword => std.debug.print("deed: an ncryptsec needs a password: run on a terminal, or set {s}\n", .{password.password_env}),
-            else => {},
-        }
-        return e;
-    };
+    return secretKeyWith(gpa, s, TerminalPassword{});
 }
 
 /// `secretKeyWith` for a verb that reports on `err`: one line saying what is

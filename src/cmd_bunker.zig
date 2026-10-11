@@ -334,10 +334,12 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
     };
     var signer = keys.Signer.init();
     defer signer.deinit();
-    const sk = keyinput.secretKey(arena, sec_text) catch {
-        p.failure = cli.exit_fail;
-        try err.writeAll("deed bunker: not a secret key\n");
-        return null;
+    const sk = keyinput.secretKeyForVerb(arena, "bunker", sec_text, err) catch |e| switch (e) {
+        error.BadKey => {
+            p.failure = cli.exit_fail;
+            return null;
+        },
+        else => return e,
     };
     const keypair = signer.keyPairFromSecretKey(sk) catch {
         p.failure = cli.exit_fail;
@@ -348,9 +350,13 @@ fn resolve(arena: std.mem.Allocator, io: Io, p: *Parsed, env_sec: ?[]const u8, e
         if (stored.sec) |kept| {
             // A file remembers which clients may use ONE key. Pointing it at
             // another would hand that key to clients nobody authorized for it.
-            const kept_sk = keyinput.secretKey(arena, kept) catch {
+            const kept_sk = keyinput.secretKey(arena, kept) catch |e| {
                 p.failure = cli.exit_fail;
-                try err.print("deed bunker: {s} holds something that is not a secret key\n", .{persist_path.?});
+                try err.print("deed bunker: {s} {s}\n", .{ persist_path.?, switch (e) {
+                    keyinput.Error.WrongPassword => "holds an ncryptsec that password does not open",
+                    keyinput.Error.NoPassword => "holds an ncryptsec, and no password could be read for it",
+                    else => "holds something that is not a secret key",
+                } });
                 return null;
             };
             if (!std.mem.eql(u8, &kept_sk, &sk)) {
