@@ -87,6 +87,8 @@ const max_notes_bytes = 4 * 1024;
 const max_line_bytes = 1 << 20;
 /// Relays one call may name.
 const max_tool_relays = 8;
+/// How deeply a tool's arguments may nest.
+const max_json_depth = 32;
 
 const default_timeout_ms: i64 = 10_000;
 const min_timeout_ms: i64 = 100;
@@ -464,6 +466,11 @@ fn toolsCall(s: *Server, a: Allocator, id: Json, params: Json, out: *Io.Writer) 
     if (name_v != .string) return replyError(out, id, -32602, "Invalid params: name must be a string");
     const args: Json = params.object.get("arguments") orelse .{ .object = .empty };
     if (args != .object) return replyError(out, id, -32602, "Invalid params: arguments must be an object");
+    // Arguments are written back out as JSON for the verbs, and the writer
+    // allows 256 levels at most. A filter or an event needs a handful.
+    if (!shallow(args, max_json_depth)) {
+        return replyError(out, id, -32602, "Invalid params: arguments are nested too deeply");
+    }
 
     const tool = for (tools) |t| {
         if (listed(s.cfg, t) and std.mem.eql(u8, t.name, name_v.string)) break t;
@@ -548,6 +555,23 @@ fn failf(out: *Io.Writer.Allocating, comptime fmt: []const u8, args: anytype) !b
     out.clearRetainingCapacity();
     try out.writer.print(fmt, args);
     return false;
+}
+
+/// True when `v` nests no deeper than `left` levels. The walk stops at the
+/// limit, so a deep value costs no more stack than a shallow one.
+fn shallow(v: Json, left: usize) bool {
+    switch (v) {
+        .array => |arr| {
+            if (left == 0) return false;
+            for (arr.items) |item| if (!shallow(item, left - 1)) return false;
+        },
+        .object => |obj| {
+            if (left == 0) return false;
+            for (obj.values()) |item| if (!shallow(item, left - 1)) return false;
+        },
+        else => {},
+    }
+    return true;
 }
 
 fn field(args: Json, name: []const u8) ?Json {
@@ -1326,4 +1350,30 @@ test "publish_event refuses auth tags on an allowed kind" {
 test "publish_event refuses a created_at far from now" {
     try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"created_at\":1000", "created_at must be within");
     try refusedBeforeSigning("\"kind\":1,\"content\":\"hi\",\"created_at\":99999999999", "created_at must be within");
+}
+
+test "a filter or event nested past the limit is refused, not a crash" {
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+    const deep_open = "[" ** 300;
+    const deep_close = "]" ** 300;
+    const l1 = try callLine(gpa, 1, "req", "{\"filter\":{\"x\":" ++ deep_open ++ deep_close ++ "},\"relays\":[\"ws://127.0.0.1:1\"]}");
+    defer gpa.free(l1);
+    const l2 = try callLine(gpa, 2, "verify", "{\"event\":{\"x\":" ++ deep_open ++ deep_close ++ "}}");
+    defer gpa.free(l2);
+    const l3 = try callLine(gpa, 3, "count", "{\"filter\":{\"x\":" ++ deep_open ++ deep_close ++ "},\"relays\":[\"ws://127.0.0.1:1\"]}");
+    defer gpa.free(l3);
+    const l4 = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\"}\n";
+    const all = try std.mem.concat(gpa, u8, &.{ l1, l2, l3, l4 });
+    defer gpa.free(all);
+    const got = try converse(gpa, .{}, all);
+    defer gpa.free(got);
+    var b: [32]u8 = undefined;
+    for ([_]u32{ 1, 2, 3 }) |id| {
+        const r = replyFor(got, id, &b).?;
+        try testing.expect(has(r, "\"error\":{\"code\":-32602"));
+        try testing.expect(has(r, "nested too deeply"));
+    }
+    try testing.expect(has(replyFor(got, 4, &b).?, "\"result\":{}"));
 }
