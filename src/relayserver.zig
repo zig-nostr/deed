@@ -61,6 +61,10 @@ pub const Options = struct {
     /// NIP-42 relay tag. Empty means the address itself.
     hostname: []const u8 = "",
     auth_required: bool = false,
+    /// Origins a browser page may open a websocket from. A request that
+    /// carries an Origin header is refused unless it is listed, or this
+    /// has \"*\". Requests without one (every non-browser client) are taken.
+    allow_origins: []const []const u8 = &.{},
     limits: Limits = .{},
     /// Where connections and errors are logged, or null for silence.
     log: ?*Io.Writer = null,
@@ -711,6 +715,12 @@ fn serveConn(c: *Conn, registered: *bool) Io.Cancelable!void {
     const upgrade = headerValue(head, "upgrade");
     const is_ws = key != null and upgrade != null and std.ascii.eqlIgnoreCase(std.mem.trim(u8, upgrade.?, " "), "websocket");
     if (!is_ws) return answerHttp(c, head);
+    if (headerValue(head, "origin")) |origin| {
+        if (!originAllowed(c.server.opts.allow_origins, origin)) {
+            c.server.log("{s}: refused a page from {s}", .{ c.peer(), origin });
+            return httpReply(c, "403 Forbidden", "text/plain", "a browser page may not connect to this relay unless its origin is allowed with --allow-origin\n");
+        }
+    }
 
     if (!c.server.register(c)) {
         return httpReply(c, "503 Service Unavailable", "text/plain", "too many connections\n");
@@ -750,6 +760,14 @@ fn serveConn(c: *Conn, registered: *bool) Io.Cancelable!void {
     }
 
     readFrames(c, &r, &recv) catch |e| return goneOrCanceled(e);
+}
+
+fn originAllowed(allowed: []const []const u8, origin: []const u8) bool {
+    for (allowed) |a| {
+        if (std.mem.eql(u8, a, "*")) return true;
+        if (std.ascii.eqlIgnoreCase(a, origin)) return true;
+    }
+    return false;
 }
 
 fn goneOrCanceled(e: anyerror) Io.Cancelable!void {
@@ -1455,7 +1473,7 @@ pub const TestServer = struct {
     ts: TestStore,
     server: Server,
 
-    pub fn start(self: *TestServer, opts: struct { auth_required: bool = false, limits: Limits = .{} }) !void {
+    pub fn start(self: *TestServer, opts: struct { auth_required: bool = false, limits: Limits = .{}, allow_origins: []const []const u8 = &.{} }) !void {
         self.da = .init;
         try self.ts.init();
         errdefer self.ts.deinit();
@@ -1463,6 +1481,7 @@ pub const TestServer = struct {
             .address = .{ .ip4 = .loopback(0) },
             .auth_required = opts.auth_required,
             .limits = opts.limits,
+            .allow_origins = opts.allow_origins,
         });
     }
 
@@ -1486,13 +1505,26 @@ const RawClient = struct {
     const Frame = struct { opcode: ws.Opcode, payload: []const u8 };
 
     fn connect(gpa: std.mem.Allocator, port: u16) !*RawClient {
+        return connectWith(gpa, port, "");
+    }
+
+    /// `extra` is whole header lines, each ending in CRLF.
+    fn connectWith(gpa: std.mem.Allocator, port: u16, extra: []const u8) !*RawClient {
         const io = testing.io;
         const self = try gpa.create(RawClient);
-        errdefer gpa.destroy(self);
-        const addr = try Io.net.IpAddress.parse("127.0.0.1", port);
-        self.* = .{ .gpa = gpa, .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .rbuf = undefined, .buf = .empty, .last = .empty };
+        const addr = Io.net.IpAddress.parse("127.0.0.1", port) catch |e| {
+            gpa.destroy(self);
+            return e;
+        };
+        self.* = .{ .gpa = gpa, .io = io, .stream = addr.connect(io, .{ .mode = .stream }) catch |e| {
+            gpa.destroy(self);
+            return e;
+        }, .reader = undefined, .rbuf = undefined, .buf = .empty, .last = .empty };
+        errdefer self.deinit();
         self.reader = self.stream.reader(io, &self.rbuf);
-        try self.writeAll("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        const req = try std.fmt.allocPrint(gpa, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{s}\r\n", .{extra});
+        defer gpa.free(req);
+        try self.writeAll(req);
         while (std.mem.indexOf(u8, self.buf.items, "\r\n\r\n") == null) {
             if (!try self.more()) return error.EndOfStream;
         }
@@ -2194,4 +2226,27 @@ test "a REQ cut off mid-answer does not free a subscription that is still regist
     }
     try testing.expect(ts.server.dropped.load(.monotonic) > 0);
     try testing.io.sleep(.fromMilliseconds(300), .awake);
+}
+
+test "a page's websocket is refused unless its origin is allowed" {
+    var ts: TestServer = undefined;
+    try ts.start(.{});
+    defer ts.stop();
+    const gpa = ts.da.allocator();
+    try testing.expectError(error.HandshakeFailed, RawClient.connectWith(gpa, ts.server.port(), "Origin: https://evil.example\r\n"));
+    const plain = try RawClient.connect(gpa, ts.server.port());
+    plain.deinit();
+
+    var open: TestServer = undefined;
+    try open.start(.{ .allow_origins = &.{ "https://app.example", "http://other.example" } });
+    defer open.stop();
+    const ok = try RawClient.connectWith(open.da.allocator(), open.server.port(), "Origin: https://app.example\r\n");
+    ok.deinit();
+    try testing.expectError(error.HandshakeFailed, RawClient.connectWith(open.da.allocator(), open.server.port(), "Origin: https://evil.example\r\n"));
+
+    var any: TestServer = undefined;
+    try any.start(.{ .allow_origins = &.{"*"} });
+    defer any.stop();
+    const star = try RawClient.connectWith(any.da.allocator(), any.server.port(), "Origin: https://evil.example\r\n");
+    star.deinit();
 }
