@@ -48,6 +48,8 @@ pub const usage =
     \\Everything but import needs a store that already exists. import creates
     \\one, and the directories above it, the first time.
     \\
+    \\Exits: 0 on success; 1 if the store cannot be read or a line was rejected; 2
+    \\if the command line was not understood.
 ;
 
 /// An event that will not fit here is one no relay would carry either.

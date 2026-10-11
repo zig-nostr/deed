@@ -24,6 +24,8 @@ pub const usage =
     \\
     \\Every key or id is 64 hex characters. --relay may be repeated.
     \\
+    \\Exits: 0 on success; 1 if a part is not valid hex or out of range; 2 if the
+    \\command line was not understood.
 ;
 
 pub fn run(

@@ -61,7 +61,7 @@ pub const usage =
     \\within --timeout if that is shorter, is named on stderr and left out.
     \\Looking up a relay's name is the one step that cannot be cut short.
     \\
-    \\Exits 0 when every event was accepted by at least one relay, 1 when any
+    \\Exits: 0 when every event was accepted by at least one relay, 1 when any
     \\was not or there was nothing to publish, and 2 when the command made no
     \\sense.
     \\

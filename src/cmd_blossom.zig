@@ -72,8 +72,8 @@ pub const usage =
     \\      --timeout <ms>   the deadline for one request (default 30000, and
     \\                       600000 for a transfer)
     \\
-    \\Exit status is 0 when everything asked for was done, 1 when something
-    \\failed, and 2 when the command line was not understood.
+    \\Exits: 0 when everything asked for was done; 1 when something failed;
+    \\2 if the command line was not understood.
     \\
     \\Examples:
     \\  deed blossom upload photo.jpg -s cdn.example.com --sec nsec1...

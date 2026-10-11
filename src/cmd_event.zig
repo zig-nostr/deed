@@ -106,6 +106,8 @@ pub const usage =
     \\  deed event -k reaction -e <id> -p <pubkey> -c "+" wss://relay.example
     \\  echo '{"kind":1,"content":"hi"}' | deed event - --sec nsec1...
     \\
+    \\Exits: 0 on success; 1 if an event could not be signed, a draft is bad, or
+    \\no relay accepted it; 2 if the command line was not understood.
 ;
 
 /// A tag shortcut flag, kept raw until every flag has been read: an `-a` with

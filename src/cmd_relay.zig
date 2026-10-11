@@ -30,7 +30,7 @@ pub const usage =
     \\  --timeout <secs>   give up on a relay after this long (default 10)
     \\  --allow-http       permit plain http to a host that is not local
     \\
-    \\Exits 1 if any relay failed, after saying why on stderr; the others are
+    \\Exits: 1 if any relay failed, after saying why on stderr; the others are
     \\still printed.
     \\
 ;

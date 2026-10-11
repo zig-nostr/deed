@@ -57,6 +57,8 @@ pub const usage =
     \\there are none from the terminal with echo off, or from a pipe. --passphrase
     \\asks for a BIP-39 passphrase the same way. --public prints the npub.
     \\
+    \\Exits: 0 on success; 1 if a key is wrong, a password is wrong or missing, or
+    \\validate finds an invalid key; 2 if the command line was not understood.
 ;
 
 pub fn run(

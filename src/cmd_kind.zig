@@ -23,6 +23,8 @@ pub const usage =
     \\  deed kind 7
     \\  deed kind text-note
     \\
+    \\Exits: 0 on success; 1 if a name is unknown; 2 if the command line was not
+    \\understood.
 ;
 
 pub fn run(

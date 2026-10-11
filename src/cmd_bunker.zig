@@ -102,6 +102,8 @@ pub const usage =
     \\  deed bunker --persist ~/.config/deed/bunker.json --qrcode wss://relay.example
     \\  NOSTR_SECRET_KEY=ncryptsec1... deed bunker connect 'nostrconnect://...'
     \\
+    \\Exits: 0 when stopped by a signal; 1 if the key is wrong or the bunker could
+    \\not start; 2 if the command line was not understood.
 ;
 
 /// Relays one bunker listens on at most.

@@ -74,7 +74,7 @@ pub const usage =
     \\named. A code with an author but no hints is also looked up at the relays that
     \\author writes to. The note itself goes only to the ones named, or to yours.
     \\
-    \\Exits 0 when a relay accepted the note, 1 when none did, and 2 when the
+    \\Exits: 0 when a relay accepted the note, 1 when none did, and 2 when the
     \\command made no sense.
     \\
 ;

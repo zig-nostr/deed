@@ -56,9 +56,9 @@ pub const usage =
     \\refresh asks only the relays you name, with --relay or in DEED_RELAYS
     \\(comma or space separated). deed has no built-in list.
     \\
-    \\Exit status is 0 when everything asked for was done, 1 when something
-    \\failed (a refresh that found no list, for example), and 2 when the command
-    \\line was not understood.
+    \\Exits: 0 when everything asked for was done; 1 when something failed (a
+    \\refresh that found no list, for example); 2 if the command line was not
+    \\understood.
     \\
 ;
 

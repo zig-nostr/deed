@@ -40,6 +40,8 @@ pub const usage =
     \\  deed decode nevent1...          {"id":"...","relays":[...],"kind":1}
     \\  deed decode bob@example.com   {"pubkey":"...","relays":[...]}
     \\
+    \\Exits: 0 when every code was decoded; 1 if any was not; 2 if the command
+    \\line was not understood.
 ;
 
 pub fn run(

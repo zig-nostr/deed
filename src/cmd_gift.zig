@@ -61,6 +61,8 @@ pub const usage =
     \\
     \\  deed gift dm --to npub1... --sec nsec1... "see you at six" | deed publish wss://relay.example
     \\
+    \\Exits: 0 on success; 1 if a key is wrong or an event could not be wrapped or
+    \\unwrapped; 2 if the command line was not understood.
 ;
 
 const Sub = enum { wrap, unwrap, dm };

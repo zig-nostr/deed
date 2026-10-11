@@ -108,7 +108,7 @@ pub const usage =
     \\  deed git patches naddr1... --apply-ready 1a2b3c4d | git am
     \\  deed git send-patch --repo naddr1... --sec nsec1... HEAD~2..HEAD
     \\
-    \\Exits 0 on success, 1 when nothing was found or nothing was accepted, and 2
+    \\Exits: 0 on success, 1 when nothing was found or nothing was accepted, and 2
     \\when the command made no sense.
     \\
 ;

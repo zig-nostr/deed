@@ -78,7 +78,7 @@ pub const usage =
     \\acknowledged. The temporary store skips that, since it does not outlive
     \\the relay anyway.
     \\
-    \\Exits 0 when stopped by a signal, 1 when the relay could not start, and
+    \\Exits: 0 when stopped by a signal, 1 when the relay could not start, and
     \\2 when the command made no sense.
     \\
 ;

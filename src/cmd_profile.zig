@@ -71,7 +71,7 @@ pub const usage =
     \\  deed profile npub1... wss://relay.example
     \\  deed profile set --sec nsec1... --about "hello" wss://relay.example
     \\
-    \\Exits 0 on success, 1 when the profile was not found or not published, and
+    \\Exits: 0 on success, 1 when the profile was not found or not published, and
     \\2 when the command made no sense.
     \\
 ;

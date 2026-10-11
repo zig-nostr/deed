@@ -58,6 +58,8 @@ pub const usage =
     \\  deed curl https://example.com/api/me
     \\  deed curl -X PUT -d '{"a":1}' https://example.com/api/thing
     \\
+    \\Exits: curl's own status once it has run; 1 if the key is wrong or the
+    \\request could not be signed; 2 if the command line was not understood.
 ;
 
 /// What deed needs to know about a curl command line.

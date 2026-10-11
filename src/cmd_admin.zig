@@ -54,7 +54,8 @@ pub const usage =
     \\  --timeout <s>    give up after this many seconds (default 15)
     \\  --allow-http     permit plain http to a host that is not local
     \\
-    \\Exits 1 if the relay refuses the call or cannot be reached.
+    \\Exits: 0 on success; 1 if the relay refuses the call or cannot be reached;
+    \\2 if the command line was not understood.
     \\
     \\Examples:
     \\  deed admin wss://relay.example.com supportedmethods

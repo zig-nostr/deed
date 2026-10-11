@@ -60,6 +60,8 @@ pub const encrypt_usage =
     \\
     \\  deed encrypt --to npub1... --sec nsec1... "meet at six"
     \\
+    \\Exits: 0 on success; 1 if the key or recipient is wrong or a message could
+    \\not be encrypted; 2 if the command line was not understood.
 ;
 
 pub const decrypt_usage =
@@ -83,6 +85,8 @@ pub const decrypt_usage =
     \\
     \\  deed decrypt --from npub1... --sec nsec1... "AiJ..."
     \\
+    \\Exits: 0 on success; 1 if the key or sender is wrong or a payload could not
+    \\be decrypted; 2 if the command line was not understood.
 ;
 
 pub fn run(
