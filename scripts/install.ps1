@@ -114,9 +114,19 @@ Nothing needs administrator rights.
         if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) {
             Fail 'this script installs the Windows build. On macOS and Linux, run: curl -fsSL https://raw.githubusercontent.com/zig-nostr/deed/main/scripts/install.sh | bash'
         }
-        # A 32-bit PowerShell on a 64-bit Windows reports x86 here and the real
-        # architecture in PROCESSOR_ARCHITEW6432.
-        $arch = $env:PROCESSOR_ARCHITEW6432
+        # The machine's own architecture, not the process's. An x64 PowerShell
+        # running under emulation on a Windows on ARM machine reports AMD64 in
+        # its environment, so the value Windows keeps in the registry is read
+        # first. The environment is the fallback: a 32-bit PowerShell on a
+        # 64-bit Windows reports x86 there and the real architecture in
+        # PROCESSOR_ARCHITEW6432.
+        $arch = $null
+        try {
+            $arch = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+        } catch {
+            $arch = $null
+        }
+        if (-not $arch) { $arch = $env:PROCESSOR_ARCHITEW6432 }
         if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
         switch ($arch) {
             'AMD64' { return 'windows-x86_64' }
@@ -273,7 +283,7 @@ Nothing needs administrator rights.
                 # zip still installs. Only a 404 means that: any other failure
                 # is reported, not papered over with a different build.
                 if ($platform -ne 'windows-aarch64' -or (Get-Status $_) -ne 404) {
-                    Fail "download failed. There may be no $platform build for $tag."
+                    Fail "download failed. $tag may not exist, or has no Windows build."
                 }
                 $platform = 'windows-x86_64'
                 $name = "deed-$($tag.Substring(1))-$platform.zip"
@@ -282,7 +292,7 @@ Nothing needs administrator rights.
                 try {
                     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
                 } catch {
-                    Fail "download failed. There may be no $platform build for $tag."
+                    Fail "download failed. $tag may not exist, or has no Windows build."
                 }
             }
 
