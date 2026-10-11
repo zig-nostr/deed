@@ -22,6 +22,7 @@ pub const usage =
     \\
     \\Usage:
     \\  deed fetch <code> [<relay-url>...]
+    \\  deed fetch --thread <note|nevent|hex> [<relay-url>...]
     \\
     \\Accepts note, nevent, naddr, nprofile and npub, with or without a leading
     \\`nostr:`, in lower case or all upper case. A code carrying relay hints is
@@ -36,6 +37,14 @@ pub const usage =
     \\  -r, --relay <url>    where to look up the author's relay list, for a code
     \\                       with no hints, repeatable (and DEED_RELAYS)
     \\      --store <path>   keep every event this receives in a local store
+    \\      --thread <code>  the whole conversation around a note: up to its
+    \\                       root, then every reply (NIP-10) and comment
+    \\                       (NIP-22), root first
+    \\      --max-depth <n>  how far below the root to follow (default 10)
+    \\      --limit <n>      most events a thread returns (default 500)
+    \\      --tree           print "depth<TAB>event" lines, replies under
+    \\                       their parent
+    \\      --local          read the thread from --store only, dial nothing
     \\      --timeout <ms>   give up on relays still answering (default 30000)
 ++ auth.usage_lines ++
     \\
