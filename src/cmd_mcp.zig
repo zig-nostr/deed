@@ -766,11 +766,69 @@ const Captured = struct {
     err: []const u8,
 };
 
+/// Keeps what is written to it up to a number of lines and of bytes. Past
+/// either, a `.stop` writer fails the write, which ends the verb writing to it
+/// and closes every connection that verb holds; a `.drop` writer throws the
+/// rest away and carries on.
+const Bounded = struct {
+    a: Allocator,
+    list: std.ArrayList(u8) = .empty,
+    max_lines: usize = std.math.maxInt(usize),
+    max_bytes: usize,
+    on_full: enum { stop, drop },
+    lines: usize = 0,
+    full: bool = false,
+    writer: Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *Bounded = @alignCast(@fieldParentPtr("writer", w));
+        for (data[0 .. data.len - 1]) |d| try self.put(d);
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.put(last);
+        var n: usize = last.len * splat;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        return n;
+    }
+
+    fn put(self: *Bounded, bytes: []const u8) Io.Writer.Error!void {
+        const room = self.max_bytes -| self.list.items.len;
+        var take: usize = 0;
+        while (take < bytes.len and take < room and self.lines < self.max_lines) : (take += 1) {
+            if (bytes[take] == '\n') self.lines += 1;
+        }
+        self.list.appendSlice(self.a, bytes[0..take]) catch return error.WriteFailed;
+        if (take < bytes.len) {
+            self.full = true;
+            if (self.on_full == .stop) return error.WriteFailed;
+        }
+    }
+};
+
 fn capture(s: *Server, a: Allocator, runner: VerbFn, argv: []const []const u8) !Captured {
-    var o: Io.Writer.Allocating = .init(a);
-    var e: Io.Writer.Allocating = .init(a);
-    const code = try runner(s.gpa, s.io, argv, &o.writer, &e.writer);
-    return .{ .code = code, .out = o.written(), .err = std.mem.trim(u8, e.written(), "\n ") };
+    return captureLines(s, a, runner, argv, null);
+}
+
+/// Runs a verb, keeping at most `max_lines` lines of what it prints. A verb
+/// stopped at that limit, or at the size limit, counts as a success with a
+/// note saying where it stopped: what it printed before is good.
+fn captureLines(s: *Server, a: Allocator, runner: VerbFn, argv: []const []const u8, max_lines: ?usize) !Captured {
+    var o: Bounded = .{ .a = a, .max_bytes = 2 * max_result_bytes, .on_full = .stop };
+    if (max_lines) |n| o.max_lines = n;
+    var e: Bounded = .{ .a = a, .max_bytes = 2 * max_notes_bytes, .on_full = .drop };
+    var code = runner(s.gpa, s.io, argv, &o.writer, &e.writer) catch |err| switch (err) {
+        error.WriteFailed => if (o.full) cli.exit_ok else return err,
+        else => return err,
+    };
+    var notes = std.mem.trim(u8, e.list.items, "\n ");
+    if (o.full) {
+        code = cli.exit_ok;
+        const why = if (o.lines >= o.max_lines)
+            try std.fmt.allocPrint(a, "stopped at the limit of {d} events", .{o.lines})
+        else
+            try std.fmt.allocPrint(a, "stopped after {d} bytes", .{o.list.items.len});
+        notes = if (notes.len == 0) why else try std.mem.concat(a, u8, &.{ notes, "\n", why });
+    }
+    return .{ .code = code, .out = o.list.items, .err = notes };
 }
 
 /// Writes what a verb produced as the tool's text. Success is its stdout and
@@ -864,9 +922,12 @@ fn toolReq(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bo
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, filter_json);
     try argv.appendSlice(a, relays);
-    try argv.appendSlice(a, &.{ "-l", try num(a, clamped(args, "limit", default_limit, 1, max_limit)) });
+    const limit = clamped(args, "limit", default_limit, 1, max_limit);
+    try argv.appendSlice(a, &.{ "-l", try num(a, limit) });
     try argv.appendSlice(a, &.{ "--timeout", try num(a, timeoutMs(args)) });
-    return present(a, try capture(s, a, cmd_req.run, argv.items), out);
+    // The limit goes in the filter, and a relay may ignore it, so it is also
+    // where collecting stops.
+    return present(a, try captureLines(s, a, cmd_req.run, argv.items, @intCast(limit)), out);
 }
 
 fn toolFetch(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
@@ -937,10 +998,11 @@ fn toolKind(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !b
 fn toolStoreQuery(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
     const path = s.cfg.store_path orelse return fail(out, "no store was named when the server started");
     const filter_json = (try jsonArg(a, args, "filter", out)) orelse return false;
+    const limit = clamped(args, "limit", default_limit, 1, max_limit);
     const argv = [_][]const u8{
-        filter_json, "--local", "--store", path, "-l", try num(a, clamped(args, "limit", default_limit, 1, max_limit)),
+        filter_json, "--local", "--store", path, "-l", try num(a, limit),
     };
-    return present(a, try capture(s, a, cmd_req.run, &argv), out);
+    return present(a, try captureLines(s, a, cmd_req.run, &argv, @intCast(limit)), out);
 }
 
 fn toolPublishNote(s: *Server, a: Allocator, args: Json, out: *Io.Writer.Allocating) !bool {
@@ -1577,4 +1639,51 @@ test "a negative or out of range number is refused before it reaches a verb" {
         try testing.expect(has(r, "\"isError\":true"));
         try testing.expect(has(r, "kind must be a number from 0 to 65535"));
     }
+}
+
+/// A relay that ignores `limit`: every REQ gets all of `events` and no EOSE.
+const Flood = struct {
+    events: []const []const u8,
+    fn handle(ctx: ?*anyopaque, frame: []const u8, w: *Io.Writer) anyerror!void {
+        const self: *Flood = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.startsWith(u8, frame, "[\"REQ\"")) return;
+        var line: [8192]u8 = undefined;
+        for (self.events) |ev| {
+            try testrelay.sendText(w, try std.fmt.bufPrint(&line, "[\"EVENT\",\"deed\",{s}]", .{ev}));
+        }
+    }
+};
+
+test "req stops at its limit when a relay ignores it, without waiting for the deadline" {
+    const io = testing.io;
+    var da: testrelay.DialAllocator = .init;
+    defer if (da.deinit() == .leak) @panic("leaked");
+    const gpa = da.allocator();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var evs: [40][]const u8 = undefined;
+    for (&evs, 0..) |*e, i| {
+        e.* = try cmd_post.signedJson(a, io, [_]u8{0x33} ** 32, 1, &.{}, try std.fmt.allocPrint(a, "flood {d}", .{i}), 1_700_000_000 + @as(i64, @intCast(i)));
+    }
+    var flood = Flood{ .events = &evs };
+    var relay: testrelay.Relay = undefined;
+    try relay.startCustom(io, Flood.handle, &flood);
+    defer relay.stop(io);
+    var ub: [40]u8 = undefined;
+    const url = try testrelay.url(&ub, relay.port());
+
+    const args = try std.fmt.allocPrint(gpa, "{{\"filter\":{{\"kinds\":[1]}},\"relays\":[\"{s}\"],\"limit\":3,\"timeout_ms\":8000}}", .{url});
+    defer gpa.free(args);
+    const line = try callLine(gpa, 1, "req", args);
+    defer gpa.free(line);
+    const started = Io.Timestamp.now(io, .awake).toMilliseconds();
+    const got = try converse(gpa, .{}, line);
+    defer gpa.free(got);
+    const took = Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try testing.expect(has(got, "\"isError\":false"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "flood "));
+    try testing.expect(has(got, "stopped at the limit of 3 events"));
+    try testing.expect(took < 4000);
 }
