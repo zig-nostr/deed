@@ -272,6 +272,13 @@ jobs:
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Whether that release carries an ARM64 build, which decides what the
+          # installer on the arm runner must have put in place.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q -- '-windows-aarch64\.zip$'; then
+            echo "has_arm64=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_arm64=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: The installer parses
         run: |
@@ -320,6 +327,23 @@ jobs:
           if ($entries.Count -ne 1) { Write-Host "the user PATH carries $prefix $($entries.Count) times, expected once"; exit 1 }
           "bin=$(Join-Path $prefix 'deed.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
           Write-Host "installed $got, on PATH once"
+
+      # Which build the installer chose, read from the file and not from what
+      # runs: the machine field of the PE header, a u16 four bytes past the
+      # offset stored at 0x3C. The arm runner must get the ARM64 build when the
+      # release has one, and x86_64 (run under emulation) when it does not.
+      - name: The installed deed.exe is the build for this machine
+        env:
+          RUNNER: ${{ matrix.runner }}
+          HAS_ARM64: ${{ steps.release.outputs.has_arm64 }}
+        run: |
+          $bytes = [IO.File]::ReadAllBytes($env:bin)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          $want = 0x8664
+          if ($env:RUNNER -eq 'windows-11-arm' -and $env:HAS_ARM64 -eq 'true') { $want = 0xAA64 }
+          if ($machine -ne $want) { Write-Host ("PE machine is 0x{0:X4}, expected 0x{1:X4}" -f $machine, $want); exit 1 }
+          Write-Host ("PE machine is 0x{0:X4}" -f $machine)
 
       # A real gesture rather than just `version`: libsecp256k1, the bech32
       # encoder and the JSON writer and reader in one line, as the check for
